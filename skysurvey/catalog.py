@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 from contextlib import contextmanager
+import subprocess
 import pickle
 import tables
 import numpy.random as ran
@@ -11,7 +12,6 @@ import bhpix
 from slalib import *
 import Polygon
 import Polygon.Shapes
-#import matplotlib.pyplot as plt
 import itertools as it
 from itertools import izip, imap
 from multiprocessing import Pool
@@ -25,17 +25,16 @@ import utils
 import footprint
 from utils import astype
 
+# Constants with special meaning
 Automatic = None
 Default = None
-All = [];
-Read = False
-Write = True
+All = []
 
 class Catalog:
 	""" A spatially and temporally partitioned object catalog.
 	
-	    The usual workhorses are Catalog.query and
-	    Catalog.map_reduce methods.
+	    The usual workhorses are Catalog.fetch, Catalog.iterate
+	    and Catalog.map_reduce methods.
 	"""
 	path = '.'
 	level = 6
@@ -115,21 +114,27 @@ class Catalog:
 			bounds &= footprint.ALLSKY
 		return bounds
 
-	def _file_for_id(self, id):
+	def _file_for_id(self, id, table_type='catalog'):
 		(x, y, t, rank) = self.unpack_id(id, self.level)
+
 		if t >= self.t0 + self.dt:
-			fn = '%s/%s.MJD%05d%+d.h5' % (self.path, bhpix.get_path(x, y, self.level), t, self.dt)
+			fn = '%s/%s.%s.MJD%05d%+d.h5' % (self.path, bhpix.get_path(x, y, self.level), table_type, t, self.dt)
 		else:
-			fn = '%s/%s.static.h5' % (self.path, bhpix.get_path(x, y, self.level))
+			fn = '%s/%s.%s.static.h5' % (self.path, bhpix.get_path(x, y, self.level), table_type)
 		return fn
+
+	def cell_exists(self, cell_id, table_type='catalog'):
+		fn = self._file_for_id(cell_id, table_type)
+		return os.access(fn, os.R_OK)
 
 	def _load_dbinfo(self):
 		data = json.loads(file(self.path + '/dbinfo.json').read())
-		
+
 		# Explicit type coercion for security reasons
 		self.level = int(data["level"])
 		self.t0 = float(data["t0"])
 		self.dt = float(data["dt"])
+		self.__nrows = float(data["nrows"])
 		self.columns = []
 		for (col, dtype) in data["columns"]:
 			self.columns.append((str(col), str(dtype)))
@@ -137,37 +142,23 @@ class Catalog:
 	def _store_dbinfo(self):
 		data = dict()
 		data["level"], data["t0"], data["dt"] = self.level, self.t0, self.dt
+		data["nrows"] = self.__nrows
 		data["columns"] = self.columns
 
 		f = open(self.path + '/dbinfo.json', 'w')
 		f.write(json.dumps(data, indent=4, sort_keys=True))
 		f.close()
 
-	### Public methods
-	def __init__(self, path, mode='r', columns=None, level=Automatic, t0=Automatic, dt=Automatic):
-		self.path = path
+	def _open_cell(self, id, mode='r', retries=-1, table_type='catalog'):
+		""" Open a given cell in read or write mode. If in
+		    write mode, the cell will be locked. Do not use this
+		    function directly; use cell() instead.
 
-		if mode == 'c':
-			self.create(columns, level, t0, dt)
-		else:
-			self._load_dbinfo()
-
-	def create(self, columns, level, t0, dt):
-		""" Create a new catalog and store the definition.
+		    Returns:
+		    	Tuple of (fp, lock_fn) where lock_fn is the lockfile
+		    	or None if mode='r'
 		"""
-		utils.mkdir_p(self.path)
-		if os.path.isfile(self.path + '/dbinfo.json'):
-			raise Exception("Creating a new catalog in '%s' would overwrite an existing one." % self.path)
-			
-		self.columns = columns
-		if level != Automatic: self.level = level
-		if    t0 != Automatic: self.t0 = t0
-		if    dt != Automatic: self.dt = dt
-
-		self._store_dbinfo()
-
-	def _open_cell(self, id, mode='r', retries=-1):
-		fn = self._file_for_id(id)
+		fn = self._file_for_id(id, table_type)
 
 		if mode == 'r':
 			return (tables.openFile(fn), None)
@@ -181,94 +172,30 @@ class Catalog:
 				utils.shell('/usr/bin/lockfile -1 -r%d "%s.lock"' % (retries, fn) )
 
 				# intialize the file
-				fp  = tables.openFile(fn, mode='w', title='SkysurveyDB')
-				fp.createTable('/', 'catalog', np.dtype(self.columns), "Catalog", expectedrows=20*1000*1000)
-				fp.createArray('/', 'id_seq', np.ones(1, dtype=np.uint32), 'A sequence for catalog table ID')
-				#print '[create] ' + fn,
+				table_type = table_type.split('_')[0]
+				if table_type == 'catalog':
+					fp  = tables.openFile(fn, mode='w', title='SkysurveyDB')
+					fp.createTable('/', 'catalog', np.dtype(self.columns), "Catalog", expectedrows=20*1000*1000)
+					fp.createArray('/', 'id_seq', np.ones(1, dtype=np.uint32), 'A sequence for catalog table ID')
+				elif table_type == 'xmatch':
+					fp  = tables.openFile(fn, mode='w', title='Skysurvey xmatch table')
+					fp.createTable('/', 'xmatch', np.dtype([('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')]), "xmatch", expectedrows=20*1000*1000)
+				else:
+					raise Exception('Unknown table type!')
 			else:
 				# open for appending
 				utils.shell('/usr/bin/lockfile "%s.lock"' % fn)
 
-				fp = tables.openFile(fn, mode='a', title='SkysurveyDB')
-				#print '[insert] ' + fn,
+				fp = tables.openFile(fn, mode='a')
 
 			return (fp, fn + '.lock')
 		else:
 			raise Exception("Mode must be one of 'r' or 'w'")
 
-	def insert(self, rows, ra, dec, t = None):
-		#
-		# Insert a set of rows into the database. Protects against multiple
-		# writers simultaneously inserting into the same file
-		#
-		# The rows being inserter must NOT contain the index column.
-		#
-		ids = self.id_from_pos(ra, dec, t)
-		cells = self.id_from_pos(ra, dec, t, self.level)
-		unique_cells = list(set(cells))
-
-		ntot = 0
-		while unique_cells:
-			# Find a cell that is ready to be written to
-			for k in xrange(3600):
-				try:
-					i = k % len(unique_cells)
-					cell = unique_cells[i]
-					(fp, lockfile)  = self._open_cell(cell, 'w', retries=0)
-					unique_cells.pop(i)
-					break
-				except subprocess.CalledProcessError as err:
-					#print err
-					pass
-			else:
-				raise Exception('Appear to be stuck on a lock file!')
-
-			t   = fp.root.catalog
-			id2 = fp.root.id_seq[0]
-
-			# Extract and store the subset of rows that belong into this cell
-			iit = iter(xrange(len(rows) + 1))
-			rows2 = [ (ids[i] + id2 + np.uint64(next(iit)),) + rows[i] for i in xrange(len(rows)) if(cells[i] == cell) ]
-
-			######## TODO: Remove once we're confident there are no bugs			
-			#fn = self._file_for_id(cell)
-			#for (k, row) in enumerate(rows2):
-			#	ff = self._file_for_id(row[0])
-			#	if ff != fn:
-			#		print ff
-			#		print fn
-			#		print row
-			#		raise Exception('**** Bug detected ****')
-			#	(x, y) = bhpix.proj_bhealpix(row[5], row[6])
-			#	(x, y) = bhpix.xy_center(x, y, self.level)
-			#	(ux, uy, ut, ui) = self.unpack_id(row[0], self.level)
-			#	if ux != x or uy != y:
-			#		print ux, uy, x, y
-			#		raise Exception('**** Bug detected ****')
-			#	if ut != self.t0:
-			#		print ut, self.t0
-			#		raise Exception('**** Bug detected ****')
-			#	if ui != id2 + k:
-			#		print ui, k, id2
-			#		raise Exception('**** Bug detected ****')
-			###############################################################
-
-			t.append(rows2)
-			fp.root.id_seq[0] += len(rows2)
-			fp.close()
-			os.unlink(lockfile)
-
-			##print '[', len(rows2), ']'
-			self.__nrows = self.__nrows + len(rows2)
-			ntot = ntot + len(rows2)
-
-		if ntot != len(ids):
-			print 'ntot=', ntot
-			raise Exception('**** Bug detected ****')
-
-		return ids
-
 	def _get_cells_recursive(self, cells, foot, pix):
+		""" Helper for _get_cells(). See documentation of
+		    _get_cells() for usage
+		"""
 		# Check for nonzero overlap
 		lev = bhpix.get_pixel_level(pix[0], pix[1])
 		dx = bhpix.pix_size(lev)
@@ -283,7 +210,7 @@ class Catalog:
 		# more than one file in catalogs with a time component
 		prefix = self.path + '/' + bhpix.get_path(pix[0], pix[1], lev)
 		fn = None
-		for fn in glob.iglob(prefix + "*.h5"):
+		for fn in glob.iglob(prefix + ".catalog.*.h5"):
 			if(foot.area() == box.area()):
 				foot = None
 
@@ -306,6 +233,9 @@ class Catalog:
 			self._get_cells_recursive(cells, foot & box, pix + dx*d)
 
 	def _get_cells(self, foot = All):
+		""" Return a list of (cell_id, footprint) tuples completely
+		    covering the requested footprint
+		"""
 		# Handle all-sky
 		if foot == All:
 			foot = footprint.ALLSKY
@@ -318,70 +248,206 @@ class Catalog:
 		self._get_cells_recursive(cells, foot, (0., 0.))
 		return cells
 
-	def select(self, cols, foot, where='ra > 0', testbounds=True):
+	def _get_cols(self, cols):
+		""" Return a list of columns, given all permissible
+		    user-friendly formats that cols can be in.
+		    
+		    Examples:
+		    	'ra dec u g r i z'	-- just those columns
+		    	'*'			-- all available columns
+		"""
+		if cols == '*':		cols = All
+		if type(cols) == str:	cols = cols.split()
+		return cols
 
-		if type(cols) == str: cols = cols.split()
+	### Public methods
+	def __init__(self, path, mode='r', columns=None, level=Automatic, t0=Automatic, dt=Automatic):
+		self.path = path
 
-		files = self._get_cells(foot)
-
-		# Query through the files
-		pool = Pool(8)
-		at = 0
-		for filechunk in util.chunks(files, 32):
-			for (fn, rows) in pool.imap_unordered(load_and_filter_rows, ( (f[0], f[1], testbounds) for f in filechunk )):
-				at = at + 1
-				print '[%d of %d]' % (at, len(files)), fn
-				for row in izip(*[rows[col] for col in cols]):
-					yield row
-
-	def mapreduce(self, mapfun, redfun, foot, where='ra > 0', testbounds=True, batchsize=Automatic, nworkers=Automatic, mapargs=()):
-		files = self._get_cells(foot)
-
-		# Map/Reduce, per database file chunk.
-		#
-		# Because Python's multiprocessing.Pool class cannot be made
-		# to block if a number of mapped results have not yet been consumed (*),
-		# I emulate this behavior by using two pools.
-		#
-		# (*) This is an issue if mappers rapidly produce large results, while
-		# the reducer is slow to ingest and process them. In that case, Pool
-		# attempts to buffer the results, potentially leading to an OOM condition.
-
-		if nworkers  == Automatic: nworkers  = mp.cpu_count()
-		if batchsize == Automatic: batchsize = nworkers * 4
-		if batchsize == All:       batchsize = len(files)+1
-
-		tasks = [ (f + (testbounds,), mapfun, mapargs) for f in files ]
-		batches = list(util.chunks(tasks, batchsize))
-
-		# Use only one pool if there's a single batch
-		if len(batches) > 1:
-			(pool0, pool1) = ( Pool(nworkers // 2), Pool(nworkers // 2) )
+		if mode == 'c':
+			self.create(columns, level, t0, dt)
 		else:
-			pool0 = Pool(nworkers)
+			self._load_dbinfo()
 
-		at = 0
-		it0 = pool0.imap_unordered(domap, batches.pop(0))
-		while it0 != None:
-			if len(batches):
-				(it1,   it0)   = (it0,   pool1.imap_unordered(domap, batches.pop(0)))
-				(pool1, pool0) = (pool0, pool1)
-				print 'Switch...'
+	def create(self, columns, level, t0, dt):
+		""" Create a new catalog and store its definition.
+		"""
+		utils.mkdir_p(self.path)
+		if os.path.isfile(self.path + '/dbinfo.json'):
+			raise Exception("Creating a new catalog in '%s' would overwrite an existing one." % self.path)
+			
+		self.columns = columns
+		if level != Automatic: self.level = level
+		if    t0 != Automatic: self.t0 = t0
+		if    dt != Automatic: self.dt = dt
+
+		self._store_dbinfo()
+
+	def insert(self, rows, ra, dec, t = None):
+		""" Insert a set of rows into the database. Protects against multiple
+		    writers simultaneously inserting into the same file
+
+		    The rows being inserted must NOT contain the index column.
+		"""
+		ids = self.id_from_pos(ra, dec, t)
+		cells = self.id_from_pos(ra, dec, t, self.level)
+		unique_cells = list(set(cells))
+
+		ntot = 0
+		while unique_cells:
+			# Find a cell that is ready to be written to (that isn't locked
+			# by another writer)
+			for k in xrange(3600):
+				try:
+					i = k % len(unique_cells)
+					cell = unique_cells[i]
+					(fp, lockfile)  = self._open_cell(cell, 'w', retries=0, table_type='catalog')
+					unique_cells.pop(i)
+					break
+				except subprocess.CalledProcessError as err:
+					#print err
+					pass
 			else:
-				(it1, it0) = (it0, None)
-				print 'Done...'
+				raise Exception('Appear to be stuck on a lock file!')
 
-			for (fn, result) in it1:
-				at = at + 1
-				print '[%d of %d]' % (at, len(files)), fn
-				redfun(result)
+			t   = fp.root.catalog
+			id2 = fp.root.id_seq[0]
 
+			# Extract and store the subset of rows that belong into this cell
+			iit = iter(xrange(len(rows) + 1))
+			rows2 = [ (ids[i] + id2 + np.uint64(next(iit)),) + rows[i] for i in xrange(len(rows)) if(cells[i] == cell) ]
+
+			t.append(rows2)
+			fp.root.id_seq[0] += len(rows2)
+			fp.close()
+			os.unlink(lockfile)
+
+			##print '[', len(rows2), ']'
+			self.__nrows = self.__nrows + len(rows2)
+			ntot = ntot + len(rows2)
+
+		if ntot != len(ids):
+			print 'ntot=', ntot
+			raise Exception('**** Bug detected ****')
+
+		return ids
 
 	def nrows(self):
 		return self.__nrows
 
 	def close(self):
 		pass
+
+	def __str__(self):
+		""" Return some basic (human readable) information about the
+		    catalog.
+		"""
+		i =     'Path:         %s\n' % self.path
+		i = i + 'Partitioning: level=%d\n' % (self.level)
+		i = i + '(t0, dt):     %f, %f \n' % (self.t0, self.dt)
+		i = i + 'Objects:      %d\n' % (self.nrows())
+		i = i + '\n'
+		s = "%20s %10s\n" % ('Column', 'Type')
+		s = s + '-'*(len(s)-1) + '\n'
+		for col in self.columns:
+			s = s + "%20s %10s\n" % (col[0], col[1])
+		return i + s
+
+	def fetch_cell(self, cell_id, where=None, filter=None, filter_args=(), table_type='catalog', include_cached=False):
+		""" Load and return all rows from a given cell, possibly
+		    filtering them using filter (if given)
+		"""
+		with self.cell(cell_id, table_type=table_type) as fp:
+			table_type = table_type.split('_')[0]
+			table = fp.root.__getattr__(table_type)
+
+			if where == None:
+				rows = table.read()
+			else:
+				rows = table.readWhere(where)
+
+		# Reject cached objects, unless requested otherwise
+		if not include_cached and len(rows) and "cached" in rows.dtype.names:
+			rows = rows[rows["cached"] == 0]
+
+		# Custom user-supplied filter
+		if filter != None:
+			rows = filter(rows, *filter_args)
+
+		return rows
+
+	def fetch(self, cols=All, foot=All, where=None, testbounds=True, include_cached=False, nworkers=None, progress_callback=None, filter=None, filter_args=()):
+		""" Return a table (numpy structured array) of all rows within a
+		    given footprint. Calls 'filter' callable (if given) to filter
+		    the returned rows.
+		    
+		    The 'filter' callable should expect a single argument, rows,
+		    being the set of rows (numpy structured array) to filter. It
+		    must return the set of filtered rows (also as numpy structured
+		    array). E.g., identity filter function would be:
+		    
+		    	def identity(rows):
+		    		return rows
+
+		    while a function filtering on column 'r' may look like:
+		    
+		    	def r_filter(rows):
+		    		return rows[rows['r'] < 21.5]
+		   
+		    The filter callable must be piclkeable. Extra arguments to
+		    filter may be given in 'filter_args'
+		"""
+
+		cols = self._get_cols(cols)
+		files = self._get_cells(foot)
+
+		ret = None
+		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), foot=foot, where=where, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
+			if cols == All:
+				cols = rows.dtype.names
+
+			# ensure enough memory has been allocated (and do it
+			# intelligently if not)
+			if ret == None:
+				rcols = [ (col, rows.dtype[col].str) for col in cols ]
+				ret = np.empty(len(rows), np.dtype(rcols))
+				nret = 0
+
+			while len(ret) < nret + len(rows):
+				ret.resize(2*(len(ret)+1))
+				#print "Resizing to", len(ret)
+
+			# store
+			for col in cols:
+				ret[col][nret:nret+len(rows)] = rows[col]
+			nret = nret + len(rows)
+
+		ret.resize(nret)
+		#print "Resizing to", len(ret)
+		return ret
+
+	def iterate(self, cols=All, foot=All, where=None, testbounds=True, return_array=False, include_cached=False, nworkers=None, progress_callback=None, filter=None, filter_args=()):
+		""" Yield rows (either on a row-by-row basis if return_array==False
+		    or in chunks (numpy structured array)) within a
+		    given footprint. Calls 'filter' callable (if given) to filter
+		    the returned rows.
+
+		    See the documentation for Catalog.fetch for discussion of
+		    'filter' callable.
+		"""
+
+		cols = self._get_cols(cols)
+		files = self._get_cells(foot)
+
+		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), foot=foot, where=where, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
+			if return_array:
+				yield rows
+			else:
+				if cols == All:
+					cols = rows.dtype.names
+
+				for row in izip(*[rows[col] for col in cols]):
+					yield row
 
 	def map_reduce(self, mapper, reducer=None, foot=All, where=None, testbounds=True, include_cached=False, mapper_args=(), reducer_args=(), nworkers=None, progress_callback=None):
 		""" A MapReduce implementation, where rows from individual cells
@@ -430,13 +496,13 @@ class Catalog:
 				yield result
 
 	@contextmanager
-	def cell(self, cell_id, mode='r', retries=-1):
+	def cell(self, cell_id, mode='r', retries=-1, table_type='catalog'):
 		""" Open and return a pytables object for the given cell.
 		    If mode is not 'r', the cell table will be locked
 		    for the duration of this context manager, and automatically
 		    unlocked upon exit from it.
 		"""
-		(fp, lockfile) = self._open_cell(cell_id, mode, retries)
+		(fp, lockfile) = self._open_cell(cell_id, mode, retries, table_type=table_type)
 
 		yield fp
 
@@ -476,7 +542,7 @@ class Catalog:
 			nhood += [ self._id_from_xy(x, y, t - self.dt, self.level) for (x, y) in ncells ]
 
 		return nhood
-		
+
 	def is_cell_local(self, cell_id):
 		""" Returns True if the cell is reachable from the
 		    current machine. A placeholder for if/when I decide
@@ -503,6 +569,24 @@ class Catalog:
 			print self._file_for_id(cell_id), ": ", ncached, " cached objects"
 		print "Total %d cached objects in %d cells" % (ntotal, ncells)
 
+	def compute_summary_stats(self):
+		""" Compute frequently used summary statistics and
+		    store them into the dbinfo file. This should be called
+		    to refresh the stats after insertions.
+		"""
+		from tasks import compute_counts
+		self.__nrows = compute_counts(self)
+		self._store_dbinfo()
+
+
+###############################################################
+# Aux functions implementing Catalog.iterate and Catalog.fetch
+# functionallity
+def _iterate_mapper(rows, filter = None, filter_args = ()):
+	if filter != None:
+		rows = filter(rows, *filter_args)
+	return rows
+
 ###############################################################
 # Aux functions implementing Catalog.map_reduce functionallity
 def _reducer(kw, reducer, cat, reducer_args):
@@ -517,25 +601,10 @@ def _mapper(partspec, mapper, where, cat, include_cached, mapper_args):
 	mapper.CATALOG = cat
 	mapper.BOUNDS = bounds
 	mapper.WHERE = where
-
 	mapper.CELL_FN = cat._file_for_id(cell_id)
 
-	# load all rows
-	with cat.cell(cell_id) as fp:
-		if 'catalog' in fp.root:
-			if where == None:
-				rows = fp.root.catalog.read();
-			else:
-				rows = fp.root.catalog.readWhere(where)
-		else:
-
-			# This ordinarily shouldn't happen... Should I throw a warning here?
-			rows = np.empty([0], dtype=np.dtype(cat.columns))
-
-	# Reject cached objects, unless requested otherwise
-	if not include_cached and len(rows):
-		rows = rows[rows["cached"] == 0]
-	#rows = rows[rows["cached"] != 0]
+	# Fetch all rows
+	rows = cat.fetch_cell(cell_id=cell_id, where=where, table_type='catalog', include_cached=include_cached)
 
 	# Reject objects out of bounds
 	if bounds != None and len(rows):

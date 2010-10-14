@@ -1,16 +1,16 @@
 #!/usr/bin/env python
 #
-# Example: import_sdss.py -c sdss /raid14/sweeps/sdss3/2009-11-16.v2/301
+# Example: import_dvo.py -c ps1 /raid14/panstarrs/dvo-201008
 #
 
 import sys
 import getopt
-import skysurvey.sdss  as sdss
+import skysurvey.dvo  as dvo
 import skysurvey as lsd
 from   skysurvey.utils import *
 
 def usage():
-	print "Usage: %s [-c|--create] <cat_dir> <sweep_file_dir>" % sys.argv[0]
+	print "Usage: %s [-c|--create] <cat_dir> <dvo_file_dir>" % sys.argv[0]
 
 try:
 	optlist, args = getopt.getopt(sys.argv[1:], 'c', ['create'])
@@ -24,7 +24,7 @@ if len(args) != 2:
 	usage()
 	exit(-1)
 
-cat_dir, sweep_dir = args
+cat_dir, dvo_dir = args
 
 create = False
 for (o, a) in optlist:
@@ -34,10 +34,10 @@ for (o, a) in optlist:
 #
 # Actual work
 #
-files = shell('find "' + sweep_dir + '" -name "*star*.fits.gz" -o -name "*gal*.fits.gz" ').splitlines()
+files = shell('find "' + dvo_dir + '" -name "*.cpt"').splitlines();
 
-print "Importing SDSS catalog ",
-sdss.import_from_sweeps(cat_dir, files, create)
+print "Importing PS1 catalog ",
+dvo.import_from_dvo(cat_dir, files, create)
 print " done."
 
 cat = lsd.Catalog(cat_dir)

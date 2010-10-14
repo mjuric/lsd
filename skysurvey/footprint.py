@@ -1,6 +1,7 @@
 import Polygon
 import bhpix
 import numpy as np
+from slalib import sla_galeq
 
 # Full sky in bhpix projection
 ALLSKY = Polygon.Polygon([

@@ -130,9 +130,13 @@ class Pool:
 				else:
 					yield result
 		else:
-			for val in input:
+			for (i, val) in enumerate(input):
+				result = mapper(val, *mapper_args)
 				progress_callback(progress_callback_stage, 'step', input, i, result)
-				yield mapper(val, *mapper_args)
+				if return_index:
+					yield (i, result)
+				else:
+					yield result
 
 		progress_callback(progress_callback_stage, 'end', input, None, None)
 

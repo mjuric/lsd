@@ -2,8 +2,10 @@ import catalog
 import pyfits
 import pool2
 import numpy as np
+from slalib import sla_eqgal
 
 def initialize_column_definitions():
+	# Columns from sweep files
 	objCols = [
 		# column in Catalog	Datatype	Column in sweep files
 		('run', 		'i4',	'run'),
@@ -18,6 +20,8 @@ def initialize_column_definitions():
 		('flags2',		'i4',	'objc_flags2'),
 		('resolve_status',	'i2',	'resolve_status')
 	]
+
+	# Magnitude-related columns
 	magCols = [];
 	for mag in 'ugriz':
 		magCols.append( (mag,           'f4') )
@@ -25,7 +29,12 @@ def initialize_column_definitions():
 		magCols.append( (mag + 'Ext',   'f4') )
 		magCols.append( (mag + 'Calib', 'f4') )
 
-	columns = [('id', 'u8'), ('cached', 'b')] + [f[0:2] for f in objCols] + magCols
+	# All columns
+	columns = [('id', 'u8'), ('cached', 'b')] +	\
+		  [('l',  'f8'), ('b', 'f8')] +		\
+		  [f[0:2] for f in objCols] +		\
+		  magCols
+
 	return (columns, objCols)
 
 (columns, objCols) = initialize_column_definitions();
@@ -52,12 +61,12 @@ def import_from_sweeps(catdir, sweep_files, create=False):
 		cat = catalog.Catalog(catdir)
 
 	at = 0; ntot = 0
-	pool = pool2.Pool(4)
+	pool = pool2.Pool()
 	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (cat,)):
-	#for (file, nloaded, nin) in imap(lambda file: import_from_sweeps_aux(file, catdir), sweep_files):
+	#for (file, nloaded, nin) in imap(lambda file: import_from_sweeps_aux(file, cat), sweep_files):
 		at = at + 1
 		ntot = ntot + nloaded
-		print('  ===> Imported ' + file + ('[%d/%d, %5.2f%%] +%-6d %9d' % (at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot)))
+#		print('  ===> Imported ' + file + ('[%d/%d, %5.2f%%] +%-6d %9d' % (at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot)))
 
 def import_from_sweeps_aux(file, cat):
 	# import an SDSS run
@@ -88,8 +97,16 @@ def import_from_sweeps_aux(file, cat):
 
 			cols += [mag, magErr, extB, calibB]
 
+		# Compute and add "derived" columns
+		l = np.empty_like(ra)
+		b = np.empty_like(dec)
+		for i in xrange(len(ra)):
+			(l[i], b[i]) = np.degrees(sla_eqgal(*np.radians((ra[i], dec[i]))))
 		cached = np.zeros(len(ra), dtype='b')
+
 		cols.insert(0, cached)
+		cols.insert(1, l)
+		cols.insert(2, b)
 
 		# Transform a list of columns into a list of rows, and store
 		ids = cat.insert(zip(*cols), ra, dec)

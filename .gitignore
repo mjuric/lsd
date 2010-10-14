@@ -1,0 +1,9 @@
+*.pyc
+*~
+*.sm
+*.svg
+*.fits
+*.tgz
+*.h5
+*.png
+DEADJOE

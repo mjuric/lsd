@@ -27,6 +27,9 @@ def proj_healpix(l, b):
 
 	return (x, y)
 
+_c = [-1, -1,  1, 1]
+_s = [ 1, -1, -1, 1]
+
 @autovectorized
 def proj_bhealpix(l, b):
 	(hxx, hyy) = proj_healpix(l, b)
@@ -35,12 +38,47 @@ def proj_bhealpix(l, b):
 	h1x = (hxx - pi/2*(0.5 + l))
 	h1y = hyy - pi/2
 
-	c = [-1, -1,  1, 1];
-	s = [ 1, -1, -1, 1]
-	h1 = (h1x * c[l] - h1y * s[l]) / pi
-	h2 = (h1x * s[l] + h1y * c[l]) / pi
+	h1 = (h1x * _c[l] - h1y * _s[l]) / pi
+	h2 = (h1x * _s[l] + h1y * _c[l]) / pi
 
 	return (h1, h2)
+
+@autovectorized
+def deproj_healpix(x, y):
+	# Equations from Calabretta and Roukema, MNRAS, 381, 865
+	K = 3; H = 4;
+
+	if abs(y) <= 0.5*pi * (K-1)/H:
+		# Equatorial regions
+		l = x
+		b = asin(y*H / (0.5*pi*K))
+	else:
+		# Polar regions
+		w = 1 if fmod(K, 2) == 1 else 0
+		s = 0.5*(K+1) - abs(y*H)/pi
+		xc = -pi + (2.*floor( (x + pi)*H/(2*pi) + 0.5*(1-w)) + w)*pi/H
+		l = xc + (x - xc) / s
+		b = asin(1 - s*s/K) * (1 if y > 0 else -1)
+
+	return degrees(l), degrees(b)
+
+@autovectorized
+def deproj_bhealpix(x, y):
+	""" Deproject from butterfly-HealPix to lon, lat
+	"""
+	# Compute to which of the four healpix slices
+	# this point belongs to
+	l = atan2(y, x)*180/pi
+	l = l if l > 0 else l + 360
+	l = int(l // 90)
+
+	h1x = pi/2. * (_c[l]*x + _s[l]*y)
+	h1y = pi/2. * (_c[l]*y - _s[l]*x)
+	
+	hxx = h1x + pi/2.*(0.5 + l)
+	hyy = h1y + pi/2.
+
+	return deproj_healpix(hxx, hyy)
 
 def ij_center(i, j, level):
 	dx = pix_size(level)
@@ -210,3 +248,28 @@ def neighbors(x, y, level, include_self=False):
 #from matplotlib.pyplot import *
 #import random as ran
 #testpix()
+
+if __name__ == '__main__':
+	clon = 212; clat = 12;
+	lon1 = 212.2; lat1 = 15.1;
+	lon2 = 212; lat2 = 15.11;
+	(x1, y1) = gnomonic(lon1, lat1, clon, clat)
+	(x2, y2) = gnomonic(lon2, lat2, clon, clat)
+	dx = x2 - x1
+	dy = y2 - y1
+	d = (dx**2 + dy**2)**.5
+	d0 = gc_dist(lon1, lat1, lon2, lat2)
+	print d, d0, d/d0 - 1
+	#print x, y, (x*x + y*y)**.5, gc_dist(lon1)
+	exit()
+
+if __name__ == '__main__':
+	from numpy.random import random
+	l = random(100000)*360
+	b = random(100000)*180 - 90
+	print len(l), ' items'
+	x, y = proj_bhealpix(l, b)
+	l1, b1 = deproj_bhealpix(x, y)
+	print np.allclose(l, l1, 1e-10, 1e-10), np.allclose(b, b1, 1e-10, 1e-10)
+	exit()
+
