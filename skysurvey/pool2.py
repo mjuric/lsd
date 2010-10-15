@@ -117,6 +117,7 @@ class Pool:
 		progress_callback(progress_callback_stage, 'begin', input, None, None)
 
 		if not self.DEBUG:
+			i = -1
 			for (i, val) in enumerate(input):
 				self.qin.put( (mapper, i, (val,) + mapper_args) )
 			n = i + 1

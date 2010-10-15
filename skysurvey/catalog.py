@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from collections import defaultdict
 from contextlib import contextmanager
 import subprocess
 import pickle
@@ -16,6 +17,8 @@ import itertools as it
 from itertools import izip, imap
 from multiprocessing import Pool
 import multiprocessing as mp
+import time
+import sys
 import pool2
 import os, errno, glob
 import json
@@ -24,6 +27,18 @@ import Polygon.IO
 import utils
 import footprint
 from utils import astype
+
+# Special return type used in _mapper() and Catalog.map_reduce
+# to denote that the returned value should not be yielded to
+# the user
+# Impl. note: The class is intentionally derived from list, and
+#             the value is intentionally [], for it to
+#             be compatible with the map/reduce mode (i.e.,
+#             an empty list will be ignored when constructing
+#             the list of values to reduce)
+class EmptySpecial(list):
+	pass
+Empty = EmptySpecial()	# Marker for mapreduce
 
 # Constants with special meaning
 Automatic = None
@@ -42,6 +57,15 @@ class Catalog:
 	t0 = 47892		# default starting epoch (MJD, 47892 == Jan 1st 1990)
 	dt = 90			# default temporal resolution (in days)
 	__nrows = 0
+
+	NULL = 0		# The value for NULL in JOINed rows that had no matches
+
+	def cell_for_id(self, id):
+		# Note: there's a more direct way of doing this,
+		#       but I don't have time to think about it right now
+		x, y, t, _ = self.unpack_id(id)
+		cell_id = self._id_from_xy(x, y, t, self.level)
+		return cell_id
 
 	def id_from_pos(self, ra, dec, t=None, level=10):
 		# find the bhealpix coordinates and time slice
@@ -248,17 +272,68 @@ class Catalog:
 		self._get_cells_recursive(cells, foot, (0., 0.))
 		return cells
 
-	def _get_cols(self, cols):
-		""" Return a list of columns, given all permissible
-		    user-friendly formats that cols can be in.
-		    
+	def _prep_query(self, cols):
+		""" 
+		    Parse the column specification and return a dictionary
+		    of (table -> [col1 col2 ...]), where the main table will
+		    be keyed by an empty string ('').
+
 		    Examples:
 		    	'ra dec u g r i z'	-- just those columns
 		    	'*'			-- all available columns
+		    	'ra dec g r sdss.g sdss.r' -- xmatch w. sdss table
+
+		    Return:
+		 	- dtype -- tuple suitable for passing to np.dtype()
+			- tables: dictionary(table->columns)
+				columns: dict(colname_in_source_table->colname_in_output_table)
 		"""
-		if cols == '*':		cols = All
-		if type(cols) == str:	cols = cols.split()
-		return cols
+
+		#
+		# Need: dtype for output table, list of tables and their fields
+		#
+		if cols == All: cols = [ '*' ]
+		if type(cols) == str: cols = cols.split()
+
+		# At this point, cols is an array of tokens (columns, wildcards)
+		# Construct the output dtype as well
+		tables = defaultdict(dict)
+		dtype = []
+		cats = dict()
+		for token in cols:
+			# get table/column
+			p = token.split('.')
+			if len(p) == 1:
+				table = ''; column = p[0];
+			else:
+				table = p[0]; column = p[1]
+
+			# Locate this catalog
+			if table not in cats:
+				cats[table] = self if table == '' else self.get_xmatched_catalog(table)
+			cat = cats[table]
+
+			# Check for asterisk
+			if column == '*':
+				columns = [ name for (name, _) in cat.columns ]
+			else:
+				columns = [ column ]
+
+			# Add output columns, ignoring those already inserted
+			colspec = dict(cat.columns)
+			for column in columns:
+				outname = table + '.' + column if table != '' else column
+				if column not in tables[table]:
+					tables[table][column] = outname
+					dtype += [ (outname, colspec[column]) ]
+
+		# Verify there's at least one column referencing the main catalog
+		if '' not in tables:
+			raise Exception('There has to be at least one column referencing the main catalog')
+
+		ret = (dtype, tables)
+
+		return ret
 
 	### Public methods
 	def __init__(self, path, mode='r', columns=None, level=Automatic, t0=Automatic, dt=Automatic):
@@ -353,7 +428,7 @@ class Catalog:
 			s = s + "%20s %10s\n" % (col[0], col[1])
 		return i + s
 
-	def fetch_cell(self, cell_id, where=None, filter=None, filter_args=(), table_type='catalog', include_cached=False):
+	def fetch_cell(self, cell_id, where=None, filter=None, filter_args=(), table_type='catalog', include_cached=False, return_id=False):
 		""" Load and return all rows from a given cell, possibly
 		    filtering them using filter (if given)
 		"""
@@ -374,9 +449,12 @@ class Catalog:
 		if filter != None:
 			rows = filter(rows, *filter_args)
 
-		return rows
+		if return_id:
+			return rows, np.array(rows['id'])
+		else:
+			return rows
 
-	def fetch(self, cols=All, foot=All, where=None, testbounds=True, include_cached=False, nworkers=None, progress_callback=None, filter=None, filter_args=()):
+	def fetch(self, cols=All, foot=All, where=None, testbounds=True, include_cached=False, join_type='outer', nworkers=None, progress_callback=None, filter=None, filter_args=()):
 		""" Return a table (numpy structured array) of all rows within a
 		    given footprint. Calls 'filter' callable (if given) to filter
 		    the returned rows.
@@ -398,35 +476,29 @@ class Catalog:
 		    filter may be given in 'filter_args'
 		"""
 
-		cols = self._get_cols(cols)
 		files = self._get_cells(foot)
 
 		ret = None
-		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), foot=foot, where=where, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
-			if cols == All:
-				cols = rows.dtype.names
-
+		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), cols=cols, foot=foot, where=where, join_type=join_type, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
 			# ensure enough memory has been allocated (and do it
 			# intelligently if not)
 			if ret == None:
-				rcols = [ (col, rows.dtype[col].str) for col in cols ]
-				ret = np.empty(len(rows), np.dtype(rcols))
+				ret = np.empty_like(rows)
 				nret = 0
 
 			while len(ret) < nret + len(rows):
 				ret.resize(2*(len(ret)+1))
 				#print "Resizing to", len(ret)
 
-			# store
-			for col in cols:
-				ret[col][nret:nret+len(rows)] = rows[col]
+			# append
+			ret[nret:nret+len(rows)] = rows
 			nret = nret + len(rows)
 
 		ret.resize(nret)
 		#print "Resizing to", len(ret)
 		return ret
 
-	def iterate(self, cols=All, foot=All, where=None, testbounds=True, return_array=False, include_cached=False, nworkers=None, progress_callback=None, filter=None, filter_args=()):
+	def iterate(self, cols=All, foot=All, where=None, testbounds=True, return_array=False, include_cached=False, join_type='outer', nworkers=None, progress_callback=None, filter=None, filter_args=()):
 		""" Yield rows (either on a row-by-row basis if return_array==False
 		    or in chunks (numpy structured array)) within a
 		    given footprint. Calls 'filter' callable (if given) to filter
@@ -436,20 +508,16 @@ class Catalog:
 		    'filter' callable.
 		"""
 
-		cols = self._get_cols(cols)
 		files = self._get_cells(foot)
 
-		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), foot=foot, where=where, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
+		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), cols=cols, foot=foot, where=where, join_type=join_type, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
 			if return_array:
 				yield rows
 			else:
-				if cols == All:
-					cols = rows.dtype.names
-
-				for row in izip(*[rows[col] for col in cols]):
+				for row in rows:
 					yield row
 
-	def map_reduce(self, mapper, reducer=None, foot=All, where=None, testbounds=True, include_cached=False, mapper_args=(), reducer_args=(), nworkers=None, progress_callback=None):
+	def map_reduce(self, mapper, reducer=None, cols=All, foot=All, where=None, testbounds=True, include_cached=False, join_type='outer', mapper_args=(), reducer_args=(), nworkers=None, progress_callback=None):
 		""" A MapReduce implementation, where rows from individual cells
 		    get mapped by the mapper, with the result reduced by the reducer.
 		    
@@ -472,6 +540,9 @@ class Catalog:
 		    If the reducer is None, only the mapping step is performed and the
 		    return value of the mapper is passed to the user.
 		"""
+		# parse the column/query specification
+		queryspec = self._prep_query(cols)
+
 		# slice up the job down to individual cells
 		partspecs = self._get_cells(foot)
 
@@ -484,13 +555,15 @@ class Catalog:
 		if reducer == None:
 			for result in pool.imap_unordered(
 					partspecs, _mapper,
-					mapper_args = (mapper, where, self, include_cached, mapper_args),
+					mapper_args = (mapper, where, self, include_cached, queryspec, join_type, mapper_args),
 					progress_callback = progress_callback):
-				yield result
+
+				if type(result) != type(Empty):
+					yield result
 		else:
 			for result in pool.imap_reduce(
 					partspecs, _mapper, _reducer,
-					mapper_args  = (mapper, where, self, include_cached, mapper_args),
+					mapper_args  = (mapper, where, self, include_cached, queryspec, join_type, mapper_args),
 					reducer_args = (reducer, self, reducer_args),
 					progress_callback = progress_callback):
 				yield result
@@ -578,6 +651,29 @@ class Catalog:
 		self.__nrows = compute_counts(self)
 		self._store_dbinfo()
 
+	def _fetch_xmatches(self, cell_id, ids, cat_to_name):
+		"""
+			Return a list of crossmatches corresponding to ids
+		"""
+		table_type = "xmatch_" + cat_to_name
+
+		if len(ids) == 0 or not self.cell_exists(cell_id, table_type=table_type):
+			return ([], [])
+
+		rows = self.fetch_cell(cell_id, table_type=table_type)
+
+		# drop all links where id1 is not in ids
+		sids = np.sort(ids)
+		res = np.searchsorted(sids, rows['id1'])
+		res[res == len(sids)] = 0
+		ok = sids[res] == rows['id1']
+		rows = rows[ok]
+
+		return (rows['id1'], rows['id2'])
+
+	def get_xmatched_catalog(self, cat_to_name):
+		# TODO: record the path of the catalog do dbinfo and get it from there
+		return Catalog(cat_to_name)
 
 ###############################################################
 # Aux functions implementing Catalog.iterate and Catalog.fetch
@@ -593,7 +689,146 @@ def _reducer(kw, reducer, cat, reducer_args):
 	reducer.CATALOG = cat
 	return reducer(kw[0], kw[1], *reducer_args)
 
-def _mapper(partspec, mapper, where, cat, include_cached, mapper_args):
+def extract_columns(rows, cols=All):
+	""" Given a structured array rows, extract and keep
+	    only the list of columns given in cols.
+	"""
+	if cols == All:
+		return rows
+
+	rcols = [ (col, rows.dtype[col].str) for col in cols ]
+	ret   = np.empty(len(rows), np.dtype(rcols))
+	for col in cols: ret[col] = rows[col]
+
+	return ret
+
+def table_join(id1, id2, m1, m2, join_type='outer'):
+	# The algorithm assumes id1 and id2 have no
+	# duplicated elements
+	if False:
+		x,y,t,_ = table_join.cat.unpack_id(table_join.cell_id)
+		radec = bhpix.deproj_bhealpix(x, y)
+
+		if len(np.unique1d(id1)) != len(id1):
+			print "XXXXXXXXXXX"
+			print "len(np.unique1d(id1)) != len(id1): ", len(np.unique1d(id1)), len(id1)
+			print "cell_id = ", table_join.cell_id
+			print "ra,dec =", radec
+			assert len(np.unique1d(id1)) == len(id1)
+		if len(np.unique1d(id2)) != len(id2):
+			print "XXXXXXXXXXX"
+			print "len(np.unique1d(id2)) != len(id2): ", len(np.unique1d(id2)), len(id2)
+			print "cell_id = ", table_join.cell_id
+			print "ra,dec =", radec
+			assert len(np.unique1d(id2)) == len(id2)
+		assert len(m1) == len(m2)
+
+	if len(id1) != 0 and len(id2) != 0 and len(m1) != 0:
+		i1 = id1.argsort()
+		sid1 = id1[i1]
+		res1 = np.searchsorted(sid1, m1)
+		res1[res1 == len(sid1)] = 0
+
+#		ok1 = sid1[res1] == m1
+#		print 'id1:  ', id1
+#		print 'i1:   ', i1
+#		print 'sid1: ', sid1
+#		print 'm1:   ', m1
+#		print 'res1: ', res1
+#		print 'ok1:  ', ok1 
+#		print 'idx1: ', i1[res1[ok1]]
+#		print 'i1_se:', id1[i1[res1[ok1]]]
+#		print ''
+
+		# Cull all links that we don't have in id2
+		i2 = id2.argsort()
+		sid2 = id2[i2]
+		res2 = np.searchsorted(sid2, m2)
+		res2[res2 == len(sid2)] = 0
+
+#		ok2 = sid2[res2] == m2
+#		print 'id2:  ', id2
+#		print 'i2:   ', i2
+#		print 'sid2: ', sid2
+#		print 'm2:   ', m2
+#		print 'res2: ', res2
+#		print 'ok2:  ', ok2 
+#		print 'idx2: ', i2[res2[ok2]]
+#		print 'i2_se:', id2[i2[res2[ok2]]]
+#		print ''
+
+		# Now map links in m to indices in id1 and id2
+		ok = (sid1[res1] == m1) & (sid2[res2] == m2)
+#		print 'ok: ', ok1 & ok2
+
+		idx1 = i1[res1[ok]]
+		idx2 = i2[res2[ok]]
+	else:
+		idx1 = np.empty(0, dtype=int)
+		idx2 = np.empty(0, dtype=int)
+
+	if join_type == 'outer':
+		# Add rows from table 1 that have no match in table 2
+		# have them nominally link to row 0 of table 2, but note their status in isnull column
+		i = np.arange(len(id1))
+		i[idx1] = -1
+		i = i[i != -1]
+		idx1 = np.concatenate((idx1, i))
+		idx2 = np.concatenate((idx2, np.zeros(len(i), int)))
+		isnull = np.zeros(len(idx1), dtype=np.dtype('bool'))
+		isnull[len(idx1)-len(i):] = True
+	else:
+		isnull = np.zeros(len(idx1), dtype=np.dtype('bool'))
+
+	# Sort by idx1, to have all idx1 rows appear consecutively
+	i = idx1.argsort()
+	idx1 = idx1[i]
+	idx2 = idx2[i]
+	isnull = isnull[i]
+
+#	print 'links:'
+#	print id1[idx1]
+#	print id2[idx2]
+#	print isnull
+
+	return (idx1, idx2, isnull)
+
+def in_array(needles, haystack):
+	""" Return a boolean array of len(needles) set to 
+	    True for each needle that is found in the haystack.
+	"""
+	s = np.sort(haystack)
+	i = np.searchsorted(s, needles)
+
+	i[i == len(s)] = 0
+	in_arr = s[i] == needles
+
+	return in_arr
+
+#def in_array(needles, haystack, return_indices=False):
+#	i = haystack.argsort()
+#	s = haystack[i]
+#	k = np.searchsorted(s, needles)
+#	k[l == len()] = 0
+#
+#	in_arr = s[i] == needles
+#	
+#	if return_indices:
+#		hi = i[k]
+#		hi[in_arr == False] = -1
+#	else:
+#		return in_arr
+
+def tstart():
+	return [ time.time() ]
+	
+def tick(s, t):
+	tt = time.time()
+	dt = tt - t[0]
+	print >> sys.stderr, s, ":", dt
+	t[0] = tt
+
+def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, mapper_args):
 	(cell_id, bounds) = partspec
 
 	# pass on some of the internals to the mapper
@@ -603,16 +838,105 @@ def _mapper(partspec, mapper, where, cat, include_cached, mapper_args):
 	mapper.WHERE = where
 	mapper.CELL_FN = cat._file_for_id(cell_id)
 
-	# Fetch all rows
-	rows = cat.fetch_cell(cell_id=cell_id, where=where, table_type='catalog', include_cached=include_cached)
+	# Fetch all rows of the base table
+	rows2, id = cat.fetch_cell(cell_id=cell_id, where=where, table_type='catalog', include_cached=include_cached, return_id=True)
 
 	# Reject objects out of bounds
-	if bounds != None and len(rows):
-		(x, y) = bhpix.proj_bhealpix(rows['ra'], rows['dec'])
+	if bounds != None and len(rows2):
+		(x, y) = bhpix.proj_bhealpix(rows2['ra'], rows2['dec'])
 		in_ = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool)
-		rows = rows[in_]
+		rows2 = rows2[in_]
+		id = id[in_]
 
-	result = mapper(rows, *mapper_args)
+	# Unpack queryspec, create output table, extract only the requested rows
+	(dtypespec, colspec) = queryspec
+	dtype = np.dtype(dtypespec)
+	if rows2.dtype == dtype:
+		rows = rows2
+	else:
+		rows = np.empty(len(rows2), dtype=dtype)
+		for (col, rcol) in colspec[''].iteritems():
+			rows[rcol] = rows2[col]
+
+	# Perform any JOINs, table by table
+	for (table2, cols2) in colspec.iteritems():
+		if table2 == '': continue
+
+		# load the xmatch table and instantiate second catalog object
+		(m1, m2) = cat._fetch_xmatches(cell_id, id, table2)
+
+		if len(m1) != 0:
+			# Load xmatched rows.
+			# get the list of cells containing xmatch link targets
+			# sort them in descending order by the number of targets
+			cat2   = cat.get_xmatched_catalog(table2)
+			cells2 = cat2.cell_for_id(m2)
+			ucells2 = np.unique1d(cells2)
+			count = np.empty_like(ucells2)
+			for (i, ucell) in enumerate(ucells2):
+				count[i] = sum(cells2 == ucell)
+			i = count.argsort()[::-1]; count = count[i]; ucells2 = ucells2[i]
+
+			# Load data from all cells until all cells are exhausted or all
+			# indices in m2 are found
+			rows2 = None
+			mfind = m2
+			for cell_id2 in ucells2:
+				rows_tmp, id_tmp = cat2.fetch_cell(cell_id2, include_cached=True, return_id=True)
+
+				# Extract the rows that may be matched
+				inarr = in_array(id_tmp, mfind)
+				if rows2 == None:
+					rows2 = rows_tmp[inarr]
+					id2   =   id_tmp[inarr]
+				else:
+					np.append(rows2, rows_tmp[inarr])
+					np.append(id2,     id_tmp[inarr])
+
+				# Remove the found indices from the list of indices to look for
+				mfound = in_array(mfind, id_tmp)
+				i = np.arange(len(mfind)); i = i[mfound == False]
+				mfind = mfind[i]
+				if len(mfind) == 0:
+					break
+				print "len(mfind): ", len(mfind)
+		else:
+			id2 = []
+
+		# Join the two tables (rows and rows2), using (m1, m2) linkage information
+		table_join.cell_id = cell_id
+		table_join.cat = cat
+		(idx1, idx2, isnull) = table_join(id, id2, m1, m2, join_type=join_type)
+		nrows = len(idx1)
+
+		if False:
+			print "XXX: table2=", table2, "cols2=", cols2
+			print "m1: ", len(m1)
+			print "cells2: ", len(cells2)
+			print "rows:", len(rows)
+			print "rows2:", len(rows2)
+			print "idx1:", len(idx1)
+			print "isnull==0", len(isnull[isnull==0])
+			print idx1, idx2, isnull
+			print idx1.dtype
+			np.savetxt('match.txt', np.transpose((m1, m2)), fmt='%d')
+			np.savetxt('id1.txt', id, fmt='%d')
+			np.savetxt('id2.txt', id2, fmt='%d')
+			exit()
+
+		# Join the old and the new table
+		rows = rows[idx1]
+		id   = id[idx1]
+		for (col, rcol) in cols2.iteritems():
+			rows[rcol]         = rows2[col][idx2]
+			rows[rcol][isnull] = cat.NULL
+
+	# Pass on to mapper, unless empty
+	if len(rows) != 0:
+		result = mapper(rows, *mapper_args)
+	else:
+		# Catalog.map_reduce will not pass this back to the user (or to reduce)
+		result = Empty
 
 	return result
 

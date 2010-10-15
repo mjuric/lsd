@@ -35,3 +35,37 @@ def astype(v, t):
 		return v.astype(t)
 	return t(v)
 
+# extract/compact functions by David Zaslavsky from 
+# http://stackoverflow.com/questions/783781/python-equivalent-of-phps-compact-and-extract
+#
+# -- mjuric: modification to extract to ensure variable names are legal
+import inspect
+
+legal_variable_characters = ''
+for i in xrange(256):
+	c = chr(i)
+	legal_variable_characters = legal_variable_characters + (c if c.isalnum() else '_')
+
+def compact(*names):
+	caller = inspect.stack()[1][0] # caller of compact()
+	vars = {}
+	for n in names:
+		if n in caller.f_locals:
+			vars[n] = caller.f_locals[n]
+		elif n in caller.f_globals:
+			vars[n] = caller.f_globals[n]
+	return vars
+
+def extract(vars, level=1):
+	caller = inspect.stack()[level][0] # caller of extract()
+	for n, v in vars.items():
+		n = n.translate(legal_variable_characters)
+		caller.f_locals[n] = v   # NEVER DO THIS ;-)
+
+def extract_row(row, level=1):
+	caller = inspect.stack()[level][0] # caller of extract()
+	for n in row.dtype.names:
+		v = row[n]
+		n = n.translate(legal_variable_characters)
+		caller.f_locals[n] = v   # NEVER DO THIS ;-)
+

@@ -5,7 +5,8 @@
 import pool2
 import numpy as np
 from itertools import izip
-import skysurvey.bhpix as bhpix
+import bhpix
+import catalog
 
 ###################################################################
 ## Sky-coverage computation
@@ -32,7 +33,7 @@ def _coverage_mapper(rows, dx = 1., filter=None, filter_args=()):
 
 	return (sky, imin, jmin, self.CELL_FN)
 
-def compute_coverage(cat, dx = 0.5, include_cached=False, where=None, filter=None, filter_args=()):
+def compute_coverage(cat, dx = 0.5, include_cached=False, where=None, filter=None, filter_args=(), foot=catalog.All):
 	""" compute_coverage - produce a sky map of coverage, using
 	    a filter function if given. The output is a starcount
 	    array in (ra, dec) binned to <dx> resolution.
@@ -42,7 +43,7 @@ def compute_coverage(cat, dx = 0.5, include_cached=False, where=None, filter=Non
 
 	sky = np.zeros((width, height))
 
-	for (patch, imin, jmin, fn) in cat.map_reduce(_coverage_mapper, mapper_args=(dx, filter, filter_args), where=where, include_cached=include_cached):
+	for (patch, imin, jmin, fn) in cat.map_reduce(_coverage_mapper, mapper_args=(dx, filter, filter_args), where=where, include_cached=include_cached, foot=foot):
 		if patch is None:
 			continue
 		sky[imin:imin + patch.shape[0], jmin:jmin + patch.shape[1]] += patch

@@ -95,6 +95,12 @@ def xy_center(x, y, level):
 def pix_size(level):
 	return 2.**(1-level)
 
+def pix_idx(x, y, level):
+	i, j = xy_to_ij(x, y, level)
+	wh = nside(level)
+	i = i + wh/2; j = j + wh/2;
+	return j * wh + i
+
 def nside(level):
 	''' Return the number of pixels on the side for a given split level. '''
 	return 2**level
