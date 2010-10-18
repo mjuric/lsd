@@ -40,15 +40,12 @@ if False:
 	exit()
 #########################################################
 
-# Open the catalog
-#cat = ss.Catalog('sdss3')
-
-if False:
-	cat = ss.Catalog('ps1')
+if True:
 	# Compute and store the sky coverage at a given resolution (see skysurvey/tasks.py on how this is implemented)
+	cat = ss.Catalog('ps1')
 	print "Computing sky coverage map: ",
-	sky = ss.compute_coverage(cat, dx=0.05, include_cached=True)
-	pyfits.writeto('foot.0.05.fits', sky.astype(float).transpose()[::-1,], clobber=True)
+	sky = ss.compute_coverage(cat, dx=0.025, include_cached=True)
+	pyfits.writeto('foot.0.025.fits', sky.astype(float).transpose()[::-1,], clobber=True)
 	exit()
 #########################################################
 
@@ -67,7 +64,7 @@ if False:
 #########################################################
 
 if True:
-	# Compute SDSS vs. PS1 r-mag distribution across the entire sky
+	# MapReduce: Compute SDSS vs. PS1 r-mag distribution across the entire sky
 
 	# Mapper: compute histograms of mag. offsets, keyed by healpix pixels
 	def calib_check_mapper(rows, level, edges):
@@ -84,12 +81,7 @@ if True:
 		for pix in set(pixels):
 			rows2 = rows[pixels == pix]
 			dm = rows2["r"] - rows2["sdss3.r"]
-
-			ibin = np.digitize(dm, edges)
-			tmp  = np.bincount(ibin)
-			hist = np.zeros(len(edges)+1, dtype='i8')  # Arghhh, stupid numpy!!
-			hist[0:len(tmp)] = tmp
-
+			hist = ssutils.xhistogram(dm, edges)
 			ret += [ (pix, hist) ]
 
 		return ret

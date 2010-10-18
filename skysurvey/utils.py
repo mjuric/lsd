@@ -69,3 +69,18 @@ def extract_row(row, level=1):
 		n = n.translate(legal_variable_characters)
 		caller.f_locals[n] = v   # NEVER DO THIS ;-)
 
+def xhistogram(data, bin_edges):
+	""" Bin the points in 'data' into bins whose edges are given by bin_edges.
+	    The output array at location i will contain the number of points pts
+	    satisfying bin_edges[i-1] < pts < bin_edges[i]
+	    
+	    Points less than bin_edges[0] and greater than bin_edges[-1] will be
+	    at indices 0 and len(bin_edges) in the output array, respectively.
+	"""
+	bins = np.empty(len(bin_edges)+2, dtype='f8')
+	bins[0]    = -np.inf
+	bins[1:-1] = bin_edges
+	bins[-1]   =  np.inf
+	hist, _ = np.histogram(data, bins)
+	return hist
+
