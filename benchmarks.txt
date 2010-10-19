@@ -1,0 +1,53 @@
+Tests of streaming-through-catalog rate for different column layouts. The
+fastest layout (by factors of 2x or 3x), when wanting to load all columns,
+is the one where columns are stored in pytables Table structure (because of
+minimized seeking)
+
+======================
+
+mjuric@nebel ps1]$ ./import_sdss.py -c sdss /raid14/sweeps/sdss3/2009-11-16.v2/301
+Computing summary statistics [m (2124 elem): 00112233445566778899]  1.48 sec
+ 278651060  rows.   done.
+[mjuric@nebel ps1]$ ./demos.py
+Computing sky coverage map: [m (2124 elem): 00112233445566778899]  139.97 sec
+Overwrite existing file 'foot.x0.025.fits'.
+
+# Reading all columns, default chunking (mostly 32k)
+[mjuric@nebel ps1]$ ./demos.py
+Computing sky coverage map: [m (2124 elem): 00112233445566778899]  506.78 sec
+Overwrite existing file 'foot.x0.025.fits'.
+# running with clean disk cache
+[mjuric@nebel ps1]$ ./demos.py
+Computing sky coverage map: [m (2124 elem): 00112233445566778899]  620.90 sec
+Overwrite existing file 'foot.x0.025.fits'.
+
+# 128k chunk, all columns
+Computing sky coverage map: [m (2124 elem): 00112233445566778899]  1094.65 sec
+Overwrite existing file 'foot.x0.025.fits'.
+
+# 4k chunk, all columns, clean cache
+[mjuric@nebel ps1]$ ./demos.py
+Computing sky coverage map: [m (2124 elem): 00112233445566778899]  519.22 sec
+Overwrite existing file 'foot.x0.025.fits'.
+
+# Old catalog (table layout)
+[mjuric@nebel ps1]$ ./demos.py
+Computing sky coverage map: [m (2124 elem): ::::::::::::::::::::]  267.19 sec
+Overwrite existing file 'foot.x0.025.fits'.
+
+# Column layout, memmap (no full load)
+[mjuric@nebel ps1]$ ./demos.py
+Computing sky coverage map: [m (1606 elem): 00112233445566778899]  112.94 sec
+Overwrite existing file 'foot.x0.025.fits'.
+
+# Column layout, memmap (explicit load of each column)
+[mjuric@nebel ps1]$ ./demos.py
+Computing sky coverage map: [m (1606 elem): 00112233445566778899]  244.53 sec
+
+# Column layout, memmap (explicit load of each column, with cleared file cache)
+[mjuric@nebel ps1]$ ./demos.py
+Computing sky coverage map: [m (1606 elem): 00112233445566778899]  667.94 sec
+Overwrite existing file 'foot.x0.025.fits'.
+[mjuric@nebel ps1]$ ./demos.py
+Computing sky coverage map: [m (1606 elem): 00112233445566778899]  661.02 sec
+Overwrite existing file 'foot.x0.025.fits'.

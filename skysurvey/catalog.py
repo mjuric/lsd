@@ -3,8 +3,8 @@
 from collections import defaultdict
 from contextlib import contextmanager
 import subprocess
-import pickle
-import tables
+import cPickle as pickle
+#import tables
 import numpy.random as ran
 import numpy as np
 import pyfits
@@ -46,19 +46,129 @@ Automatic = None
 Default = None
 All = []
 
-def cset_create(fp, where, name, columns, title='', expectedrows=1*1000*1000):
-	# Create a "column oriented table"
-	cset = fp.createGroup(where, name, title=title)
-	for (name, type) in columns:
-		a = tables.Atom.from_dtype(np.dtype(type))
-		fp.createEArray(cset, name, a, (0, ), expectedrows=expectedrows)
-	return cset
+accumulate = False
+class ColTable:
+	path = None
+	columns = None
+
+	def __init__(self, path, columns=None, mode='r'):
+		self.path = path
+		if mode == 'w':
+			self.columns = dict(columns)
+
+			if not os.path.exists(path):
+				utils.mkdir_p(path)
+
+			# Store column info
+			f = open(path + '/info.json', 'w')
+			f.write(json.dumps(self.columns, indent=4, sort_keys=True))
+			f.close()
+
+			# Erase any existing columns
+			for fn in glob.iglob(path + "/*.npy"):
+				print "Would unlink", fn
+				#os.unlink(fn)
+
+			# Initialize to zero elements
+			for name, dtype in self.columns.iteritems():
+				tmp = np.zeros(0, dtype=np.dtype(dtype))
+				self.write(name, tmp)
+
+		# Load columns
+		self.columns = json.loads(file(self.path + '/info.json').read())
+
+		if accumulate:
+			self.accumfile = open(self.path + '/log.pkl', 'ab')
+		else:
+			if os.path.isfile(self.path + '/log.pkl'):
+				self.rollback()
+
+	def rollback(self):
+		print "Performing rollback on " + self.path
+		fp = open(self.path + '/log.pkl', 'r')
+		cols = dict()
+
+		try:
+			while True:
+				cmd = pickle.load(fp)
+				if   cmd[0] == 'write':
+					(cmd, name, val, dtype) = cmd
+					cols[name] = np.array(len(val), dtype=np.dtype(dtype))
+					cols[name][:] = val
+					#print (cmd, name, len(val), dtype)
+				elif cmd[0] == 'append':
+					(cmd, name, val) = cmd
+					if name not in cols:
+						cols[name] = self.read(name)
+					cols[name] = np.append(cols[name], val)
+					#print (cmd, name, len(val), cols[name].dtype.str)
+		except EOFError:
+			pass
+
+		l = None
+		for name, val in cols.iteritems():
+			if l == None:
+				l = len(val)
+			assert l == len(val)
+			#print name, len(val)
+
+		for name, val in cols.iteritems():
+			self.write(name, val)
+
+		os.unlink(self.path + '/log.pkl')
+
+	def close(self):
+		if accumulate:
+			self.accumfile.close()
+		pass
+
+	def cols(self):
+		return self.columns.keys()
+
+	def read(self, name, dtype=None):
+		cpath = '%s/%s.npy' % (self.path, name)
+		if dtype == None: dtype = self.columns[name]
+		fsize = os.path.getsize(cpath)
+		if fsize == 0:
+			return np.zeros(0, dtype=dtype)
+		else:
+			return np.memmap(cpath, dtype=dtype, mode='r')
+
+	def write(self, name, val, dtype=None):
+		if accumulate == True and len(val) > 1:
+			pickle.dump(('write', name, val, dtype), self.accumfile, -1)
+		else:
+			cpath = '%s/%s.npy' % (self.path, name)
+			open(cpath, "w").close()
+			if len(val) != 0:
+				if dtype == None: dtype = self.columns[name]
+				mm = np.memmap(cpath, dtype=dtype, mode='w+', shape=len(val))
+				mm[:] = val[:]
+				del mm
+
+	def append(self, name, val):
+		if accumulate == True:
+			pickle.dump(('append', name, val), self.accumfile, -1)
+		else:
+			cpath = '%s/%s.npy' % (self.path, name)
+			offset = os.path.getsize(cpath)
+			mm = np.memmap(cpath, dtype=self.columns[name], mode='r+', shape=len(val), offset=offset)
+			mm[:] = val[:]
+			del mm
+
+	def write_seq(self, name, val):
+		v = np.array([ val ])
+		return self.write('seq.'+name, v, dtype='u8')
+
+	def read_seq(self, name):
+		return self.read('seq.'+name, dtype='u8')[0]
+
 
 def cset_get_column_list(cset):
-	return [ col.name for col in cset._f_listNodes('EArray') ]
+	return cset.cols()
 
 def cset_read_col(cset, col):
-	return cset.__getattr__(col).read()
+	return cset.read(col)
 
 def cset_read(cset, cols=All):
 	if cols == All:
@@ -66,7 +176,7 @@ def cset_read(cset, cols=All):
 
 	ret = Table()
 	for name in cols:
-		ret[name] = cset.__getattr__(name).read()
+		ret[name] = cset_read_col(cset, name)
 
 	return ret
 
@@ -75,18 +185,18 @@ def cset_append(cset, table):
 	#	1. All columns from the cset must be in table
 	#	2. No extra columns are allowed to be in table
 	#	3. The lengths of all columns must be the same
-	columns = cset._f_listNodes('EArray')
+	columns = cset_get_column_list(cset)
 	l = None
 	for col in columns:
-		if col.name not in table:
-			raise Exception('Column "%s" not found in the set of rows to be appended.' % col.name)
+		if col not in table:
+			raise Exception('Column "%s" not found in the set of rows to be appended.' % col)
 		if l == None:
-			l = len(table[col.name])
-		if l != len(table[col.name]):
-			raise Exception('Length of column "%s" different from the others.' % col.name)
+			l = len(table[col])
+		if l != len(table[col]):
+			raise Exception('Length of column "%s" different from the others.' % col)
 
 	if len(columns) != table.ncols():
-		c1 = [ col.name for col in columns ]
+		c1 = columns
 		c2 = table.keys()
 		print sorted(c1)
 		print sorted(c2)
@@ -94,9 +204,18 @@ def cset_append(cset, table):
 
 	# Append
 	for col in columns:
-		col.append(table[col.name])
+		cset.append(col, table[col])
 
 	return cset
+
+class CFile:
+	dir = None
+	mode = None
+
+	def __init__(self, dir, mode='r'):
+		self.dir = dir
+		self.mode = mode
+
 
 class Catalog:
 	""" A spatially and temporally partitioned object catalog.
@@ -241,36 +360,31 @@ class Catalog:
 		fn = self._file_for_id(id, table_type)
 
 		if mode == 'r':
-			return (tables.openFile(fn), None)
+			return (ColTable(fn + '/' + table_type), None)
 		elif mode == 'w':
-			if not os.path.isfile(fn):
+			path = fn[:fn.rfind('/')];
+			if not os.path.isdir(path):
 				# create directory if needed
-				path = fn[:fn.rfind('/')];
 				if not os.path.exists(path):
 					utils.mkdir_p(path)
 
-				utils.shell('/usr/bin/lockfile -1 -r%d "%s.lock"' % (retries, fn) )
+			utils.shell('/usr/bin/lockfile -1 -r%d "%s.lock"' % (retries, fn) )
 
+			if not os.path.isdir(fn):
 				# intialize the file
-				table_type = table_type.split('_')[0]
-				if table_type == 'catalog':
-					fp  = tables.openFile(fn, mode='w', title='SkysurveyDB')
-					cset_create(fp, '/', 'catalog', self.columns, "Catalog", expectedrows=20*1000*1000)
-					##fp.createTable('/', 'catalog', np.dtype(self.columns), "Catalog", expectedrows=20*1000*1000)
-					fp.createArray('/', 'id_seq', np.ones(1, dtype=np.uint32), 'A sequence for catalog table ID')
-				elif table_type == 'xmatch':
-					fp  = tables.openFile(fn, mode='w', title='Skysurvey xmatch table')
-					#fp.createTable('/', 'xmatch', np.dtype([('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')]), "xmatch", expectedrows=20*1000*1000)
-					cset_create(fp, '/', "xmatch", [('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')], "xmatch table", expectedrows=20*1000*1000)
+				tt = table_type.split('_')[0]
+				if   tt == 'catalog':
+					cset = ColTable(fn + '/catalog', mode='w', columns=self.columns)
+					cset.write_seq('id_seq', 1)
+				elif tt == 'xmatch':
+					cset = ColTable(fn + '/' + table_type, mode='w', columns=[('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')])
 				else:
 					raise Exception('Unknown table type!')
 			else:
 				# open for appending
-				utils.shell('/usr/bin/lockfile "%s.lock"' % fn)
+				cset = ColTable(fn + '/' + table_type, mode='a')
 
-				fp = tables.openFile(fn, mode='a')
-
-			return (fp, fn + '.lock')
+			return (cset, fn + '.lock')
 		else:
 			raise Exception("Mode must be one of 'r' or 'w'")
 
@@ -436,7 +550,7 @@ class Catalog:
 				try:
 					i = k % len(unique_cells)
 					cell = unique_cells[i]
-					(fp, lockfile)  = self._open_cell(cell, 'w', retries=0, table_type='catalog')
+					(cset, lockfile)  = self._open_cell(cell, 'w', retries=0, table_type='catalog')
 					unique_cells.pop(i)
 					break
 				except subprocess.CalledProcessError as err:
@@ -445,18 +559,17 @@ class Catalog:
 			else:
 				raise Exception('Appear to be stuck on a lock file!')
 
-			t   = fp.root.catalog
-			id0 = fp.root.id_seq[0]
+			id0 = cset.read_seq('id_seq')
 
 			# Extract and store the subset of rows that belong to this cell
 			rows2 = rows[cells == cell]
 			nrows2 = rows2.nrows()
 			rows2['id'] += np.arange(id0, id0 + nrows2, dtype='u8')
-			cset_append(t, rows2)
+			cset_append(cset, rows2)
 
 			# Increment primary key (id) counter
-			fp.root.id_seq[0] += nrows2
-			fp.close()
+			cset.write_seq('id_seq', id0 + nrows2)
+			cset.close()
 			os.unlink(lockfile)
 
 			##print '[', len(rows2), ']'
@@ -495,23 +608,21 @@ class Catalog:
 		    filtering them using filter (if given).
 		"""
 
-		with self.cell(cell_id, table_type=table_type) as fp:
+		with self.cell(cell_id, table_type=table_type) as cset:
 			# Find the desired cset
 			table_type = table_type.split('_')[0]
-			table = fp.root.__getattr__(table_type)
 
 			# Prepare column set to load
-			cols = set(cols if cols != All else cset_get_column_list(table))
+			cols = set(cols if cols != All else cset_get_column_list(cset))
 			if include_implicit and table_type in self.implicit_columns:
 				cols.update(self.implicit_columns[table_type])
 			
 			# Fetch requested columns
-			rows = cset_read(table, cols)
+			rows = cset_read(cset, cols)
 
-			# Fetch and append cached objects, if requested
-			if include_cached and '_neighbor_cache' in table:
-				cached = cset_read(table._neighbor_cache, cols)
-				rows.append_rows(cached)
+			# Remove cached objects, unless requested otherwise
+			if not include_cached and 'cached' in cset.cols():
+				rows = rows[rows['cached'] == 0]
 
 		# Custom user-supplied filter (call only for nonzero rows)
 		if filter != None and rows.nrows() == 0:

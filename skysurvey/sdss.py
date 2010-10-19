@@ -1,6 +1,7 @@
 import catalog
 import pyfits
 import pool2
+import utils
 import numpy as np
 from slalib import sla_eqgal
 from table import Table
@@ -61,6 +62,7 @@ def import_from_sweeps(catdir, sweep_files, create=False):
 	else:
 		cat = catalog.Catalog(catdir)
 
+	catalog.accumulate = True
 	at = 0; ntot = 0
 	pool = pool2.Pool()
 	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (cat,)):
@@ -68,6 +70,12 @@ def import_from_sweeps(catdir, sweep_files, create=False):
 		at = at + 1
 		ntot = ntot + nloaded
 #		print('  ===> Imported ' + file + ('[%d/%d, %5.2f%%] +%-6d %9d' % (at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot)))
+
+	catalog.accumulate = False
+	files = utils.shell('find "' + catdir + '" -name "*.pkl"').splitlines()
+	for fn in files:
+		path = fn[:fn.rfind('/')];
+		catalog.ColTable(path)
 
 def import_from_sweeps_aux(file, cat):
 	# import an SDSS run
