@@ -35,16 +35,18 @@ for (o, a) in optlist:
 # Actual work
 #
 files = shell('find "' + sweep_dir + '" -name "*star*.fits.gz" -o -name "*gal*.fits.gz" ').splitlines()
+#files = files[0:1000]
 
-print "Importing SDSS catalog ",
-sdss.import_from_sweeps(cat_dir, files, create)
-print " done."
+#print "Importing SDSS catalog ",
+#sdss.import_from_sweeps(cat_dir, files, create)
+#print " done."
 
 cat = lsd.Catalog(cat_dir)
-print "Building neighbor cache ",
-cat.build_neighbor_cache()
-print " done."
+#print "Building neighbor cache ",
+#cat.build_neighbor_cache()
+#print " done."
 
 print "Computing summary statistics ",
 cat.compute_summary_stats()
+print cat.nrows(), " rows. ",
 print " done."

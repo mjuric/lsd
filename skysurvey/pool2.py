@@ -62,7 +62,8 @@ def progress_pct(stage, step, input, index, result):
 		self.at = self.at + 1
 		pct = 100. * self.at / self.len
 		while self.pct <= pct:
-			sys.stderr.write(self.sign)
+			sign = self.sign if self.sign != ':' else '%d' % int((self.pct - 5) / 10)
+			sys.stderr.write(sign)
 			self.pct = self.pct + 5
 	elif step == 'end':
 		if stage == self.endstage:

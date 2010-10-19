@@ -238,13 +238,13 @@ def neighbors(x, y, level, include_self=False):
 #		print (cx, cy)
 		for di in xrange(-1, 2):
 			for dj in xrange(-1, 2):
-				if not include_self and di == 0 and dj == 0:
-					continue
-
 				(x, y) = (cx + di*dx, cy + dj*dx)
 				pix = map_to_valid_pixels(x, y, dx)
 #				print '  n=', di, dj, pix
 				result.update(pix)
+
+	if not include_self and (cx, cy) in result:
+		result.remove((cx, cy))
 
 	return result
 ################################################################

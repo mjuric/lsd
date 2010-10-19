@@ -42,10 +42,10 @@ if False:
 
 if True:
 	# Compute and store the sky coverage at a given resolution (see skysurvey/tasks.py on how this is implemented)
-	cat = ss.Catalog('ps1')
+	cat = ss.Catalog('sdss')
 	print "Computing sky coverage map: ",
 	sky = ss.compute_coverage(cat, dx=0.025, include_cached=True)
-	pyfits.writeto('foot.0.025.fits', sky.astype(float).transpose()[::-1,], clobber=True)
+	pyfits.writeto('foot.x0.025.fits', sky.astype(float).transpose()[::-1,], clobber=True)
 	exit()
 #########################################################
 

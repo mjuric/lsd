@@ -16,7 +16,7 @@ def _coverage_mapper(rows, dx = 1., filter=None, filter_args=()):
 	if filter is not None:
 		rows = filter(rows, *filter_args)
 
-	if len(rows) == 0:
+	if rows.nrows() == 0:
 		return (None, None, None, None)
 
 	i = (rows['ra'] / dx).astype(int)
@@ -43,7 +43,7 @@ def compute_coverage(cat, dx = 0.5, include_cached=False, where=None, filter=Non
 
 	sky = np.zeros((width, height))
 
-	for (patch, imin, jmin, fn) in cat.map_reduce(_coverage_mapper, mapper_args=(dx, filter, filter_args), where=where, include_cached=include_cached, foot=foot):
+	for (patch, imin, jmin, fn) in cat.map_reduce(_coverage_mapper, mapper_args=(dx, filter, filter_args), cols=[], where=where, include_cached=include_cached, foot=foot):
 		if patch is None:
 			continue
 		sky[imin:imin + patch.shape[0], jmin:jmin + patch.shape[1]] += patch
@@ -56,11 +56,11 @@ def compute_coverage(cat, dx = 0.5, include_cached=False, where=None, filter=Non
 def ls_mapper(rows):
 	# return the number of rows in this chunk, keyed by the filename
 	self = ls_mapper
-	return (self.CELL_FN, len(rows))
+	return (self.CELL_FN, rows.nrows())
 
 def compute_counts(cat, include_cached=False):
 	ntotal = 0
-	for (file, nobjects) in cat.map_reduce(ls_mapper, include_cached=include_cached):
+	for (file, nobjects) in cat.map_reduce(ls_mapper, cols='id', include_cached=include_cached):
 		ntotal = ntotal + nobjects
 	return ntotal
 ###################################################################

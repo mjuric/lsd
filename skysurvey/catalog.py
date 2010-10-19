@@ -26,6 +26,7 @@ import fcntl
 import Polygon.IO
 import utils
 import footprint
+from table import Table
 from utils import astype
 
 # Special return type used in _mapper() and Catalog.map_reduce
@@ -45,6 +46,58 @@ Automatic = None
 Default = None
 All = []
 
+def cset_create(fp, where, name, columns, title='', expectedrows=1*1000*1000):
+	# Create a "column oriented table"
+	cset = fp.createGroup(where, name, title=title)
+	for (name, type) in columns:
+		a = tables.Atom.from_dtype(np.dtype(type))
+		fp.createEArray(cset, name, a, (0, ), expectedrows=expectedrows)
+	return cset
+
+def cset_get_column_list(cset):
+	return [ col.name for col in cset._f_listNodes('EArray') ]
+
+def cset_read_col(cset, col):
+	return cset.__getattr__(col).read()
+
+def cset_read(cset, cols=All):
+	if cols == All:
+		cols = cset_get_column_list(cset)
+
+	ret = Table()
+	for name in cols:
+		ret[name] = cset.__getattr__(name).read()
+
+	return ret
+
+def cset_append(cset, table):
+	# Sanity checks:
+	#	1. All columns from the cset must be in table
+	#	2. No extra columns are allowed to be in table
+	#	3. The lengths of all columns must be the same
+	columns = cset._f_listNodes('EArray')
+	l = None
+	for col in columns:
+		if col.name not in table:
+			raise Exception('Column "%s" not found in the set of rows to be appended.' % col.name)
+		if l == None:
+			l = len(table[col.name])
+		if l != len(table[col.name]):
+			raise Exception('Length of column "%s" different from the others.' % col.name)
+
+	if len(columns) != table.ncols():
+		c1 = [ col.name for col in columns ]
+		c2 = table.keys()
+		print sorted(c1)
+		print sorted(c2)
+		raise Exception('Extra columns found in the set of rows to be appended.')
+
+	# Append
+	for col in columns:
+		col.append(table[col.name])
+
+	return cset
+
 class Catalog:
 	""" A spatially and temporally partitioned object catalog.
 	
@@ -59,6 +112,9 @@ class Catalog:
 	__nrows = 0
 
 	NULL = 0		# The value for NULL in JOINed rows that had no matches
+	implicit_columns = [	# Columns implicitly loaded for a given table type
+		{ 'catalog': ['id', 'ra', 'dec'] }
+	]
 
 	def cell_for_id(self, id):
 		# Note: there's a more direct way of doing this,
@@ -199,11 +255,13 @@ class Catalog:
 				table_type = table_type.split('_')[0]
 				if table_type == 'catalog':
 					fp  = tables.openFile(fn, mode='w', title='SkysurveyDB')
-					fp.createTable('/', 'catalog', np.dtype(self.columns), "Catalog", expectedrows=20*1000*1000)
+					cset_create(fp, '/', 'catalog', self.columns, "Catalog", expectedrows=20*1000*1000)
+					##fp.createTable('/', 'catalog', np.dtype(self.columns), "Catalog", expectedrows=20*1000*1000)
 					fp.createArray('/', 'id_seq', np.ones(1, dtype=np.uint32), 'A sequence for catalog table ID')
 				elif table_type == 'xmatch':
 					fp  = tables.openFile(fn, mode='w', title='Skysurvey xmatch table')
-					fp.createTable('/', 'xmatch', np.dtype([('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')]), "xmatch", expectedrows=20*1000*1000)
+					#fp.createTable('/', 'xmatch', np.dtype([('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')]), "xmatch", expectedrows=20*1000*1000)
+					cset_create(fp, '/', "xmatch", [('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')], "xmatch table", expectedrows=20*1000*1000)
 				else:
 					raise Exception('Unknown table type!')
 			else:
@@ -358,13 +416,15 @@ class Catalog:
 
 		self._store_dbinfo()
 
-	def insert(self, rows, ra, dec, t = None):
-		""" Insert a set of rows into the database. Protects against multiple
-		    writers simultaneously inserting into the same file
+	def append(self, rows, ra, dec, t = None):
+		""" Append a Table of rows into the database. Protects against multiple
+		    writers simultaneously appending to the same file
 
-		    The rows being inserted must NOT contain the index column.
+		    The rows being appended MUST contain the index column, whose
+		    value will be filled in by this method
 		"""
-		ids = self.id_from_pos(ra, dec, t)
+		rows['id'] = self.id_from_pos(ra, dec, t)
+
 		cells = self.id_from_pos(ra, dec, t, self.level)
 		unique_cells = list(set(cells))
 
@@ -386,26 +446,28 @@ class Catalog:
 				raise Exception('Appear to be stuck on a lock file!')
 
 			t   = fp.root.catalog
-			id2 = fp.root.id_seq[0]
+			id0 = fp.root.id_seq[0]
 
-			# Extract and store the subset of rows that belong into this cell
-			iit = iter(xrange(len(rows) + 1))
-			rows2 = [ (ids[i] + id2 + np.uint64(next(iit)),) + rows[i] for i in xrange(len(rows)) if(cells[i] == cell) ]
+			# Extract and store the subset of rows that belong to this cell
+			rows2 = rows[cells == cell]
+			nrows2 = rows2.nrows()
+			rows2['id'] += np.arange(id0, id0 + nrows2, dtype='u8')
+			cset_append(t, rows2)
 
-			t.append(rows2)
-			fp.root.id_seq[0] += len(rows2)
+			# Increment primary key (id) counter
+			fp.root.id_seq[0] += nrows2
 			fp.close()
 			os.unlink(lockfile)
 
 			##print '[', len(rows2), ']'
-			self.__nrows = self.__nrows + len(rows2)
-			ntot = ntot + len(rows2)
+			self.__nrows = self.__nrows + nrows2
+			ntot = ntot + nrows2
 
-		if ntot != len(ids):
+		if ntot != len(cells):
 			print 'ntot=', ntot
 			raise Exception('**** Bug detected ****')
 
-		return ids
+		return rows['id']
 
 	def nrows(self):
 		return self.__nrows
@@ -428,31 +490,34 @@ class Catalog:
 			s = s + "%20s %10s\n" % (col[0], col[1])
 		return i + s
 
-	def fetch_cell(self, cell_id, where=None, filter=None, filter_args=(), table_type='catalog', include_cached=False, return_id=False):
+	def fetch_cell(self, cell_id, cols=All, filter=None, filter_args=(), table_type='catalog', include_cached=False, include_implicit=True):
 		""" Load and return all rows from a given cell, possibly
-		    filtering them using filter (if given)
+		    filtering them using filter (if given).
 		"""
+
 		with self.cell(cell_id, table_type=table_type) as fp:
+			# Find the desired cset
 			table_type = table_type.split('_')[0]
 			table = fp.root.__getattr__(table_type)
 
-			if where == None:
-				rows = table.read()
-			else:
-				rows = table.readWhere(where)
+			# Prepare column set to load
+			cols = set(cols if cols != All else cset_get_column_list(table))
+			if include_implicit and table_type in self.implicit_columns:
+				cols.update(self.implicit_columns[table_type])
+			
+			# Fetch requested columns
+			rows = cset_read(table, cols)
 
-		# Reject cached objects, unless requested otherwise
-		if not include_cached and len(rows) and "cached" in rows.dtype.names:
-			rows = rows[rows["cached"] == 0]
+			# Fetch and append cached objects, if requested
+			if include_cached and '_neighbor_cache' in table:
+				cached = cset_read(table._neighbor_cache, cols)
+				rows.append_rows(cached)
 
-		# Custom user-supplied filter
-		if filter != None:
+		# Custom user-supplied filter (call only for nonzero rows)
+		if filter != None and rows.nrows() == 0:
 			rows = filter(rows, *filter_args)
 
-		if return_id:
-			return rows, np.array(rows['id'])
-		else:
-			return rows
+		return rows
 
 	def fetch(self, cols=All, foot=All, where=None, testbounds=True, include_cached=False, join_type='outer', nworkers=None, progress_callback=None, filter=None, filter_args=()):
 		""" Return a table (numpy structured array) of all rows within a
@@ -830,6 +895,7 @@ def tick(s, t):
 
 def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, mapper_args):
 	(cell_id, bounds) = partspec
+	(outcols, coltables) = queryspec
 
 	# pass on some of the internals to the mapper
 	mapper.CELL_ID = cell_id
@@ -839,27 +905,18 @@ def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, 
 	mapper.CELL_FN = cat._file_for_id(cell_id)
 
 	# Fetch all rows of the base table
-	rows2, id = cat.fetch_cell(cell_id=cell_id, where=where, table_type='catalog', include_cached=include_cached, return_id=True)
+	rows = cat.fetch_cell(cell_id=cell_id, cols=coltables[''].keys(), table_type='catalog', include_cached=include_cached)
+	if rows.nrows() == 0: return Empty
 
 	# Reject objects out of bounds
-	if bounds != None and len(rows2):
-		(x, y) = bhpix.proj_bhealpix(rows2['ra'], rows2['dec'])
+	if bounds != None and len(rows):
+		(x, y) = bhpix.proj_bhealpix(rows['ra'], rows['dec'])
 		in_ = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool)
-		rows2 = rows2[in_]
-		id = id[in_]
-
-	# Unpack queryspec, create output table, extract only the requested rows
-	(dtypespec, colspec) = queryspec
-	dtype = np.dtype(dtypespec)
-	if rows2.dtype == dtype:
-		rows = rows2
-	else:
-		rows = np.empty(len(rows2), dtype=dtype)
-		for (col, rcol) in colspec[''].iteritems():
-			rows[rcol] = rows2[col]
+		rows = rows[in_]
+	if rows.nrows() == 0: return Empty
 
 	# Perform any JOINs, table by table
-	for (table2, cols2) in colspec.iteritems():
+	for (table2, cols2) in coltables.iteritems():
 		if table2 == '': continue
 
 		# load the xmatch table and instantiate second catalog object
@@ -882,16 +939,14 @@ def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, 
 			rows2 = None
 			mfind = m2
 			for cell_id2 in ucells2:
-				rows_tmp, id_tmp = cat2.fetch_cell(cell_id2, include_cached=True, return_id=True)
+				rows_tmp = cat2.fetch_cell(cell_id2, cols=cols2.keys(), include_cached=True)
 
 				# Extract the rows that may be matched
 				inarr = in_array(id_tmp, mfind)
 				if rows2 == None:
 					rows2 = rows_tmp[inarr]
-					id2   =   id_tmp[inarr]
 				else:
-					np.append(rows2, rows_tmp[inarr])
-					np.append(id2,     id_tmp[inarr])
+					rows2.append_rows(rows_tmp[inarr])
 
 				# Remove the found indices from the list of indices to look for
 				mfound = in_array(mfind, id_tmp)
@@ -901,13 +956,14 @@ def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, 
 					break
 				print "len(mfind): ", len(mfind)
 		else:
-			id2 = []
+			rows2 = Table(cols2)
 
 		# Join the two tables (rows and rows2), using (m1, m2) linkage information
-		table_join.cell_id = cell_id
-		table_join.cat = cat
-		(idx1, idx2, isnull) = table_join(id, id2, m1, m2, join_type=join_type)
+		table_join.cell_id = cell_id	# for debugging
+		table_join.cat = cat		# for debugging
+		(idx1, idx2, isnull) = table_join(rows['id'], rows2['id'], m1, m2, join_type=join_type)
 		nrows = len(idx1)
+		if rows.nrows() == 0: return Empty
 
 		if False:
 			print "XXX: table2=", table2, "cols2=", cols2
@@ -920,19 +976,21 @@ def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, 
 			print idx1, idx2, isnull
 			print idx1.dtype
 			np.savetxt('match.txt', np.transpose((m1, m2)), fmt='%d')
-			np.savetxt('id1.txt', id, fmt='%d')
-			np.savetxt('id2.txt', id2, fmt='%d')
+			np.savetxt('id1.txt', rows['id'], fmt='%d')
+			np.savetxt('id2.txt', rows2['id'], fmt='%d')
 			exit()
 
 		# Join the old and the new table
 		rows = rows[idx1]
-		id   = id[idx1]
 		for (col, rcol) in cols2.iteritems():
 			rows[rcol]         = rows2[col][idx2]
 			rows[rcol][isnull] = cat.NULL
 
+	# Keep only the columns requested by the user, and in the right order
+	rows = rows[ tuple((name for (name, _) in outcols)) ]
+
 	# Pass on to mapper, unless empty
-	if len(rows) != 0:
+	if rows.nrows() != 0:
 		result = mapper(rows, *mapper_args)
 	else:
 		# Catalog.map_reduce will not pass this back to the user (or to reduce)
@@ -946,8 +1004,6 @@ def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, 
 def _cache_maker_mapper(rows, margin_x, margin_t):
 	# Map: fetch all objects to be mapped, return them keyed
 	# by cell ID
-
-	if len(rows) == 0: return []
 
 	self         = _cache_maker_mapper
 	cat          = self.CATALOG
@@ -994,7 +1050,7 @@ def _cache_maker_mapper(rows, margin_x, margin_t):
 	rows = rows[in_]
 
 	res = []
-	if len(rows):
+	if rows.nrows():
 		for neighbor in cat.neighboring_cells(cell_id):
 			res.append( (neighbor, rows) )
 
@@ -1016,22 +1072,18 @@ def _cache_maker_reducer(cell_id, newrowblocks):
 
 	ncached = 0
 	with cat.cell(cell_id, mode='w') as fp:
-		#fp.createTable('/', 'catalog_tmp', np.dtype(cat.columns), "Catalog", expectedrows=20*1000*1000)
+		# Add a '_neighbor_cache' subtable (and remove any existing ones)
+		if '_neighbor_cache' in fp.root.catalog:
+			fp.removeNode('/catalog/_neighbor_cache', recursive=True)
+		cset = cset_create(fp, '/catalog', '_neighbor_cache', cat.columns, title='Neighbor cache')
 
-		rows = fp.root.catalog.read();
-		rows = rows[rows["cached"] == 0]
-
-		fp.root.catalog.copy('/', 'catalog_tmp', start=0, stop=0)
-		fp.root.catalog_tmp.append(rows)
-
+		# Append
 		for newrows in newrowblocks:
 			newrows["cached"] = True
-			fp.root.catalog_tmp.append(newrows)
-			ncached = ncached + len(newrows)
+			cset_append(cset, newrows)
+			ncached = ncached + newrows.nrows()
 
 		fp.flush()
-		fp.root.catalog.remove()
-		fp.root.catalog_tmp.rename('catalog')
 
 	# Return the number of new rows cached into this cell
 	return (cell_id, ncached)

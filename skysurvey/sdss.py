@@ -3,6 +3,7 @@ import pyfits
 import pool2
 import numpy as np
 from slalib import sla_eqgal
+from table import Table
 
 def initialize_column_definitions():
 	# Columns from sweep files
@@ -22,22 +23,22 @@ def initialize_column_definitions():
 	]
 
 	# Magnitude-related columns
+	magBands = ['u', 'g', 'r', 'i', 'z']
+	magSuffix = ['', 'Err', 'Ext', 'Calib']
 	magCols = [];
-	for mag in 'ugriz':
-		magCols.append( (mag,           'f4') )
-		magCols.append( (mag + 'Err',   'f4') )
-		magCols.append( (mag + 'Ext',   'f4') )
-		magCols.append( (mag + 'Calib', 'f4') )
+	for mag in magBands:
+		for suffix in magSuffix:
+			magCols.append( (mag + suffix, 'f4') )
 
 	# All columns
-	columns = [('id', 'u8'), ('cached', 'b')] +	\
+	columns = [('id', 'u8'), ('cached', 'bool')] +	\
 		  [('l',  'f8'), ('b', 'f8')] +		\
 		  [f[0:2] for f in objCols] +		\
 		  magCols
 
-	return (columns, objCols)
+	return (columns, objCols, magCols, magBands, magSuffix)
 
-(columns, objCols) = initialize_column_definitions();
+(columns, objCols, magCols, magBands, magSuffix) = initialize_column_definitions();
 
 # SDSS flag definitions
 F1_SATURATED		 = (2**18)
@@ -81,13 +82,14 @@ def import_from_sweeps_aux(file, cat):
 	ok = (rs & RS_SURVEY_PRIMARY != 0) & (f1 & F1 == 0) & (f2 & F2 == 0)
 
 	# Import objects
+	cols = Table()
 	if any(ok != 0):
 		# Load the data, cutting on flags
-		cols                     = [ dat.field(col[2])[ok]             for col in objCols ]
-		(ext, flux, ivar, calib) = [ dat.field(col)[ok].transpose()    for col in ['extinction', 'modelflux', 'modelflux_ivar', 'calib_status'] ]
-		(ra, dec)                = cols[4], cols[5]
+		for (catcol, _, sweepcol) in objCols:
+			cols[catcol] = dat.field(sweepcol)[ok]
 
 		# Compute magnitudes in all bands
+		(ext, flux, ivar, calib) = [ dat.field(col)[ok].transpose()    for col in ['extinction', 'modelflux', 'modelflux_ivar', 'calib_status'] ]
 		for band in xrange(5):
 			(fluxB, ivarB, extB, calibB) = (flux[band], ivar[band], ext[band], calib[band])
 
@@ -95,21 +97,26 @@ def import_from_sweeps_aux(file, cat):
 			mag = -2.5 * np.log10(fluxB) + 22.5
 			magErr = (1.08574 / fluxB) / np.sqrt(ivarB)
 
-			cols += [mag, magErr, extB, calibB]
+			b = magBands[band]
+			cols[b] = mag
+			cols[b + 'Err'] = magErr
+			cols[b + 'Ext'] = extB
+			cols[b + 'Calib'] = calibB
 
 		# Compute and add "derived" columns
+		(ra, dec) = cols["ra"], cols["dec"]
 		l = np.empty_like(ra)
 		b = np.empty_like(dec)
 		for i in xrange(len(ra)):
 			(l[i], b[i]) = np.degrees(sla_eqgal(*np.radians((ra[i], dec[i]))))
-		cached = np.zeros(len(ra), dtype='b')
+		cached = np.zeros(len(ra), dtype='bool')
 
-		cols.insert(0, cached)
-		cols.insert(1, l)
-		cols.insert(2, b)
+		cols["cached"] = cached
+		cols["l"] = l
+		cols["b"] = b
 
 		# Transform a list of columns into a list of rows, and store
-		ids = cat.insert(zip(*cols), ra, dec)
+		ids = cat.append(cols, ra, dec)
 	else:
 		ids = []
 
