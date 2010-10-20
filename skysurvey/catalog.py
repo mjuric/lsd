@@ -890,8 +890,8 @@ def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, 
 					rows2 = rows_tmp[inarr]
 					id2   =   id_tmp[inarr]
 				else:
-					np.append(rows2, rows_tmp[inarr])
-					np.append(id2,     id_tmp[inarr])
+					rows2 = np.append(rows2, rows_tmp[inarr])
+					id2   = np.append(id2,     id_tmp[inarr])
 
 				# Remove the found indices from the list of indices to look for
 				mfound = in_array(mfind, id_tmp)

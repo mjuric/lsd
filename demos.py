@@ -40,7 +40,7 @@ if False:
 	exit()
 #########################################################
 
-if True:
+if False:
 	# Compute and store the sky coverage at a given resolution (see skysurvey/tasks.py on how this is implemented)
 	cat = ss.Catalog('ps1')
 	print "Computing sky coverage map: ",
