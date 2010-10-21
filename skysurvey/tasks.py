@@ -8,6 +8,13 @@ from itertools import izip
 import bhpix
 import catalog
 
+def as_columns(rows, start=None, stop=None, stride=None):
+	# Emulate slice syntax: only one index present
+	if stop == None and stride == None:
+		stop = start
+		start = None
+	return tuple((rows[col] for col in rows.dtype.names[slice(start, stop, stride)]))
+
 ###################################################################
 ## Sky-coverage computation
 def _coverage_mapper(rows, dx = 1., filter=None, filter_args=()):
@@ -19,8 +26,10 @@ def _coverage_mapper(rows, dx = 1., filter=None, filter_args=()):
 	if len(rows) == 0:
 		return (None, None, None, None)
 
-	i = (rows['ra'] / dx).astype(int)
-	j = ((90 - rows['dec']) / dx).astype(int)
+	lon, lat = as_columns(rows, 2)
+
+	i = (lon / dx).astype(int)
+	j = ((90 - lat) / dx).astype(int)
 
 	(imin, imax, jmin, jmax) = (i.min(), i.max(), j.min(), j.max())
 	w = imax - imin + 1
@@ -31,9 +40,9 @@ def _coverage_mapper(rows, dx = 1., filter=None, filter_args=()):
 	for (ii, jj) in izip(i, j):
 		sky[ii, jj] += 1
 
-	return (sky, imin, jmin, self.CELL_FN)
+	return (sky, imin, jmin)
 
-def compute_coverage(cat, dx = 0.5, include_cached=False, where=None, filter=None, filter_args=(), foot=catalog.All):
+def compute_coverage(cat, dx = 0.5, include_cached=False, filter=None, filter_args=(), foot=catalog.All):
 	""" compute_coverage - produce a sky map of coverage, using
 	    a filter function if given. The output is a starcount
 	    array in (ra, dec) binned to <dx> resolution.
@@ -43,7 +52,7 @@ def compute_coverage(cat, dx = 0.5, include_cached=False, where=None, filter=Non
 
 	sky = np.zeros((width, height))
 
-	for (patch, imin, jmin, fn) in cat.map_reduce(_coverage_mapper, mapper_args=(dx, filter, filter_args), where=where, include_cached=include_cached, foot=foot):
+	for (patch, imin, jmin) in cat.map_reduce(_coverage_mapper, mapper_args=(dx, filter, filter_args), query='l, b where dec/2 > 30', include_cached=include_cached, foot=foot):
 		if patch is None:
 			continue
 		sky[imin:imin + patch.shape[0], jmin:jmin + patch.shape[1]] += patch
@@ -56,11 +65,11 @@ def compute_coverage(cat, dx = 0.5, include_cached=False, where=None, filter=Non
 def ls_mapper(rows):
 	# return the number of rows in this chunk, keyed by the filename
 	self = ls_mapper
-	return (self.CELL_FN, len(rows))
+	return (ls_mapper.CELL_ID, len(rows))
 
 def compute_counts(cat, include_cached=False):
 	ntotal = 0
-	for (file, nobjects) in cat.map_reduce(ls_mapper, include_cached=include_cached):
+	for (cell_id, nobjects) in cat.map_reduce(ls_mapper, query='id', include_cached=include_cached):
 		ntotal = ntotal + nobjects
 	return ntotal
 ###################################################################
@@ -125,9 +134,12 @@ def _xmatch_mapper(rows, cat_to, xmatch_radius, cat_to_name):
 		# Remove the matches beyond xmatch_radius
 		xmatch = xmatch[xmatch['dist'] < xmatch_radius]
 
+		# Store the xmatch table
 		if len(xmatch) != 0:
+			table = 'xmatch_' + cat_to_name
+			cat.create_table(table, { 'columns': [('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')] }, ignore_if_exists=True)
 			# Store the xmatch table
-			with cat.cell(cell_id, mode='w', table_type='xmatch_' + cat_to_name) as fp:
+			with cat.cell(cell_id, mode='w', table=table) as fp:
 				if fp.root.xmatch.nrows != 0:
 					fp.root.xmatch.removeRows(0, fp.root.xmatch.nrows)
 				fp.root.xmatch.append(xmatch)

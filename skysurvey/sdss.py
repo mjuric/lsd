@@ -3,6 +3,7 @@ import pyfits
 import pool2
 import numpy as np
 from slalib import sla_eqgal
+from itertools import imap
 
 def initialize_column_definitions():
 	# Columns from sweep files
@@ -56,7 +57,8 @@ def import_from_sweeps(catdir, sweep_files, create=False):
 	"""
 	if create:
 		# Create the new database
-		cat = catalog.Catalog(catdir, 'c', columns)
+		cat = catalog.Catalog(catdir, name='sdss', mode='c')
+		cat.create_table('catalog', { 'columns': columns, 'primary_key': 'id', 'spatial_keys': ('ra', 'dec') })
 	else:
 		cat = catalog.Catalog(catdir)
 
@@ -66,7 +68,7 @@ def import_from_sweeps(catdir, sweep_files, create=False):
 	#for (file, nloaded, nin) in imap(lambda file: import_from_sweeps_aux(file, cat), sweep_files):
 		at = at + 1
 		ntot = ntot + nloaded
-#		print('  ===> Imported ' + file + ('[%d/%d, %5.2f%%] +%-6d %9d' % (at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot)))
+		print('  ===> Imported ' + file + ('[%d/%d, %5.2f%%] +%-6d %9d' % (at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot)))
 
 def import_from_sweeps_aux(file, cat):
 	# import an SDSS run
@@ -102,14 +104,19 @@ def import_from_sweeps_aux(file, cat):
 		b = np.empty_like(dec)
 		for i in xrange(len(ra)):
 			(l[i], b[i]) = np.degrees(sla_eqgal(*np.radians((ra[i], dec[i]))))
-		cached = np.zeros(len(ra), dtype='b')
+		cached = np.zeros(len(ra), dtype='bool')
 
-		cols.insert(0, cached)
-		cols.insert(1, l)
-		cols.insert(2, b)
+		cols.insert(0, np.empty(len(ra), dtype=np.uint64))	# id
+		cols.insert(1, cached)					# cached
+		cols.insert(2, l)					# l
+		cols.insert(3, b)					# b
 
-		# Transform a list of columns into a list of rows, and store
-		ids = cat.insert(zip(*cols), ra, dec)
+		# Transform a list of columns into an array of rows and store
+		rows = np.empty(len(ra), dtype=np.dtype(columns))
+		for (pos, (name, _)) in enumerate(columns):
+			rows[name] = cols[pos]
+
+		ids = cat.append('catalog', rows)
 	else:
 		ids = []
 

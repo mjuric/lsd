@@ -91,9 +91,8 @@ class Pool:
 	DEBUG = False
 	#DEBUG = True
 
-	def __init__(self, nworkers = None, DEBUG=False):
-	        if DEBUG:
-	            self.DEBUG=True
+	def __init__(self, nworkers = None):
+	        if self.DEBUG:
 	            return
 
 		if nworkers == None:

@@ -1,5 +1,5 @@
-#!/usr/bin/env python
 
+import query_parser as qp
 from collections import defaultdict
 from contextlib import contextmanager
 import subprocess
@@ -53,12 +53,21 @@ class Catalog:
 	"""
 	path = '.'
 	level = 6
-	columns = []
 	t0 = 47892		# default starting epoch (MJD, 47892 == Jan 1st 1990)
 	dt = 90			# default temporal resolution (in days)
 	__nrows = 0
 
 	NULL = 0		# The value for NULL in JOINed rows that had no matches
+
+	tables  = None		# Tables in catalog ( dict of lists of (tablename, schema, primary_key) tuples)
+	primary_table = None	# Primary table of this catalog ( the one holding the IDs and spatial/temporal keys)
+
+	def all_columns(self):
+		# Return the list of all columns in all tables of the catalog
+		cols = []
+		for _, schema in self.tables.iteritems():
+			cols += schema['columns']
+		return [ name for name, _ in cols ]
 
 	def cell_for_id(self, id):
 		# Note: there's a more direct way of doing this,
@@ -66,6 +75,9 @@ class Catalog:
 		x, y, t, _ = self.unpack_id(id)
 		cell_id = self._id_from_xy(x, y, t, self.level)
 		return cell_id
+
+	def cell_for_pos(self, ra, dec, t=None):
+		return self.id_from_pos(ra, dec, t, self.level)
 
 	def id_from_pos(self, ra, dec, t=None, level=10):
 		# find the bhealpix coordinates and time slice
@@ -138,42 +150,92 @@ class Catalog:
 			bounds &= footprint.ALLSKY
 		return bounds
 
-	def _file_for_id(self, id, table_type='catalog'):
-		(x, y, t, rank) = self.unpack_id(id, self.level)
+	def _tablet_file(self, cell_id, table):
+		(x, y, t, rank) = self.unpack_id(cell_id, self.level)
+		subpath = bhpix.get_path(x, y, self.level)
 
 		if t >= self.t0 + self.dt:
-			fn = '%s/%s.%s.MJD%05d%+d.h5' % (self.path, bhpix.get_path(x, y, self.level), table_type, t, self.dt)
+			fn = '%s/%s.%s.MJD%05d%+d.h5' % (self.path, subpath, table, t, self.dt)
 		else:
-			fn = '%s/%s.%s.static.h5' % (self.path, bhpix.get_path(x, y, self.level), table_type)
+			fn = '%s/%s.%s.static.h5' % (self.path, subpath, table)
 		return fn
 
-	def cell_exists(self, cell_id, table_type='catalog'):
-		fn = self._file_for_id(cell_id, table_type)
+	def cell_exists(self, cell_id, table=None):
+		if table == None:
+			table = self.primary_table
+
+		fn = self._tablet_file(cell_id, table)
 		return os.access(fn, os.R_OK)
 
 	def _load_dbinfo(self):
 		data = json.loads(file(self.path + '/dbinfo.json').read())
 
-		# Explicit type coercion for security reasons
-		self.level = int(data["level"])
-		self.t0 = float(data["t0"])
-		self.dt = float(data["dt"])
-		self.__nrows = float(data["nrows"])
-		self.columns = []
-		for (col, dtype) in data["columns"]:
-			self.columns.append((str(col), str(dtype)))
+		self.name = data["name"]
+		self.level = data["level"]
+		self.t0 = data["t0"]
+		self.dt = data["dt"]
+		self.__nrows = data["nrows"]
+
+		# Backwards compatibility
+		if "columns" in data:
+			data["tables"] = \
+			{
+				"catalog":
+				{
+					"columns":   data["columns"],
+					"primary_key": "id",
+					"spatial_keys": ("ra", "dec")
+				}
+			}
+			data["primary_table"] = 'catalog'
+
+		# Load table definitions
+		self.tables = data["tables"]
+		self.primary_table = data["primary_table"]
 
 	def _store_dbinfo(self):
 		data = dict()
 		data["level"], data["t0"], data["dt"] = self.level, self.t0, self.dt
 		data["nrows"] = self.__nrows
-		data["columns"] = self.columns
+		data["tables"] = self.tables
+		data["primary_table"] = self.primary_table
+		data["name"] = self.name
 
 		f = open(self.path + '/dbinfo.json', 'w')
 		f.write(json.dumps(data, indent=4, sort_keys=True))
 		f.close()
 
-	def _open_cell(self, id, mode='r', retries=-1, table_type='catalog'):
+	def create_table(self, table, schema, ignore_if_exists=False):
+		# Create a new table and set it as primary if it
+		# has a primary_key
+		if table in self.tables and not ignore_if_exists:
+			raise Exception('Trying to create a table that already exists!')
+
+		self.tables[table] = schema
+
+		if 'primary_key' in schema:
+			if 'spatial_keys' not in schema:
+				raise Exception('Trying to create a primary table with no spatial keys!')
+			if self.primary_table is not None:
+				raise Exception('Trying to create a primary table while one already exists!')
+			self.primary_table = table
+
+		self._store_dbinfo()
+
+	def _create_tablet(self, fn, table):
+		# Create a tablet at a given path, for table 'table'
+		assert os.access(fn, os.R_OK) == False
+
+		fp  = tables.openFile(fn, mode='w')
+		schema = self.tables[table]
+		fp.createTable('/', 'table', np.dtype(schema["columns"]), expectedrows=20*1000*1000)
+		if 'primary_key' in schema:
+			seqname = '_seq_' + schema['primary_key']
+			fp.createArray('/', seqname, np.array([1], dtype=np.uint64))
+
+		return fp
+
+	def _open_cell(self, cell_id, table, mode='r', retries=-1):
 		""" Open a given cell in read or write mode. If in
 		    write mode, the cell will be locked. Do not use this
 		    function directly; use cell() instead.
@@ -182,34 +244,21 @@ class Catalog:
 		    	Tuple of (fp, lock_fn) where lock_fn is the lockfile
 		    	or None if mode='r'
 		"""
-		fn = self._file_for_id(id, table_type)
+		fn = self._tablet_file(cell_id, table)
 
 		if mode == 'r':
 			return (tables.openFile(fn), None)
 		elif mode == 'w':
+			# create directory if needed
+			path = fn[:fn.rfind('/')];
+			if not os.path.exists(path):
+				utils.mkdir_p(path)
+
+			utils.shell('/usr/bin/lockfile -1 -r%d "%s.lock"' % (retries, fn) )
+
 			if not os.path.isfile(fn):
-				# create directory if needed
-				path = fn[:fn.rfind('/')];
-				if not os.path.exists(path):
-					utils.mkdir_p(path)
-
-				utils.shell('/usr/bin/lockfile -1 -r%d "%s.lock"' % (retries, fn) )
-
-				# intialize the file
-				table_type = table_type.split('_')[0]
-				if table_type == 'catalog':
-					fp  = tables.openFile(fn, mode='w', title='SkysurveyDB')
-					fp.createTable('/', 'catalog', np.dtype(self.columns), "Catalog", expectedrows=20*1000*1000)
-					fp.createArray('/', 'id_seq', np.ones(1, dtype=np.uint32), 'A sequence for catalog table ID')
-				elif table_type == 'xmatch':
-					fp  = tables.openFile(fn, mode='w', title='Skysurvey xmatch table')
-					fp.createTable('/', 'xmatch', np.dtype([('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')]), "xmatch", expectedrows=20*1000*1000)
-				else:
-					raise Exception('Unknown table type!')
+				fp = self._create_tablet(fn, table)
 			else:
-				# open for appending
-				utils.shell('/usr/bin/lockfile "%s.lock"' % fn)
-
 				fp = tables.openFile(fn, mode='a')
 
 			return (fp, fn + '.lock')
@@ -273,22 +322,6 @@ class Catalog:
 		return cells
 
 	def _prep_query(self, cols):
-		""" 
-		    Parse the column specification and return a dictionary
-		    of (table -> [col1 col2 ...]), where the main table will
-		    be keyed by an empty string ('').
-
-		    Examples:
-		    	'ra dec u g r i z'	-- just those columns
-		    	'*'			-- all available columns
-		    	'ra dec g r sdss.g sdss.r' -- xmatch w. sdss table
-
-		    Return:
-		 	- dtype -- tuple suitable for passing to np.dtype()
-			- tables: dictionary(table->columns)
-				columns: dict(colname_in_source_table->colname_in_output_table)
-		"""
-
 		#
 		# Need: dtype for output table, list of tables and their fields
 		#
@@ -336,39 +369,74 @@ class Catalog:
 		return ret
 
 	### Public methods
-	def __init__(self, path, mode='r', columns=None, level=Automatic, t0=Automatic, dt=Automatic):
-		self.path = path
-
+	def __init__(self, path, mode='r', name=None, level=Automatic, t0=Automatic, dt=Automatic):
 		if mode == 'c':
-			self.create(columns, level, t0, dt)
+			assert name is not None
+			self.create_catalog(name, path, level, t0, dt)
 		else:
+			self.path = path
 			self._load_dbinfo()
 
-	def create(self, columns, level, t0, dt):
+	def create_catalog(self, name, path, level, t0, dt):
 		""" Create a new catalog and store its definition.
 		"""
+		self.path = path
+
 		utils.mkdir_p(self.path)
 		if os.path.isfile(self.path + '/dbinfo.json'):
 			raise Exception("Creating a new catalog in '%s' would overwrite an existing one." % self.path)
-			
-		self.columns = columns
+
+		self.tables = {}
+		self.name = name
+
 		if level != Automatic: self.level = level
 		if    t0 != Automatic: self.t0 = t0
 		if    dt != Automatic: self.dt = dt
 
 		self._store_dbinfo()
 
-	def insert(self, rows, ra, dec, t = None):
-		""" Insert a set of rows into the database. Protects against multiple
-		    writers simultaneously inserting into the same file
+	def update(self, table, keys, rows):
+		raise Exception('Not implemented')
 
-		    The rows being inserted must NOT contain the index column.
+	def append(self, table, rows, cell_id=None):
+		""" Insert a set of rows into a table in the database. Protects against
+		    multiple writers simultaneously inserting into the same file.
+
+		    If table being inserted into has spatial_keys, the rows being
+		    inserted MUST contain the primary key column.
+		    
+		    Otherwise, cell_id must be a scalar or a vector of the same length
+		    as len(rows).
+
+		    Return: list of ids or cells inserted into
 		"""
-		ids = self.id_from_pos(ra, dec, t)
-		cells = self.id_from_pos(ra, dec, t, self.level)
-		unique_cells = list(set(cells))
+		if table == self.primary_table:
+			schema = self.tables[table]
+			assert "primary_key" in schema
+			assert "spatial_keys" in schema
+
+			raKey, decKey = schema["spatial_keys"]
+			ra, dec = rows[raKey], rows[decKey]
+			if "temporal_key" in schema:
+				t = rows[schema["temporal_key"]]
+			else:
+				t = None
+
+			key = schema["primary_key"]
+			cells     = self.cell_for_pos(ra, dec, t)
+			rows[key] = self.id_from_pos(ra, dec, t)
+		else:
+			assert cell_id != None
+
+			if type(cell_id) != np.ndarray:
+				cells = np.empty(len(rows), dtype=np.uint64)
+				cells[:] = cell_id
+			else:
+				cells = cell_id
+			key = None
 
 		ntot = 0
+		unique_cells = list(set(cells))
 		while unique_cells:
 			# Find a cell that is ready to be written to (that isn't locked
 			# by another writer)
@@ -376,7 +444,7 @@ class Catalog:
 				try:
 					i = k % len(unique_cells)
 					cell = unique_cells[i]
-					(fp, lockfile)  = self._open_cell(cell, 'w', retries=0, table_type='catalog')
+					(fp, lockfile)  = self._open_cell(cell, mode='w', retries=0, table=table)
 					unique_cells.pop(i)
 					break
 				except subprocess.CalledProcessError as err:
@@ -385,27 +453,29 @@ class Catalog:
 			else:
 				raise Exception('Appear to be stuck on a lock file!')
 
-			t   = fp.root.catalog
-			id2 = fp.root.id_seq[0]
+			t   = fp.root.table
 
 			# Extract and store the subset of rows that belong into this cell
-			iit = iter(xrange(len(rows) + 1))
-			rows2 = [ (ids[i] + id2 + np.uint64(next(iit)),) + rows[i] for i in xrange(len(rows)) if(cells[i] == cell) ]
+			incell = cells == cell
+			if key != None:
+				n = sum(incell)
+				id_seq = fp.root.__getattr__('_seq_' + key)
+				rows[key][incell] += np.arange(id_seq[0], id_seq[0] + n, dtype=np.uint64)
+				id_seq[0] += n
 
+			rows2 = rows[incell]
 			t.append(rows2)
-			fp.root.id_seq[0] += len(rows2)
 			fp.close()
 			os.unlink(lockfile)
 
-			##print '[', len(rows2), ']'
+			#print '[', len(rows2), ']'
 			self.__nrows = self.__nrows + len(rows2)
 			ntot = ntot + len(rows2)
 
-		if ntot != len(ids):
-			print 'ntot=', ntot
-			raise Exception('**** Bug detected ****')
+		assert ntot == len(rows), 'ntot != len(rows), ntot=%d, len(rows)=%d, cell_id=%d' % (ntot, len(rows), cell_id)
+		assert len(np.unique1d(rows[key])) == len(rows), 'len(np.unique1d(rows[key])) != len(rows) in cell %d' % cell_id
 
-		return ids
+		return rows[key] if key != None else cells
 
 	def nrows(self):
 		return self.__nrows
@@ -421,38 +491,36 @@ class Catalog:
 		i = i + 'Partitioning: level=%d\n' % (self.level)
 		i = i + '(t0, dt):     %f, %f \n' % (self.t0, self.dt)
 		i = i + 'Objects:      %d\n' % (self.nrows())
+		i = i + 'Tables:       %s' % str(self.tables.keys())
 		i = i + '\n'
-		s = "%20s %10s\n" % ('Column', 'Type')
-		s = s + '-'*(len(s)-1) + '\n'
-		for col in self.columns:
-			s = s + "%20s %10s\n" % (col[0], col[1])
+		s = ''
+		for table in self.tables:
+			s = s + '-'*31 + '\n'
+			s = s + 'Table \'' + table + '\':\n'
+			s = s + "%20s %10s\n" % ('Column', 'Type')
+			s = s + '-'*31 + '\n'
+			for col in self.tables[table]["columns"]:
+				s = s + "%20s %10s\n" % (col[0], col[1])
+			s = s + '-'*31 + '\n'
 		return i + s
 
-	def fetch_cell(self, cell_id, where=None, filter=None, filter_args=(), table_type='catalog', include_cached=False, return_id=False):
+	def fetch_cell(self, cell_id, table=None, include_cached=False):
 		""" Load and return all rows from a given cell, possibly
 		    filtering them using filter (if given)
 		"""
-		with self.cell(cell_id, table_type=table_type) as fp:
-			table_type = table_type.split('_')[0]
-			table = fp.root.__getattr__(table_type)
+		if table == None:
+			table = self.primary_table
 
-			if where == None:
-				rows = table.read()
-			else:
-				rows = table.readWhere(where)
+		with self.cell(cell_id, table=table) as fp:
+			rows = fp.root.table.read()
 
 		# Reject cached objects, unless requested otherwise
-		if not include_cached and len(rows) and "cached" in rows.dtype.names:
-			rows = rows[rows["cached"] == 0]
+		if not include_cached:
+			assert table == self.primary_table
+			if len(rows):
+				rows = rows[rows["cached"] == 0]
 
-		# Custom user-supplied filter
-		if filter != None:
-			rows = filter(rows, *filter_args)
-
-		if return_id:
-			return rows, np.array(rows['id'])
-		else:
-			return rows
+		return rows
 
 	def fetch(self, cols=All, foot=All, where=None, testbounds=True, include_cached=False, join_type='outer', nworkers=None, progress_callback=None, filter=None, filter_args=()):
 		""" Return a table (numpy structured array) of all rows within a
@@ -517,7 +585,7 @@ class Catalog:
 				for row in rows:
 					yield row
 
-	def map_reduce(self, mapper, reducer=None, cols=All, foot=All, where=None, testbounds=True, include_cached=False, join_type='outer', mapper_args=(), reducer_args=(), nworkers=None, progress_callback=None):
+	def map_reduce(self, mapper, reducer=None, query='*', foot=All, testbounds=True, include_cached=False, join_type='outer', mapper_args=(), reducer_args=(), nworkers=None, progress_callback=None):
 		""" A MapReduce implementation, where rows from individual cells
 		    get mapped by the mapper, with the result reduced by the reducer.
 		    
@@ -540,9 +608,6 @@ class Catalog:
 		    If the reducer is None, only the mapping step is performed and the
 		    return value of the mapper is passed to the user.
 		"""
-		# parse the column/query specification
-		queryspec = self._prep_query(cols)
-
 		# slice up the job down to individual cells
 		partspecs = self._get_cells(foot)
 
@@ -555,7 +620,7 @@ class Catalog:
 		if reducer == None:
 			for result in pool.imap_unordered(
 					partspecs, _mapper,
-					mapper_args = (mapper, where, self, include_cached, queryspec, join_type, mapper_args),
+					mapper_args = (mapper, self, query, include_cached, mapper_args),
 					progress_callback = progress_callback):
 
 				if type(result) != type(Empty):
@@ -563,19 +628,22 @@ class Catalog:
 		else:
 			for result in pool.imap_reduce(
 					partspecs, _mapper, _reducer,
-					mapper_args  = (mapper, where, self, include_cached, queryspec, join_type, mapper_args),
+					mapper_args  = (mapper, self, query, include_cached, mapper_args),
 					reducer_args = (reducer, self, reducer_args),
 					progress_callback = progress_callback):
 				yield result
 
 	@contextmanager
-	def cell(self, cell_id, mode='r', retries=-1, table_type='catalog'):
+	def cell(self, cell_id, mode='r', retries=-1, table=None):
 		""" Open and return a pytables object for the given cell.
 		    If mode is not 'r', the cell table will be locked
 		    for the duration of this context manager, and automatically
 		    unlocked upon exit from it.
 		"""
-		(fp, lockfile) = self._open_cell(cell_id, mode, retries, table_type=table_type)
+		if table == None:
+			table = self.primary_table
+
+		(fp, lockfile) = self._open_cell(cell_id, mode=mode, retries=retries, table=table)
 
 		yield fp
 
@@ -627,7 +695,7 @@ class Catalog:
 		""" Cache the objects found within margin_x (arcsecs) of
 		    each cell into neighboring cells as well, to support
 		    efficient nearest-neighbor lookups.
-		    
+
 		    This routine works in tandem with _cache_maker_mapper
 		    and _cache_maker_reducer auxilliary routines.
 		"""
@@ -639,7 +707,7 @@ class Catalog:
 		for (cell_id, ncached) in self.map_reduce(_cache_maker_mapper, _cache_maker_reducer, mapper_args=(margin_x, margin_t)):
 			ntotal = ntotal + ncached
 			ncells = ncells + 1
-			print self._file_for_id(cell_id), ": ", ncached, " cached objects"
+			print self._tablet_file(cell_id), ": ", ncached, " cached objects"
 		print "Total %d cached objects in %d cells" % (ntotal, ncells)
 
 	def compute_summary_stats(self):
@@ -655,12 +723,12 @@ class Catalog:
 		"""
 			Return a list of crossmatches corresponding to ids
 		"""
-		table_type = "xmatch_" + cat_to_name
+		table = self.external_catalogs[cat_to_name]['xmatch_table']
 
-		if len(ids) == 0 or not self.cell_exists(cell_id, table_type=table_type):
+		if len(ids) == 0 or not self.cell_exists(cell_id, table=table):
 			return ([], [])
 
-		rows = self.fetch_cell(cell_id, table_type=table_type)
+		rows = self.fetch_cell(cell_id, table=table)
 
 		# drop all links where id1 is not in ids
 		sids = np.sort(ids)
@@ -672,8 +740,8 @@ class Catalog:
 		return (rows['id1'], rows['id2'])
 
 	def get_xmatched_catalog(self, cat_to_name):
-		# TODO: record the path of the catalog do dbinfo and get it from there
-		return Catalog(cat_to_name)
+		path = self.external_catalogs[cat_to_name]['path']
+		return Catalog(path)
 
 ###############################################################
 # Aux functions implementing Catalog.iterate and Catalog.fetch
@@ -828,108 +896,198 @@ def tick(s, t):
 	print >> sys.stderr, s, ":", dt
 	t[0] = tt
 
-def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, mapper_args):
+class TableColsProxy:
+	cat = None
+
+	def __init__(self, cat):
+		self.cat = cat
+
+	def __getitem__(self, catname):
+		# Return a list of columns in catalog catname
+		if catname == '': return self.cat.all_columns()
+		return self.cat.get_xmatched_catalog(catname).all_columns()
+
+class ColDict:
+	catalogs = None		# Cache of loaded catalogs and tables
+	columns  = None		# Cache of already referenced columns
+	cell_id  = None		# cell_id on which we're operating
+
+	def __init__(self, query, cat, cell_id, bounds, include_cached):
+
+		self.cell_id = cell_id
+		self.columns = {}
+
+		# parse query
+		(select_clause, where_clause, from_clause) = qp.parse(query, TableColsProxy(cat))
+		#print (query, select_clause, where_clause, from_clause)
+		#exit()
+
+		# Fetch all rows of the base table
+		rows2 = cat.fetch_cell(cell_id=cell_id, table=cat.primary_table, include_cached=include_cached)
+		idx2  = np.arange(len(rows2))
+
+		# Reject objects out of bounds
+		if bounds != None and len(rows2):
+			raKey, decKey = cat.tables[cat.primary_table]["spatial_keys"]
+			ra, dec = rows2[raKey], rows2[decKey]
+
+			(x, y) = bhpix.proj_bhealpix(ra, dec)
+			in_ = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool)
+
+			rows2 = rows2[in_]
+			idx2 = idx2[in_]
+
+		# Initialize catalogs and table lists, plus the array of primary keys
+		self.keys     = rows2[cat.tables[cat.primary_table]["primary_key"]]
+		self.catalogs = \
+		{
+			cat.name:
+			{
+				'cat':    cat,
+				'join' :  (idx2, np.zeros(len(rows2), dtype=bool)),
+				'tables':
+				{
+					cat.primary_table: rows2
+				}
+			}
+		}
+		
+		# Load catalog indices to be joined
+		for (catname, join_type) in from_clause:
+			print "HERE!"; exit();
+			if cat.name == catname:
+				continue
+
+			# load the xmatch table and instantiate the second catalog object
+			(m1, m2) = cat._fetch_xmatches(cell_id, id, catname)
+			cat2     = cat.get_xmatched_catalog(catname)
+			rows2    = cat2.fetch_cell(cell_id=cell_id, table=cat2.primary_table)
+			id2      = rows2[cat2.tables[cat2.primary_table]["primary_key"]]
+
+			# Join the tables (jmap and rows2), using (m1, m2) linkage information
+			table_join.cell_id = cell_id	# debugging
+			table_join.cat = cat		# debugging
+			(idx1, idx2, isnull) = table_join(self.keys, id2, m1, m2, join_type=join_type)
+			self.catalogs[cat2.name]['tables'][cat2.primary_table] = rows2
+
+			# update the catalogs map
+			for (catname, v) in self.catalogs.iteritems():
+				(idx, isnull_) = v['join']
+				v['join']      = idx[idx1], isnull_[idx2]
+
+			# add the newly joined catalog
+			self.catalogs[cat2.name]['cat']  = cat2
+			self.catalogs[cat2.name]['join'] = arange(len(rows2))[idx2], isnull
+
+		# eval individual columns in select clause to slurp them up from disk
+		# and have them ready for the where clause
+		self.dtype = []
+		nrows = 0
+		for (asname, name) in select_clause:
+			col = eval(name, {}, self)
+			self[asname] = col
+			self.dtype += [ (asname, str(col.dtype)) ]
+			nrows = len(self[asname])
+
+		# eval the WHERE clause, to obtain the final filter
+		self.in_    = np.empty(nrows, dtype=bool)
+		self.in_[:] = eval(where_clause, {}, self)
+		#print self.dtype
+		#exit()
+
+	def rows(self):
+		# Extract out the filtered rows
+		self.t0 = time.time()
+		rows = np.empty(sum(self.in_), dtype=np.dtype(self.dtype))
+		for name, _ in self.dtype:
+			col = self[name][self.in_]
+			rows[name] = col
+		#rows = np.empty(len(self.in_), dtype=np.dtype(self.dtype))
+		#for name, _ in self.dtype:
+		#	rows[name] = self[name]
+		#rows = rows[self.in_]
+		#print 'Loaded %d rows in %f sec (%d columns).' % (len(rows), time.time() - self.t0, len(rows.dtype.names))
+		return rows
+
+	def load_column(self, name, table, catname):
+		# See if we have it cached
+		if table in self.catalogs[catname]['tables']:
+			return self.catalogs[catname]['tables'][table][name]
+
+		print "Reached untested in load_column()"
+		exit()
+
+		# Load, join, and cache it
+		cat = self.catalogs[catname]['cat']
+		rows = cat.fetch_cell(cell_id=self.cell_id, table=table)
+		
+		idx, isnull = self.catalogs[catname]['join']
+		rows = rows[idx]
+		for name in rows.dtype.names:
+			rows[name][isnull] = cat.NULL
+
+		self.catalogs[catname]['tables'][table] = rows
+
+		# return the requested column (further caching is the responsibility of the caller)
+		return rows[name]
+
+	def __getitem__(self, name):
+		# An already loaded column?
+		if name in self.columns:
+			return self.columns[name]
+
+		# A yet unloaded column? Try to find it in tables of joined catalogs
+		# May be prefixed by catalog name, in which case we force lookup of only
+		#     that catalog
+		if name.find('.') == -1:
+			cats = self.catalogs
+			colname = name
+		else:
+			(catname, colname) = name.split('.')
+			cats = { catname, self.catalogs[catname] }
+		for (catname, v) in cats.iteritems():
+			cat = v['cat']
+			for (table, schema) in cat.tables.iteritems():
+				columns = set(( name for name, _ in schema['columns'] ))
+				if colname in columns:
+					self[name] = self.load_column(colname, table, catname)
+					return self.columns[name]
+
+		# A name of a catalog? Return a proxy object
+		if name in self.catalogs:
+			return CatProxy(self, name)
+
+		# This object is unknown to us -- let it fall through, it may
+		# be a global/Python variable or function
+		raise KeyError(name)
+
+	def __setitem__(self, key, val):
+		if len(self.columns):
+			assert len(val) == len(self.columns.values()[0])
+
+		self.columns[key] = val
+
+class CatProxy:
+	coldict = None
+	prefix = None
+
+	def __init__(self, coldict, prefix):
+		self.coldict = coldict
+		self.prefix = prefix
+
+	def __getattr__(self, name):
+		return coldict[prefix + '.' + name]
+
+def _mapper(partspec, mapper, cat, query, include_cached, mapper_args):
 	(cell_id, bounds) = partspec
 
 	# pass on some of the internals to the mapper
 	mapper.CELL_ID = cell_id
 	mapper.CATALOG = cat
 	mapper.BOUNDS = bounds
-	mapper.WHERE = where
-	mapper.CELL_FN = cat._file_for_id(cell_id)
 
-	# Fetch all rows of the base table
-	rows2, id = cat.fetch_cell(cell_id=cell_id, where=where, table_type='catalog', include_cached=include_cached, return_id=True)
-
-	# Reject objects out of bounds
-	if bounds != None and len(rows2):
-		(x, y) = bhpix.proj_bhealpix(rows2['ra'], rows2['dec'])
-		in_ = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool)
-		rows2 = rows2[in_]
-		id = id[in_]
-
-	# Unpack queryspec, create output table, extract only the requested rows
-	(dtypespec, colspec) = queryspec
-	dtype = np.dtype(dtypespec)
-	if rows2.dtype == dtype:
-		rows = rows2
-	else:
-		rows = np.empty(len(rows2), dtype=dtype)
-		for (col, rcol) in colspec[''].iteritems():
-			rows[rcol] = rows2[col]
-
-	# Perform any JOINs, table by table
-	for (table2, cols2) in colspec.iteritems():
-		if table2 == '': continue
-
-		# load the xmatch table and instantiate second catalog object
-		(m1, m2) = cat._fetch_xmatches(cell_id, id, table2)
-
-		if len(m1) != 0:
-			# Load xmatched rows.
-			# get the list of cells containing xmatch link targets
-			# sort them in descending order by the number of targets
-			cat2   = cat.get_xmatched_catalog(table2)
-			cells2 = cat2.cell_for_id(m2)
-			ucells2 = np.unique1d(cells2)
-			count = np.empty_like(ucells2)
-			for (i, ucell) in enumerate(ucells2):
-				count[i] = sum(cells2 == ucell)
-			i = count.argsort()[::-1]; count = count[i]; ucells2 = ucells2[i]
-
-			# Load data from all cells until all cells are exhausted or all
-			# indices in m2 are found
-			rows2 = None
-			mfind = m2
-			for cell_id2 in ucells2:
-				rows_tmp, id_tmp = cat2.fetch_cell(cell_id2, include_cached=True, return_id=True)
-
-				# Extract the rows that may be matched
-				inarr = in_array(id_tmp, mfind)
-				if rows2 == None:
-					rows2 = rows_tmp[inarr]
-					id2   =   id_tmp[inarr]
-				else:
-					rows2 = np.append(rows2, rows_tmp[inarr])
-					id2   = np.append(id2,     id_tmp[inarr])
-
-				# Remove the found indices from the list of indices to look for
-				mfound = in_array(mfind, id_tmp)
-				i = np.arange(len(mfind)); i = i[mfound == False]
-				mfind = mfind[i]
-				if len(mfind) == 0:
-					break
-				print "len(mfind): ", len(mfind)
-		else:
-			id2 = []
-
-		# Join the two tables (rows and rows2), using (m1, m2) linkage information
-		table_join.cell_id = cell_id
-		table_join.cat = cat
-		(idx1, idx2, isnull) = table_join(id, id2, m1, m2, join_type=join_type)
-		nrows = len(idx1)
-
-		if False:
-			print "XXX: table2=", table2, "cols2=", cols2
-			print "m1: ", len(m1)
-			print "cells2: ", len(cells2)
-			print "rows:", len(rows)
-			print "rows2:", len(rows2)
-			print "idx1:", len(idx1)
-			print "isnull==0", len(isnull[isnull==0])
-			print idx1, idx2, isnull
-			print idx1.dtype
-			np.savetxt('match.txt', np.transpose((m1, m2)), fmt='%d')
-			np.savetxt('id1.txt', id, fmt='%d')
-			np.savetxt('id2.txt', id2, fmt='%d')
-			exit()
-
-		# Join the old and the new table
-		rows = rows[idx1]
-		id   = id[idx1]
-		for (col, rcol) in cols2.iteritems():
-			rows[rcol]         = rows2[col][idx2]
-			rows[rcol][isnull] = cat.NULL
+	# Load, join, select
+	rows = ColDict(query, cat, cell_id, bounds, include_cached).rows()
 
 	# Pass on to mapper, unless empty
 	if len(rows) != 0:
@@ -945,13 +1103,11 @@ def _mapper(partspec, mapper, where, cat, include_cached, queryspec, join_type, 
 ## functionallity
 def _cache_maker_mapper(rows, margin_x, margin_t):
 	# Map: fetch all objects to be mapped, return them keyed
-	# by cell ID
-
-	if len(rows) == 0: return []
+	# by cell ID and table
 
 	self         = _cache_maker_mapper
 	cat          = self.CATALOG
-	cell_id = self.CELL_ID
+	cell_id      = self.CELL_ID
 
 	p, t = cat.cell_bounds(cell_id)
 
@@ -991,18 +1147,23 @@ def _cache_maker_mapper(rows, margin_x, margin_t):
 	in_ = np.fromiter( (not p.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool)
 	if margin_t != 0:
 		in_ &= np.fromiter( ( 0. < fabs(pt - t) - 0.5*dt < margin_t for pt in rows["t"] ), dtype=np.bool)
-	rows = rows[in_]
+
+	# Now load all tables, and keep only the neighbors within
+	# neighborhood
+	rows = []
+	for table in cat.tables:
+		rows[table] = cat.fetch_cell(cell_id=cell_id, table=table)[in_]
 
 	res = []
 	if len(rows):
 		for neighbor in cat.neighboring_cells(cell_id):
 			res.append( (neighbor, rows) )
 
-	print "Scanned margins of", self.CELL_FN
+	print "Scanned margins of", cat._tablet_file(self.CELL_ID, table=cat.primary_table)
 
 	return res
 
-def _cache_maker_reducer(cell_id, newrowblocks):
+def _cache_maker_reducer(cell_id, nborblocks):
 	# Reduce: the key is the cell ID, the value is
 	# a list of objects to be copied there.
 	# 1. copy all existing non-cached objects to a temporary table
@@ -1014,24 +1175,32 @@ def _cache_maker_reducer(cell_id, newrowblocks):
 
 	assert cat.is_cell_local(cell_id)
 
-	ncached = 0
-	with cat.cell(cell_id, mode='w') as fp:
-		#fp.createTable('/', 'catalog_tmp', np.dtype(cat.columns), "Catalog", expectedrows=20*1000*1000)
+	# Load 'cached' flags from primary table
+	with cat.cell(cell_id, table=cat.primary_table) as fp:
+		prows = fp.root.table.read();
+		notcached = prows["cached"] == 0
 
-		rows = fp.root.catalog.read();
-		rows = rows[rows["cached"] == 0]
+	# Update all tables
+	for table, schema in cat.tables.iteritems():
+		ncached = 0
+		with cat.cell(cell_id, table=table, mode='w') as fp:
+			tbl = fp.root.table
 
-		fp.root.catalog.copy('/', 'catalog_tmp', start=0, stop=0)
-		fp.root.catalog_tmp.append(rows)
+			# Load and clean out previously cached rows
+			rows = tbl.read() if table != cat.primary_table else tbl.read()
+			rows = rows[notcached]
 
-		for newrows in newrowblocks:
-			newrows["cached"] = True
-			fp.root.catalog_tmp.append(newrows)
-			ncached = ncached + len(newrows)
+			# Copy over the old, remove excess
+			tbl.modifyRows(rows)
+			tbl.removeRows(len(rows))
 
-		fp.flush()
-		fp.root.catalog.remove()
-		fp.root.catalog_tmp.rename('catalog')
+			# Append cached rows
+			for nbor in nborblocks:
+				newrows = nbor[table]
+				if table == cat.primary_table:
+					newrows["cached"] = True
+					ncached = ncached + len(newrows)
+				tbl.append(newrows)
 
 	# Return the number of new rows cached into this cell
 	return (cell_id, ncached)

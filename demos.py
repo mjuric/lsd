@@ -40,9 +40,9 @@ if False:
 	exit()
 #########################################################
 
-if False:
+if True:
 	# Compute and store the sky coverage at a given resolution (see skysurvey/tasks.py on how this is implemented)
-	cat = ss.Catalog('ps1')
+	cat = ss.Catalog('sdss')
 	print "Computing sky coverage map: ",
 	sky = ss.compute_coverage(cat, dx=0.025, include_cached=True)
 	pyfits.writeto('foot.0.025.fits', sky.astype(float).transpose()[::-1,], clobber=True)
@@ -63,7 +63,7 @@ if False:
 	exit()
 #########################################################
 
-if True:
+if False:
 	# MapReduce: Compute SDSS vs. PS1 r-mag distribution across the entire sky
 
 	# Mapper: compute histograms of mag. offsets, keyed by healpix pixels
