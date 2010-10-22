@@ -1065,23 +1065,22 @@ class ColDict:
 			(x, y) = bhpix.proj_bhealpix(ra, dec)
 			in_ = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool)
 
-			rows2 = rows2[in_]
 			idx2  = idx2[in_]
 
 		# Initialize catalogs and table lists, plus the array of primary keys
-		self.keys     = rows2[cat.tables[cat.primary_table]["primary_key"]]
 		self.catalogs = \
 		{
 			cat.name:
 			{
 				'cat':    cat,
-				'join' :  (idx2, np.zeros(len(rows2), dtype=bool)),
+				'join' :  (idx2, np.zeros(len(idx2), dtype=bool)),
 				'tables':
 				{
 					cat.primary_table: rows2
 				}
 			}
 		}
+		self.keys     = rows2[idx2][cat.tables[cat.primary_table]["primary_key"]]
 
 		# Load catalog indices to be joined
 		for (catname, join_type) in from_clause:

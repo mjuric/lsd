@@ -40,12 +40,12 @@ if False:
 	exit()
 #########################################################
 
-if True:
+if False:
 	# Compute and store the sky coverage at a given resolution (see skysurvey/tasks.py on how this is implemented)
 	cat = ss.Catalog('ps1')
 	print "Computing sky coverage map: ",
-	#sky = ss.compute_coverage(cat, dx=0.025, include_cached=False, query='ra, dec, sdss.ra, sdss.dec, sdss.id XMATCH WITH sdss')
-	sky = ss.compute_coverage(cat, dx=0.025, include_cached=False, query='ra, dec')
+	sky = ss.compute_coverage(cat, dx=0.025, include_cached=False, query='ra, abs(dec), sdss.ra, sdss.dec, sdss.id XMATCH WITH sdss')
+	#sky = ss.compute_coverage(cat, dx=0.025, include_cached=False, query='ra, dec')
 	pyfits.writeto('foot.0.025.fits', sky.astype(float).transpose()[::-1,], clobber=True)
 	exit()
 #########################################################
@@ -128,25 +128,23 @@ if False:
 	exit()
 #########################################################
 
-if False:
-	# Custom MapReduce example: create a histogram of counts vs. declination
-	def deccount_mapper(rows):
-		# Mapper: compute the histogram for objects in this cell
-		hist, edges = np.histogram(rows["dec"], bins=18, range=(-90, 90))
-		bins = edges[0:-1] + 0.5*np.diff(edges)
+if True:
+	# Mapper: compute the distribution of counts within a cell, and
+	#         return the result as an array of (bin, count) tuples
+	def deccount_mapper(rows, bins):
+		counts, _ = np.histogram(rows['dec'], bins)
+		return zip(bins[:-1], counts)
 
-		# Return only nonzero bins
-		res = [ (bin, ct) for (bin, ct) in izip(bins, hist) if ct > 0 ]
-		return res
-
+	# Reducer: sum up the counts for a given bin
 	def deccount_reducer(bin, counts):
-		# Reducer: sum up the counts for each declination bin
 		return (bin, sum(counts))
 
-	cat = ss.Catalog('ps1')
-	print "Computing dec. distribution:",
-	for (k, v) in sorted(cat.map_reduce(deccount_mapper, deccount_reducer)):
-		print k, v
+	ddec = 10
+	bins = np.arange(-90, 90.01, ddec)	# bin edges
+	cat  = ss.Catalog('ps1')
+	hist = cat.map_reduce(deccount_mapper, deccount_reducer, mapper_args=(bins,), query='dec xmatch with sdss')
+	for (bin, count) in sorted(hist):
+		print "%+05.1f %10d" % (bin + ddec/2, count)
 #########################################################
 
 if False:

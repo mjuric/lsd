@@ -16,8 +16,10 @@ def initialize_column_definitions():
 		('l',		'f8',	''),		# computed column
 		('b',		'f8',	''),		# computed column
 		('flags',	'u4',	'flags'),
+		('obj_id',	'u4',	'obj_id'),
 		('cat_id',	'u4',	'cat_id'),
-		('ext_id',	'u8',	'ext_id')
+		('ext_id',	'u8',	'ext_id'),
+		('file_id',	'a20',	'')
 	];
 
 	magData = [ # FITS field, output suffix, type
@@ -75,6 +77,15 @@ def import_from_dvo_aux(file, cat):
 	for i, (col, _, _) in enumerate(photoCols):
 		cols[col] = photoData[i]
 
+	#idx = np.arange(len(cols['cat_id']))
+	#i   = idx.argsort(
+	#ra  = np.sort(cols['ra']);   dra = np.diff(ra)
+	#dec = np.sort(cols['dec']); ddec = np.diff(dec)
+	#assert (abs(dra) + abs(ddec) > 1.e-14).all(), str(sorted(dra)[:10]) + '\n' + str(sorted(ddec)[:10])
+	#assert len(np.unique1d(cols['obj_id'])) == len(cols['obj_id'])
+	#assert len(np.unique1d(cols['ext_id'])) == len(cols['ext_id'])
+	#assert len(np.unique1d(cols['cat_id'])) == len(cols['cat_id'])
+
 	#print ''
 	#for i, col in enumerate(magRawCols):
 	#	print magData[i][0],'=',col[10:15]
@@ -90,6 +101,12 @@ def import_from_dvo_aux(file, cat):
 		(l[i], b[i]) = np.degrees(sla_eqgal(*np.radians((ra[i], dec[i]))))
 	cols['l']      = l
 	cols['b']      = b
+
+	# Add the ID of the file the object came from
+	fn = '/'.join(file.split('/')[-2:])
+	assert(len(fn) < 20)
+	cols['file_id'] = np.empty(len(l), dtype='a20')
+	cols['file_id'][:] = fn
 
 	# sanity check
 	for (name, _, _) in astromCols + photoCols:
