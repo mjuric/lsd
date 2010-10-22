@@ -30,6 +30,35 @@ if False:
 		pyfits.writeto('rCalib_norm.fits', pimg.astype(float), clobber=True)
 		pyfits.writeto('rCalib_mean.fits', aimg.astype(float), clobber=True)
 	exit()
+
+if True:
+	# Extract a block of rows and store it in a FITS file
+	cat = ss.Catalog('sdss')
+	query = 'ra, dec, l, b, type, flags, flags2, resolve_status, u, uErr, uExt, uCalib, g, gErr, gExt, gCalib, r, rErr, rExt, rCalib, i, iErr, iExt, iCalib, z, zErr, zExt, zCalib, run, camcol, field, objid'
+	rows = cat.fetch(query=query, foot=ssfoot.rectangle(15, 15, 28, 75))
+	print rows.dtype.names
+	pyfits.writeto('sdss3-subset.fits', rows, clobber=True)
+	exit()
+
+if False:
+	# Execute a query using both fetch() and iterate(), and compare the results.
+	query = 'ra, dec, g, r, i, z, y'
+	foot  = ssfoot.rectangle(180, 10, 181, 11)
+
+	cat = ss.Catalog('ps1')
+	rows1 =                 cat.fetch(query=query, foot=foot)
+	rows2 = np.fromiter( (cat.iterate(query=query, foot=foot)), dtype=rows1.dtype)
+
+	# get rid of NaNs, as they mess up sorting and comparison (eg., NaN == NaN evaluates to False)
+	for col in rows1.dtype.names: rows1[col][np.isnan(rows1[col])] = 0
+	for col in rows2.dtype.names: rows2[col][np.isnan(rows2[col])] = 0
+
+	rows1.sort()
+	rows2.sort()
+	assert (rows1 == rows2).all()
+
+	exit()
+
 #########################################################
 
 if False:
@@ -55,16 +84,14 @@ if False:
 if False:
 	# A simple query with reference to an x-matched catalog
 	cat = ss.Catalog('ps1')
-#	for row in cat.iterate('ra dec g r i z y sdss3.ra sdss3.dec sdss3.u sdss3.g sdss3.r', join_type='outer', foot=ssfoot.rectangle(180, 10, 181, 11)):
-	for row in cat.iterate('* sdss3.*', join_type='outer', foot=ssfoot.rectangle(180, 10, 181, 11)):
+	for row in cat.iterate('ra, dec, g, r, i, z, y, sdss.ra, sdss.dec, sdss.u, sdss.g, sdss.r XMATCH sdss(outer)', foot=ssfoot.rectangle(180, 10, 181, 11)):
 		ssutils.extract_row(row)
-		isnull = sdss3_g == cat.NULL
-		d = ss.gc_dist(ra, dec, sdss3_ra, sdss3_dec)*3600 if not isnull else 0
-		print "%12.8f %12.8f %6.3f %6.3f %6.3f %6.3f %6.3f %12.8f %12.8f %6.3f %6.3f %6.3f   %6.3f %1d" % (ra, dec, g, r, i, z, y, sdss3_ra, sdss3_dec, sdss3_u, sdss3_g, sdss3_r, d, isnull)
+		d = ss.gc_dist(ra, dec, sdss_ra, sdss_dec)*3600 if sdss_g != 0 else 0
+		print "%12.8f %12.8f %6.3f %6.3f %6.3f %6.3f %6.3f %12.8f %12.8f %6.3f %6.3f %6.3f   %6.3f" % (ra, dec, g, r, i, z, y, sdss_ra, sdss_dec, sdss_u, sdss_g, sdss_r, d)
 	exit()
 #########################################################
 
-if False:
+if True:
 	# MapReduce: Compute SDSS vs. PS1 r-mag distribution across the entire sky
 
 	# Mapper: compute histograms of mag. offsets, keyed by healpix pixels
@@ -81,7 +108,7 @@ if False:
 		ret = []
 		for pix in set(pixels):
 			rows2 = rows[pixels == pix]
-			dm = rows2["r"] - rows2["sdss3.r"]
+			dm = rows2["r"] - rows2["sdss.r"]
 			hist = ssutils.xhistogram(dm, edges)
 			ret += [ (pix, hist) ]
 
@@ -106,7 +133,7 @@ if False:
 	print "Computing magnitude distributions (%d x %d): " % (nside, nside),
 	#for (pix, dist) in sorted(cat.map_reduce(calib_check_mapper, calib_check_reducer, mapper_args=(level, edges), cols='ra dec r sdss3.r', join_type='inner', foot=ssfoot.rectangle(180, 10, 181, 11))):
 	#for (pix, dist) in sorted(cat.map_reduce(calib_check_mapper, calib_check_reducer, mapper_args=(level, edges), cols='ra dec r sdss3.r', join_type='inner', foot=ssfoot.rectangle(175, 35, 185, 85))):
-	for (pix, dist) in sorted(cat.map_reduce(calib_check_mapper, calib_check_reducer, mapper_args=(level, edges), cols='ra dec r sdss3.r', join_type='inner')):
+	for (pix, dist) in sorted(cat.map_reduce(calib_check_mapper, calib_check_reducer, mapper_args=(level, edges), query='ra, dec, r, sdss.r XMATCH sdss')):
 		j = pix // nside
 		i = pix % nside
 		img[:, j, i] = dist

@@ -377,53 +377,6 @@ class Catalog:
 		self._get_cells_recursive(cells, foot, (0., 0.))
 		return cells
 
-	def _prep_query(self, cols):
-		#
-		# Need: dtype for output table, list of tables and their fields
-		#
-		if cols == All: cols = [ '*' ]
-		if type(cols) == str: cols = cols.split()
-
-		# At this point, cols is an array of tokens (columns, wildcards)
-		# Construct the output dtype as well
-		tables = defaultdict(dict)
-		dtype = []
-		cats = dict()
-		for token in cols:
-			# get table/column
-			p = token.split('.')
-			if len(p) == 1:
-				table = ''; column = p[0];
-			else:
-				table = p[0]; column = p[1]
-
-			# Locate this catalog
-			if table not in cats:
-				cats[table] = self if table == '' else self.get_xmatched_catalog(table)
-			cat = cats[table]
-
-			# Check for asterisk
-			if column == '*':
-				columns = [ name for (name, _) in cat.columns ]
-			else:
-				columns = [ column ]
-
-			# Add output columns, ignoring those already inserted
-			colspec = dict(cat.columns)
-			for column in columns:
-				outname = table + '.' + column if table != '' else column
-				if column not in tables[table]:
-					tables[table][column] = outname
-					dtype += [ (outname, colspec[column]) ]
-
-		# Verify there's at least one column referencing the main catalog
-		if '' not in tables:
-			raise Exception('There has to be at least one column referencing the main catalog')
-
-		ret = (dtype, tables)
-
-		return ret
-
 	### Public methods
 	def __init__(self, path, mode='r', name=None, level=Automatic, t0=Automatic, dt=Automatic):
 		if mode == 'c':
@@ -599,7 +552,7 @@ class Catalog:
 
 		return rows
 
-	def fetch(self, cols=All, foot=All, where=None, testbounds=True, include_cached=False, join_type='outer', nworkers=None, progress_callback=None, filter=None, filter_args=()):
+	def fetch(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None, filter_args=()):
 		""" Return a table (numpy structured array) of all rows within a
 		    given footprint. Calls 'filter' callable (if given) to filter
 		    the returned rows.
@@ -621,10 +574,8 @@ class Catalog:
 		    filter may be given in 'filter_args'
 		"""
 
-		files = self._get_cells(foot)
-
 		ret = None
-		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), cols=cols, foot=foot, where=where, join_type=join_type, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
+		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), query=query, foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
 			# ensure enough memory has been allocated (and do it
 			# intelligently if not)
 			if ret == None:
@@ -643,7 +594,7 @@ class Catalog:
 		#print "Resizing to", len(ret)
 		return ret
 
-	def iterate(self, cols=All, foot=All, where=None, testbounds=True, return_array=False, include_cached=False, join_type='outer', nworkers=None, progress_callback=None, filter=None, filter_args=()):
+	def iterate(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None, filter_args=(), return_array=False):
 		""" Yield rows (either on a row-by-row basis if return_array==False
 		    or in chunks (numpy structured array)) within a
 		    given footprint. Calls 'filter' callable (if given) to filter
@@ -653,9 +604,7 @@ class Catalog:
 		    'filter' callable.
 		"""
 
-		files = self._get_cells(foot)
-
-		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), cols=cols, foot=foot, where=where, join_type=join_type, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
+		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), query=query, foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
 			if return_array:
 				yield rows
 			else:
