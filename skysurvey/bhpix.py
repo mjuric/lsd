@@ -107,7 +107,8 @@ def nside(level):
 
 def get_subpath(x, y, level):
 	(cx, cy) = xy_center(x, y, level)
-	return "%+g%+g%+g" % (cx, cy, pix_size(level))
+	#return "%+g%+g%+g" % (cx, cy, pix_size(level))
+	return "%+g%+g" % (cx, cy)
 
 def get_pixel_level(x, y):
 	# deduce the level, assuming (x,y) are the center of a pixel

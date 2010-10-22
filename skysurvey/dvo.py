@@ -4,67 +4,37 @@ import pool2
 import time
 import numpy as np
 from slalib import sla_eqgal
-from itertools import imap
-
-def importDVO(fn, DVO):
-	# Create/open the database
-	db = StarDB(fn, 6)
-	db.table_fields = tableFields;
-
-	# import the entire DVO database
-	findcpt = 'find "' + DVO + '" -name "*.cpt"';
-	files = shell(findcpt).splitlines();
-	at = 0
-	for file in files:
-		# Load object data
-		dat = pyfits.getdata(file, 1)
-		ra  = dat.field('ra')
-		dec = dat.field('dec')
-		cols = [ dat.field(coldef[0]) for coldef in objCols ]
-
-		# Load magnitudes (they're stored in groups of 5 rows)
-		mag = pyfits.getdata(file[:-1]+'s', 1)
-		magRawCols = [ mag.field(coldef[0]) for coldef in magData ];
-		magCols    = [ col[band::5]         for band in xrange(5)    for col in magRawCols ]
-		cols += magCols
-
-		# Transform a list of columns into a list of rows, and store
-		rows = zip(*cols)
-		db.append(ra, dec, rows)
-
-		at = at + 1
-		print('    from ' + file + ('[%d/%d, %5.2f%%] +%-6d %9d' % (at, len(files), 100 * float(at) / len(files), len(rows), db.nrows())))
-
-	db.close();
-
+from itertools import imap, izip
 
 def initialize_column_definitions():
 	# Construct table definition
-	objCols = [
-		('ra',		'f8'),
-		('dec',		'f8'),
-		('flags',	'u4'),
-		('cat_id',	'u4'),
-		('ext_id',	'u8')
+	astromCols = [
+		('id',		'u8',	''),		# computed column
+		('cached', 	'bool',	''),		# computed column
+		('ra',		'f8',	'ra'),
+		('dec',		'f8',	'dec'),
+		('l',		'f8',	''),		# computed column
+		('b',		'f8',	''),		# computed column
+		('flags',	'u4',	'flags'),
+		('cat_id',	'u4',	'cat_id'),
+		('ext_id',	'u8',	'ext_id')
 	];
+
 	magData = [ # FITS field, output suffix, type
 		('MAG', '',		'f4'),
 		('MAG_ERR', 'Err',	'f4'),
-		('FLAGS', 'Flags',	'f4')
+		('FLAGS', 'Flags',	'u4')
 		];
-	magCols = [];
-	for mag in 'grizy': magCols.extend([ (mag + v[1], v[2]) for v in magData ])
-	tableFields = objCols + magCols;
+	photoCols = [];
+	for mag in 'grizy':
+		photoCols.extend([ (mag + suffix, dtype, fitscol) for (fitscol, suffix, dtype) in magData ])
 
-	# All columns
-	columns = [('id', 'u8'), ('cached', 'b')] +	\
-		  [('l',  'f8'), ('b', 'f8')] +		\
-		  objCols + 				\
-		  magCols
+	return (astromCols, photoCols, magData)
 
-	return (columns, objCols, magData)
+def to_dtype(cols):
+	return list(( (name, dtype) for (name, dtype, _) in cols ))
 
-(columns, objCols, magData) = initialize_column_definitions();
+(astromCols, photoCols, magData) = initialize_column_definitions();
 
 def import_from_dvo(catdir, dvo_files, create=False):
 	""" Import a PS1 catalog from DVO
@@ -74,7 +44,9 @@ def import_from_dvo(catdir, dvo_files, create=False):
 	"""
 	if create:
 		# Create the new database
-		cat = catalog.Catalog(catdir, 'c', columns)
+		cat = catalog.Catalog(catdir, name='ps1', mode='c')
+		cat.create_table('astrometry', { 'columns': to_dtype(astromCols), 'primary_key': 'id', 'spatial_keys': ('ra', 'dec'), "cached_flag": "cached" })
+		cat.create_table('photometry', { 'columns': to_dtype(photoCols) })
 	else:
 		cat = catalog.Catalog(catdir)
 
@@ -92,29 +64,37 @@ def import_from_dvo(catdir, dvo_files, create=False):
 
 def import_from_dvo_aux(file, cat):
 	# Load object data
-	dat = pyfits.getdata(file, 1)
-	ra  = dat.field('ra')
-	dec = dat.field('dec')
-	cols = [ dat.field(coldef[0]) for coldef in objCols ]
+	dat     = pyfits.getdata(file, 1)
+	cols    = dict(( (name, dat.field(fitsname))   for (name, _, fitsname) in astromCols if fitsname != ''))
 
 	# Load magnitudes (they're stored in groups of 5 rows)
 	mag = pyfits.getdata(file[:-1]+'s', 1)
-	magRawCols = [ mag.field(coldef[0]) for coldef in magData ];
-	magCols    = [ col[band::5]         for band in xrange(5)    for col in magRawCols ]
-	cols += magCols
+	magRawCols = [ mag.field(fitsname) for fitsname, _, _ in magData ];
+	photoData  = [ col[band::5]        for band in xrange(5)    for col in magRawCols ]
+	assert len(photoData) == len(photoCols)
+	for i, (col, _, _) in enumerate(photoCols):
+		cols[col] = photoData[i]
 
-	# Compute and add "derived" columns
+	#print ''
+	#for i, col in enumerate(magRawCols):
+	#	print magData[i][0],'=',col[10:15]
+	#for col, _, _ in photoCols:
+	#	print col,'=',cols[col][2]
+	#exit()
+
+	# Add computed columns
+	(ra, dec) = cols['ra'], cols['dec']
 	l = np.empty_like(ra)
 	b = np.empty_like(dec)
 	for i in xrange(len(ra)):
 		(l[i], b[i]) = np.degrees(sla_eqgal(*np.radians((ra[i], dec[i]))))
-	cached = np.zeros(len(ra), dtype='b')
+	cols['l']      = l
+	cols['b']      = b
 
-	cols.insert(0, cached)
-	cols.insert(1, l)
-	cols.insert(2, b)
+	# sanity check
+	for (name, _, _) in astromCols + photoCols:
+		assert name in cols or name in ['id', 'cached'], name
 
-	# Transform a list of columns into a list of rows, and store
-	ids = cat.insert(zip(*cols), ra, dec)
+	ids = cat.append(cols)
 
 	return (file, len(ids), len(ids))

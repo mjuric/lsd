@@ -7,13 +7,7 @@ import numpy as np
 from itertools import izip
 import bhpix
 import catalog
-
-def as_columns(rows, start=None, stop=None, stride=None):
-	# Emulate slice syntax: only one index present
-	if stop == None and stride == None:
-		stop = start
-		start = None
-	return tuple((rows[col] for col in rows.dtype.names[slice(start, stop, stride)]))
+from utils import as_columns, gnomonic, gc_dist
 
 ###################################################################
 ## Sky-coverage computation
@@ -34,15 +28,25 @@ def _coverage_mapper(rows, dx = 1., filter=None, filter_args=()):
 	(imin, imax, jmin, jmax) = (i.min(), i.max(), j.min(), j.max())
 	w = imax - imin + 1
 	h = jmax - jmin + 1
-	sky = np.zeros((w, h))
-
 	i -= imin; j -= jmin
-	for (ii, jj) in izip(i, j):
-		sky[ii, jj] += 1
+
+	if False:
+		# Binning (method #1, straightforward but slow)
+		sky = np.zeros((w, h))
+		for (ii, jj) in izip(i, j):
+			sky[ii, jj] += 1
+	else:
+		# Binning (method #2, fast)
+		sky2 = np.zeros(w*h)
+		idx = np.bincount(j + i*h)
+		sky2[0:len(idx)] = idx
+		sky = sky2.reshape((w, h))
+
+	#assert not (sky-sky2).any()
 
 	return (sky, imin, jmin)
 
-def compute_coverage(cat, dx = 0.5, include_cached=False, filter=None, filter_args=(), foot=catalog.All):
+def compute_coverage(cat, dx = 0.5, include_cached=False, filter=None, filter_args=(), foot=catalog.All, query='ra, dec'):
 	""" compute_coverage - produce a sky map of coverage, using
 	    a filter function if given. The output is a starcount
 	    array in (ra, dec) binned to <dx> resolution.
@@ -52,11 +56,12 @@ def compute_coverage(cat, dx = 0.5, include_cached=False, filter=None, filter_ar
 
 	sky = np.zeros((width, height))
 
-	for (patch, imin, jmin) in cat.map_reduce(_coverage_mapper, mapper_args=(dx, filter, filter_args), query='l, b where dec/2 > 30', include_cached=include_cached, foot=foot):
+	for (patch, imin, jmin) in cat.map_reduce(_coverage_mapper, mapper_args=(dx, filter, filter_args), query=query, include_cached=include_cached, foot=foot):
 		if patch is None:
 			continue
 		sky[imin:imin + patch.shape[0], jmin:jmin + patch.shape[1]] += patch
 
+	print "Objects:", sky.sum()
 	return sky
 ###################################################################
 
@@ -65,7 +70,7 @@ def compute_coverage(cat, dx = 0.5, include_cached=False, filter=None, filter_ar
 def ls_mapper(rows):
 	# return the number of rows in this chunk, keyed by the filename
 	self = ls_mapper
-	return (ls_mapper.CELL_ID, len(rows))
+	return (self.CELL_ID, len(rows))
 
 def compute_counts(cat, include_cached=False):
 	ntotal = 0
@@ -77,29 +82,7 @@ def compute_counts(cat, include_cached=False):
 ###################################################################
 ## Cross-match two catalogs
 
-def gnomonic(lon, lat, clon, clat):
-	from numpy import sin, cos
-
-	phi  = np.radians(lat)
-	l    = np.radians(lon)
-	phi1 = np.radians(clat)
-	l0   = np.radians(clon)
-
-	cosc = sin(phi1)*sin(phi) + cos(phi1)*cos(phi)*cos(l-l0)
-	x = cos(phi)*sin(l-l0) / cosc
-	y = (cos(phi1)*sin(phi) - sin(phi1)*cos(phi)*cos(l-l0)) / cosc
-
-	return (np.degrees(x), np.degrees(y))
-
-def gc_dist(lon1, lat1, lon2, lat2):
-	from numpy import sin, cos, arcsin, sqrt
-
-	lon1 = np.radians(lon1); lat1 = np.radians(lat1)
-	lon2 = np.radians(lon2); lat2 = np.radians(lat2)
-
-	return np.degrees(2*arcsin(sqrt( (sin((lat1-lat2)*0.5))**2 + cos(lat1)*cos(lat2)*(sin((lon1-lon2)*0.5))**2 )));
-
-def _xmatch_mapper(rows, cat_to, xmatch_radius, cat_to_name):
+def _xmatch_mapper(rows, cat_to, xmatch_radius, xmatch_table):
 	from scikits.ann import kdtree
 
 	# locate cell center
@@ -112,43 +95,43 @@ def _xmatch_mapper(rows, cat_to, xmatch_radius, cat_to_name):
 	# Fetch data and project to tangent plane around the center
 	# of the cell. We assume the cell is small enough for the
 	# distortions not to matter
-	if cat_to.cell_exists(cell_id):
-		rows2 = cat_to.fetch_cell(cell_id=cell_id, include_cached=True)
-		id1, ra1, dec1 = rows['id'], rows['ra'], rows['dec']
-		id2, ra2, dec2 = rows2['id'], rows2['ra'], rows2['dec']
-		xy1 = np.column_stack(gnomonic(ra1, dec1, clon, clat))
-		xy2 = np.column_stack(gnomonic(ra2, dec2, clon, clat))
+	if not cat_to.tablet_exists(cell_id):
+		return len(rows), 0, 0
 
-		# Construct kD-tree and find the nearest to each object
-		# in this cell
-		tree = kdtree(xy2)
-		match_idx, match_d2 = tree.knn(xy1, 1)
-		match_idx = match_idx[:,0]		# First neighbor only
-		del tree
+	(id1, ra1, dec1) = as_columns(rows)
 
-		# Create the index table array
-		xmatch = np.empty(len(match_idx), dtype=[('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')])
-		xmatch['id1'] = id1
-		xmatch['id2'] = id2[match_idx]
-		xmatch['dist'] = gc_dist(ra1, dec1, ra2[match_idx], dec2[match_idx])
-		# Remove the matches beyond xmatch_radius
-		xmatch = xmatch[xmatch['dist'] < xmatch_radius]
+	rows2 = cat_to.fetch_cell(cell_id, include_cached=True)
+	raKey2, decKey2 = cat_to.get_spatial_keys()
+	idKey2          = cat_to.get_primary_key()
+	id2, ra2, dec2 = rows2[idKey2], rows2[raKey2], rows2[decKey2]
+	xy1 = np.column_stack(gnomonic(ra1, dec1, clon, clat))
+	xy2 = np.column_stack(gnomonic(ra2, dec2, clon, clat))
 
+	# Construct kD-tree and find the nearest to each object
+	# in this cell
+	tree = kdtree(xy2)
+	match_idx, match_d2 = tree.knn(xy1, 1)
+	del tree
+	match_idx = match_idx[:,0]		# First neighbor only
+
+	# Create the index table array
+	xmatch = np.empty(len(match_idx), dtype=np.dtype(cat._get_schema(xmatch_table)['columns']))
+	xmatch['id1'] = id1
+	xmatch['id2'] = id2[match_idx]
+	xmatch['d1']  = gc_dist(ra1, dec1, ra2[match_idx], dec2[match_idx])
+	# Remove the matches beyond xmatch_radius
+	xmatch = xmatch[xmatch['d1'] < xmatch_radius]
+
+	if len(xmatch) != 0:
 		# Store the xmatch table
-		if len(xmatch) != 0:
-			table = 'xmatch_' + cat_to_name
-			cat.create_table(table, { 'columns': [('id1', 'u8'), ('id2', 'u8'), ('dist', 'f4')] }, ignore_if_exists=True)
-			# Store the xmatch table
-			with cat.cell(cell_id, mode='w', table=table) as fp:
-				if fp.root.xmatch.nrows != 0:
-					fp.root.xmatch.removeRows(0, fp.root.xmatch.nrows)
-				fp.root.xmatch.append(xmatch)
+		cat._drop_tablet(cell_id, xmatch_table)
+		cat._append_tablet(cell_id, xmatch_table, xmatch)
 
 		return len(id1), len(id2), len(xmatch)
 	else:
 		return len(rows), 0, 0
 
-def xmatch(cat_from, cat_to, cat_to_name, radius=1./3600.):
+def xmatch(cat_from, cat_to, radius=1./3600.):
 	""" Cross-match objects from cat_to with cat_from catalog and
 	    store the result into a cross-match table in cat_from.
 
@@ -157,10 +140,19 @@ def xmatch(cat_from, cat_to, cat_to_name, radius=1./3600.):
 	    	- stream through all objects in cat_to, find matches
 	    	- store the output into an index table
 	"""
-	for (nfrom, nto, nmatch) in cat_from.map_reduce(_xmatch_mapper, mapper_args=(cat_to, radius, cat_to_name)):
-		if nfrom != 0 and nto != 0:
-			print "  ===>  %6d xmatch %6d -> %6d (%5.2f)" % (nfrom, nto, nmatch, 100. * nmatch / nfrom)
+	# Create the x-match table
+	xmatch_table = 'xmatch_' + cat_to.name
+	cat_from.create_table(xmatch_table, { 'columns': [('id1', 'u8'), ('id2', 'u8'), ('d1', 'f4')] }, ignore_if_exists=True, hidden=True)
 
-	# TODO: add metadata do dbinfo about this xmatch
+	raKey, decKey = cat_from.get_spatial_keys()
+	idKey         = cat_from.get_primary_key()
+	query = "%s, %s, %s" % (idKey, raKey, decKey)
+
+	#for (nfrom, nto, nmatch) in cat_from.map_reduce(_xmatch_mapper, query=query, mapper_args=(cat_to, radius, xmatch_table)):
+	#	if nfrom != 0 and nto != 0:
+	#		print "  ===>  %6d xmatch %6d -> %6d matches (%5.2f%%)" % (nfrom, nto, nmatch, 100. * nmatch / nfrom)
+
+	# Add metadata about this xmatch to dbinfo
+	cat_from.add_xmatched_catalog(cat_to, xmatch_table)
 
 ###################################################################

@@ -88,8 +88,9 @@ class Pool:
 	qin = None
 	qout = None
 	ps = []
-	DEBUG = False
+	#DEBUG = False
 	#DEBUG = True
+	DEBUG = os.getenv('DEBUG', False)
 
 	def __init__(self, nworkers = None):
 	        if self.DEBUG:

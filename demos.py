@@ -35,16 +35,17 @@ if False:
 if False:
 	# xmatch PS1 to SDSS
 	ps1 = ss.Catalog('ps1')
-	sdss = ss.Catalog('sdss3')
-	ss.xmatch(ps1, sdss, 'sdss')
+	sdss = ss.Catalog('sdss')
+	ss.xmatch(ps1, sdss)
 	exit()
 #########################################################
 
 if True:
 	# Compute and store the sky coverage at a given resolution (see skysurvey/tasks.py on how this is implemented)
-	cat = ss.Catalog('sdss')
+	cat = ss.Catalog('ps1')
 	print "Computing sky coverage map: ",
-	sky = ss.compute_coverage(cat, dx=0.025, include_cached=True)
+	#sky = ss.compute_coverage(cat, dx=0.025, include_cached=False, query='ra, dec, sdss.ra, sdss.dec, sdss.id XMATCH WITH sdss')
+	sky = ss.compute_coverage(cat, dx=0.025, include_cached=False, query='ra, dec')
 	pyfits.writeto('foot.0.025.fits', sky.astype(float).transpose()[::-1,], clobber=True)
 	exit()
 #########################################################

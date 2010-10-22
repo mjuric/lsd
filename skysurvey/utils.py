@@ -1,6 +1,35 @@
 import subprocess, os, errno
 import numpy as np
 
+def gnomonic(lon, lat, clon, clat):
+	from numpy import sin, cos
+
+	phi  = np.radians(lat)
+	l    = np.radians(lon)
+	phi1 = np.radians(clat)
+	l0   = np.radians(clon)
+
+	cosc = sin(phi1)*sin(phi) + cos(phi1)*cos(phi)*cos(l-l0)
+	x = cos(phi)*sin(l-l0) / cosc
+	y = (cos(phi1)*sin(phi) - sin(phi1)*cos(phi)*cos(l-l0)) / cosc
+
+	return (np.degrees(x), np.degrees(y))
+
+def gc_dist(lon1, lat1, lon2, lat2):
+	from numpy import sin, cos, arcsin, sqrt
+
+	lon1 = np.radians(lon1); lat1 = np.radians(lat1)
+	lon2 = np.radians(lon2); lat2 = np.radians(lat2)
+
+	return np.degrees(2*arcsin(sqrt( (sin((lat1-lat2)*0.5))**2 + cos(lat1)*cos(lat2)*(sin((lon1-lon2)*0.5))**2 )));
+
+def as_columns(rows, start=None, stop=None, stride=None):
+	# Emulate slice syntax: only one index present
+	if stop == None and stride == None:
+		stop = start
+		start = None
+	return tuple((rows[col] for col in rows.dtype.names[slice(start, stop, stride)]))
+
 def shell(cmd):
 	p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 	(out, err) = p.communicate();

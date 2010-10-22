@@ -3,42 +3,46 @@ import pyfits
 import pool2
 import numpy as np
 from slalib import sla_eqgal
-from itertools import imap
+from itertools import imap, izip
 
 def initialize_column_definitions():
-	# Columns from sweep files
-	objCols = [
+	# Astrometry table
+	astromCols = [
 		# column in Catalog	Datatype	Column in sweep files
-		('run', 		'i4',	'run'),
-		('camcol',		'i4',	'camcol'),
-		('field',		'i4',	'field'),
-		('objid',		'i4',	'id'),
-
+		('id',			'u8',	''),			# computed column
+		('cached', 		'bool',	''),			# computed column
 		('ra',			'f8',	'ra'),
 		('dec',			'f8',	'dec'),
+		('l',			'f8',	''),			# computed column
+		('b',			'f8',	''),			# computed column
 		('type',		'i4',	'objc_type'),
 		('flags',		'i4',	'objc_flags'),
 		('flags2',		'i4',	'objc_flags2'),
 		('resolve_status',	'i2',	'resolve_status')
 	]
 
-	# Magnitude-related columns
-	magCols = [];
+	# Survey metadata table
+	surveyCols = [
+		('run', 		'i4',	'run'),
+		('camcol',		'i4',	'camcol'),
+		('field',		'i4',	'field'),
+		('objid',		'i4',	'id'),
+	]
+
+	# Photometry table
+	photoCols = [];
 	for mag in 'ugriz':
-		magCols.append( (mag,           'f4') )
-		magCols.append( (mag + 'Err',   'f4') )
-		magCols.append( (mag + 'Ext',   'f4') )
-		magCols.append( (mag + 'Calib', 'f4') )
+		photoCols.append( (mag,           'f4',	'') )
+		photoCols.append( (mag + 'Err',   'f4',	'') )
+		photoCols.append( (mag + 'Ext',   'f4',	'') )
+		photoCols.append( (mag + 'Calib', 'i2',	'') )
 
-	# All columns
-	columns = [('id', 'u8'), ('cached', 'b')] +	\
-		  [('l',  'f8'), ('b', 'f8')] +		\
-		  [f[0:2] for f in objCols] +		\
-		  magCols
+	return (astromCols, surveyCols, photoCols)
 
-	return (columns, objCols)
+def to_dtype(cols):
+	return list(( (name, dtype) for (name, dtype, _) in cols ))
 
-(columns, objCols) = initialize_column_definitions();
+(astromCols, surveyCols, photoCols) = initialize_column_definitions();
 
 # SDSS flag definitions
 F1_SATURATED		 = (2**18)
@@ -58,7 +62,9 @@ def import_from_sweeps(catdir, sweep_files, create=False):
 	if create:
 		# Create the new database
 		cat = catalog.Catalog(catdir, name='sdss', mode='c')
-		cat.create_table('catalog', { 'columns': columns, 'primary_key': 'id', 'spatial_keys': ('ra', 'dec') })
+		cat.create_table('astrometry', { 'columns': to_dtype(astromCols), 'primary_key': 'id', 'spatial_keys': ('ra', 'dec'), "cached_flag": "cached" })
+		cat.create_table('survey',     { 'columns': to_dtype(surveyCols) })
+		cat.create_table('photometry', { 'columns': to_dtype(photoCols) })
 	else:
 		cat = catalog.Catalog(catdir)
 
@@ -85,38 +91,37 @@ def import_from_sweeps_aux(file, cat):
 	# Import objects
 	if any(ok != 0):
 		# Load the data, cutting on flags
-		cols                     = [ dat.field(col[2])[ok]             for col in objCols ]
+		cols                     = dict(( (name, dat.field(fitsname)[ok])   for (name, _, fitsname) in astromCols + surveyCols if fitsname != ''))
 		(ext, flux, ivar, calib) = [ dat.field(col)[ok].transpose()    for col in ['extinction', 'modelflux', 'modelflux_ivar', 'calib_status'] ]
-		(ra, dec)                = cols[4], cols[5]
 
 		# Compute magnitudes in all bands
 		for band in xrange(5):
 			(fluxB, ivarB, extB, calibB) = (flux[band], ivar[band], ext[band], calib[band])
 
+			# Compute magnitude from flux
 			fluxB[fluxB <= 0] = 0.001
 			mag = -2.5 * np.log10(fluxB) + 22.5
 			magErr = (1.08574 / fluxB) / np.sqrt(ivarB)
 
-			cols += [mag, magErr, extB, calibB]
+			# Append these to the list of columns
+			bands = 'ugriz'
+			for name, col in izip(['', 'Err', 'Ext', 'Calib'], [mag, magErr, extB, calibB]):
+				cols[bands[band] + name] = col
 
-		# Compute and add "derived" columns
+		# Add computed columns
+		(ra, dec) = cols['ra'], cols['dec']
 		l = np.empty_like(ra)
 		b = np.empty_like(dec)
 		for i in xrange(len(ra)):
 			(l[i], b[i]) = np.degrees(sla_eqgal(*np.radians((ra[i], dec[i]))))
-		cached = np.zeros(len(ra), dtype='bool')
+		cols['l']      = l
+		cols['b']      = b
 
-		cols.insert(0, np.empty(len(ra), dtype=np.uint64))	# id
-		cols.insert(1, cached)					# cached
-		cols.insert(2, l)					# l
-		cols.insert(3, b)					# b
+		# sanity check
+		for (name, _, _) in astromCols + surveyCols + photoCols:
+			assert name in cols or name in ['id', 'cached'], name
 
-		# Transform a list of columns into an array of rows and store
-		rows = np.empty(len(ra), dtype=np.dtype(columns))
-		for (pos, (name, _)) in enumerate(columns):
-			rows[name] = cols[pos]
-
-		ids = cat.append('catalog', rows)
+		ids = cat.append(cols)
 	else:
 		ids = []
 

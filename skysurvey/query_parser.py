@@ -19,7 +19,7 @@ def parse(query, tablecols):
 				break
 
 			col = ''
-			while token.lower() not in ['', ',', 'where', 'as']:
+			while token.lower() not in ['', ',', 'where', 'as', 'xmatch']:
 				col = col + token
 				if token == '(':
 					# find matching ')'
@@ -50,12 +50,18 @@ def parse(query, tablecols):
 				newcols = [(name, col)]
 
 			# Column delimiter or end of SELECT clause
-			if token.lower() in ['', ',', 'where', 'from']:
+			if token.lower() in ['', ',', 'where', 'xmatch']:
 				select_clause += newcols
-				if token.lower() == "from":
+				if token.lower() == "xmatch":
+					first = True
 					# JOIN clause
 					while token.lower() not in ['', 'where']:
 						(_, table, _, _, _) = next(g)			# table name
+
+						if first:
+							first = False
+							if table.lower() == 'with':
+								continue
 
 						(_, token, _, _, _) = next(g)
 						if token == '(':
@@ -94,11 +100,13 @@ if __name__ == '__main__':
 		'': ['a', 'b', 'c'],
 		'sdss': ['haha', 'hihi']
 	}
+	print parse("sdss.ra, sdss.dec XMATCH with sdss", tablecols)
+	exit()
 	print parse("*, sdss.*", tablecols);
 	exit()
 	print parse("ra, dec", tablecols);
 	exit()
-	print parse("sdss.*, ra, sdss.gic as a, dec as DEC, (where(sdss.dec,where,ra,dec)) as blarg FROM ps1, sdss(outer), tmass WHERE 0.1 < g-r < 0.5", tablecols)
+	print parse("sdss.*, ra, sdss.gic as a, dec as DEC, (where(sdss.dec,where,ra,dec)) as blarg XMATCH ps1, sdss(outer), tmass WHERE 0.1 < g-r < 0.5", tablecols)
 	exit()
 
 	vd = VerboseDict()
