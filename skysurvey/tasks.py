@@ -7,7 +7,7 @@ import numpy as np
 from itertools import izip
 import bhpix
 import catalog
-from utils import as_columns, gnomonic, gc_dist
+from utils import as_columns, gnomonic, gc_dist, unpack_callable
 
 ###################################################################
 ## Sky-coverage computation
@@ -46,17 +46,19 @@ def _coverage_mapper(rows, dx = 1., filter=None, filter_args=()):
 
 	return (sky, imin, jmin)
 
-def compute_coverage(cat, dx = 0.5, include_cached=False, filter=None, filter_args=(), foot=catalog.All, query='ra, dec'):
+def compute_coverage(cat, dx = 0.5, include_cached=False, filter=None, foot=catalog.All, query='ra, dec'):
 	""" compute_coverage - produce a sky map of coverage, using
 	    a filter function if given. The output is a starcount
 	    array in (ra, dec) binned to <dx> resolution.
 	"""
+	filter, filter_args = unpack_callable(filter)
+
 	width  = int(round(360/dx))
 	height = int(round(180/dx))
 
 	sky = np.zeros((width, height))
 
-	for (patch, imin, jmin) in cat.map_reduce(_coverage_mapper, mapper_args=(dx, filter, filter_args), query=query, include_cached=include_cached, foot=foot):
+	for (patch, imin, jmin) in cat.map_reduce(query, (_coverage_mapper, dx, filter, filter_args), foot=foot, include_cached=include_cached):
 		if patch is None:
 			continue
 		sky[imin:imin + patch.shape[0], jmin:jmin + patch.shape[1]] += patch
@@ -74,7 +76,7 @@ def ls_mapper(rows):
 
 def compute_counts(cat, include_cached=False):
 	ntotal = 0
-	for (cell_id, nobjects) in cat.map_reduce(ls_mapper, query='id', include_cached=include_cached):
+	for (cell_id, nobjects) in cat.map_reduce('id', ls_mapper, include_cached=include_cached):
 		ntotal = ntotal + nobjects
 	return ntotal
 ###################################################################
@@ -191,7 +193,7 @@ def xmatch(cat_from, cat_to, radius=1./3600.):
 	query = "%s, %s, %s" % (idKey, raKey, decKey)
 
 	ntot = 0
-	for (nfrom, nto, nmatch) in cat_from.map_reduce(_xmatch_mapper, query=query, mapper_args=(cat_to, radius, xmatch_table)):
+	for (nfrom, nto, nmatch) in cat_from.map_reduce(query, (_xmatch_mapper, cat_to, radius, xmatch_table)):
 		ntot += nmatch
 		if nfrom != 0 and nto != 0:
 			print "  ===>  %6d xmatch %6d -> %6d matches (%5.2f%%)" % (nfrom, nto, nmatch, 100. * nmatch / nfrom)

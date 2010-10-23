@@ -1,6 +1,12 @@
 import subprocess, os, errno
 import numpy as np
 
+def unpack_callable(func):
+	""" Unpack a (function, function_args) tuple
+	"""
+	func, func_args = (func, ()) if callable(func) or func is None else (func[0], func[1:])
+	return func, func_args
+
 def gnomonic(lon, lat, clon, clat):
 	from numpy import sin, cos
 

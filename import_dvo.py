@@ -35,12 +35,10 @@ for (o, a) in optlist:
 # Actual work
 #
 files = shell('find "' + dvo_dir + '" -name "*.cpt"').splitlines();
-#files = files[:10]
 
 print "Importing PS1 catalog ",
 dvo.import_from_dvo(cat_dir, files, create)
 print " done."
-#exit()
 
 cat = lsd.Catalog(cat_dir)
 print "Building neighbor cache ",

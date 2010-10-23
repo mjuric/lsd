@@ -31,7 +31,7 @@ if False:
 		pyfits.writeto('rCalib_mean.fits', aimg.astype(float), clobber=True)
 	exit()
 
-if True:
+if False:
 	# Extract a block of rows and store it in a FITS file
 	cat = ss.Catalog('sdss')
 	query = 'ra, dec, l, b, type, flags, flags2, resolve_status, u, uErr, uExt, uCalib, g, gErr, gExt, gCalib, r, rErr, rExt, rCalib, i, iErr, iExt, iCalib, z, zErr, zExt, zCalib, run, camcol, field, objid'
@@ -91,7 +91,7 @@ if False:
 	exit()
 #########################################################
 
-if True:
+if False:
 	# MapReduce: Compute SDSS vs. PS1 r-mag distribution across the entire sky
 
 	# Mapper: compute histograms of mag. offsets, keyed by healpix pixels
@@ -131,9 +131,7 @@ if True:
 	img = np.zeros(shape=[len(edges)+1, nside, nside])	# output image
 
 	print "Computing magnitude distributions (%d x %d): " % (nside, nside),
-	#for (pix, dist) in sorted(cat.map_reduce(calib_check_mapper, calib_check_reducer, mapper_args=(level, edges), cols='ra dec r sdss3.r', join_type='inner', foot=ssfoot.rectangle(180, 10, 181, 11))):
-	#for (pix, dist) in sorted(cat.map_reduce(calib_check_mapper, calib_check_reducer, mapper_args=(level, edges), cols='ra dec r sdss3.r', join_type='inner', foot=ssfoot.rectangle(175, 35, 185, 85))):
-	for (pix, dist) in sorted(cat.map_reduce(calib_check_mapper, calib_check_reducer, mapper_args=(level, edges), query='ra, dec, r, sdss.r XMATCH sdss')):
+	for (pix, dist) in sorted(cat.map_reduce('ra, dec, r, sdss.r XMATCH sdss', (calib_check_mapper, level, edges), calib_check_reducer)):
 		j = pix // nside
 		i = pix % nside
 		img[:, j, i] = dist
@@ -169,7 +167,7 @@ if True:
 	ddec = 10
 	bins = np.arange(-90, 90.01, ddec)	# bin edges
 	cat  = ss.Catalog('ps1')
-	hist = cat.map_reduce(deccount_mapper, deccount_reducer, mapper_args=(bins,), query='dec xmatch with sdss')
+	hist = cat.map_reduce('dec xmatch with sdss', (deccount_mapper, bins), deccount_reducer)
 	for (bin, count) in sorted(hist):
 		print "%+05.1f %10d" % (bin + ddec/2, count)
 #########################################################

@@ -25,7 +25,7 @@ import fcntl
 import Polygon.IO
 import utils
 import footprint
-from utils import astype, gc_dist
+from utils import astype, gc_dist, unpack_callable
 
 # Special return type used in _mapper() and Catalog.map_reduce
 # to denote that the returned value should not be yielded to
@@ -552,7 +552,7 @@ class Catalog:
 
 		return rows
 
-	def fetch(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None, filter_args=()):
+	def fetch(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None):
 		""" Return a table (numpy structured array) of all rows within a
 		    given footprint. Calls 'filter' callable (if given) to filter
 		    the returned rows.
@@ -574,8 +574,10 @@ class Catalog:
 		    filter may be given in 'filter_args'
 		"""
 
+		filter, filter_args = unpack_callable(filter)
+
 		ret = None
-		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), query=query, foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
+		for rows in self.map_reduce(query=query, mapper=(_iterate_mapper, filter, filter_args), foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
 			# ensure enough memory has been allocated (and do it
 			# intelligently if not)
 			if ret == None:
@@ -594,7 +596,7 @@ class Catalog:
 		#print "Resizing to", len(ret)
 		return ret
 
-	def iterate(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None, filter_args=(), return_array=False):
+	def iterate(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None, return_array=False):
 		""" Yield rows (either on a row-by-row basis if return_array==False
 		    or in chunks (numpy structured array)) within a
 		    given footprint. Calls 'filter' callable (if given) to filter
@@ -604,14 +606,16 @@ class Catalog:
 		    'filter' callable.
 		"""
 
-		for rows in self.map_reduce(_iterate_mapper, mapper_args=(filter, filter_args), query=query, foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
+		filter, filter_args = unpack_callable(filter)
+
+		for rows in self.map_reduce(query, (_iterate_mapper, filter, filter_args), foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
 			if return_array:
 				yield rows
 			else:
 				for row in rows:
 					yield row
 
-	def map_reduce(self, mapper, reducer=None, query='*', foot=All, testbounds=True, include_cached=False, join_type='outer', mapper_args=(), reducer_args=(), nworkers=None, progress_callback=None):
+	def map_reduce(self, query, mapper, reducer=None, foot=All, testbounds=True, include_cached=False, nworkers=None, progress_callback=None):
 		""" A MapReduce implementation, where rows from individual cells
 		    get mapped by the mapper, with the result reduced by the reducer.
 		    
@@ -634,6 +638,10 @@ class Catalog:
 		    If the reducer is None, only the mapping step is performed and the
 		    return value of the mapper is passed to the user.
 		"""
+		# Unpack mapper/reducer args
+		mapper,   mapper_args = unpack_callable(mapper)
+		reducer, reducer_args = unpack_callable(reducer)
+
 		# slice up the job down to individual cells
 		partspecs = self._get_cells(foot)
 
@@ -754,7 +762,7 @@ class Catalog:
 
 		ntotal = 0
 		ncells = 0
-		for (cell_id, ncached) in self.map_reduce(_cache_maker_mapper, _cache_maker_reducer, query=query, mapper_args=(margin_x, margin_t)):
+		for (cell_id, ncached) in self.map_reduce(query, (_cache_maker_mapper, margin_x, margin_t), _cache_maker_reducer):
 			ntotal = ntotal + ncached
 			ncells = ncells + 1
 			#print self._cell_prefix(cell_id), ": ", ncached, " cached objects"
@@ -818,7 +826,7 @@ class Catalog:
 ###############################################################
 # Aux functions implementing Catalog.iterate and Catalog.fetch
 # functionallity
-def _iterate_mapper(rows, filter = None, filter_args = ()):
+def _iterate_mapper(rows, filter, filter_args):
 	if filter != None:
 		rows = filter(rows, *filter_args)
 	return rows
@@ -1342,72 +1350,3 @@ def _cache_maker_reducer(cell_id, nborblocks):
 	# Return the number of new rows cached into this cell
 	return (cell_id, ncached)
 ###################################################################
-
-# Refresh neighbor cache
-if __name__ == "x__main__":
-	cat = Catalog('sdss')
-	cat.build_neighbor_cache()
-
-	exit()
-
-# MapReduce examples
-if __name__ == "__main__":
-	cat = Catalog('sdss')
-
-	# Simple mapper, counts the number of objects in each file
-#	ntotal = 0
-#	for (file, nobjects) in cat.map_reduce(ls_mapper, include_cached=False, nworkers=4):
-#		ntotal = ntotal + nobjects
-#		print file, nobjects
-#	print "Total of %d objects in catalog." % ntotal
-
-	# Computes the histogram of counts vs. declination
-#	for (k, v) in sorted(cat.map_reduce(deccount_mapper, deccount_reducer)):
-#		print k, v
-
-	# Computes and plots the sky coverage at a given resolution
-	sky_coverage = coverage(dx=0.25)
-	pyfits.writeto('foot.fits', sky_coverage.astype(float).transpose()[::-1,], clobber=True)
-
-	exit()
-
-
-if __name__ == "x__main__":
-
-	#importDVO('ps1', '/raid14/panstarrs/dvo-201008');
-	#importSDSS('sdss', '/raid14/sweeps/sdss3/2009-11-16.v2/301/');
-	importSDSS('sdss', '/data/sdss/sdss3/2009-11-16.v2/301/');
-	exit()
-
-	cat = Catalog('sdss')
-	n = 0;
-	sky = np.zeros((360,180))
-	allsky = Polygon.Polygon([(1,1),(-1,1),(-1,-1),(1,-1)])
-	foot = footprint.rectangle(0, -80, 360, 90, coordsys='gal')
-	foot = allsky
-
-#	for (ra, dec) in cat.select('ra dec', foot, testbounds=True):
-#		n = n + 1
-#		sky[int(ra), int(90-dec)] += 1
-
-	###mr = MapReduce_Coverage()
-	###cat.mapreduce(test_map, mr.reduce, foot, testbounds=True)
-	###n = mr.sum;
-	###sky = mr.sky
-
-	test_reduce.sky = None
-	cat.mapreduce(test_map, test_reduce, foot, testbounds=True, mapargs=(0.5,))
-	sky = test_reduce.sky
-	n = sky.sum()
-
-	#from PIL import Image
-	#img = Image.fromarray(sky.astype(np.int32));
-	#img.save('foot.png')
-	pyfits.writeto('foot.fits', sky.astype(float).transpose()[::-1,], clobber=True)
-
-	print 'rows=', n
-	#plt.imshow(sky.transpose(), interpolation='nearest');
-	#plt.show();
-
-	exit()
-
