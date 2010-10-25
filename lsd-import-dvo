@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Example: import_dvo.py -c ps1 /raid14/panstarrs/dvo-201008
+# Example: lsd-import-dvo -c ps1 /raid14/panstarrs/dvo-201008
 #
 
 import sys

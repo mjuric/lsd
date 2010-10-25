@@ -1,0 +1,45 @@
+#!/usr/bin/env python
+import sys
+import os
+import os.path
+import numpy as np
+import getopt
+import skysurvey as ss
+from skysurvey.footprint import rectangle
+from skysurvey.utils import make_printf_string, as_tuple
+import pyfits
+
+def usage():
+	print "Usage: %s --bounds=[All] --resolution=[2arcmin] --query=['ra, dec'] <catalog> <output.fits>" % sys.argv[0]
+
+try:
+	optlist, args = getopt.getopt(sys.argv[1:], 'b:r:q:', ['bounds=', 'resolution=', 'query='])
+except getopt.GetoptError, err:
+	print str(err)
+	usage()
+	exit(-1)
+
+if len(args) != 2:
+	print "Error: Incorrect number of command line arguments."
+	usage()
+	exit(-1)
+
+foot = []
+output = 'footprint.fits'
+query = 'ra, dec'
+dx = 2.
+for o, a in optlist:
+	if o in ('-b', '--bounds'):
+		foot = eval(a)
+	if o in ('-r', '--resolution'):
+		dx = float(a)
+	if o in ('-q', '--query'):
+		query = a
+catname, output = args
+
+#
+# Compute and store the sky coverage at a given resolution (see skysurvey/tasks.py on how this is implemented)
+#
+cat = ss.Catalog(catname)
+sky = ss.compute_coverage(cat, dx=dx/60., query=query, foot=foot)
+pyfits.writeto(output, sky[::-1,::-1].transpose(), clobber=True)

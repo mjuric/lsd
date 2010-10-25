@@ -29,6 +29,31 @@ def gc_dist(lon1, lat1, lon2, lat2):
 
 	return np.degrees(2*arcsin(sqrt( (sin((lat1-lat2)*0.5))**2 + cos(lat1)*cos(lat2)*(sin((lon1-lon2)*0.5))**2 )));
 
+def get_fmt(dtype):
+	fmt_map = {
+		'int8':         '%4d',
+		'int16':	'%6d',
+		'int32':	'%11d',
+		'int64':	'%21d',
+		'float32':	'%7.3f',
+		'float64':	'%12.8f',
+		'uint8':        '%3d',
+		'uint16':	'%5d',
+		'uint32':	'%10d',
+		'uint64':	'%20d',
+		'bool':		'%1d'
+	}
+	if dtype.kind == 'S':
+		return '%' + str(dtype.itemsize) + 's'
+	return fmt_map[str(dtype)]
+
+def make_printf_string(row):
+	fmt = ' '.join( [ get_fmt(row.dtype.fields[name][0]) for name in row.dtype.names ] )
+	return fmt
+
+def as_tuple(row):
+	return tuple((row[col] for col in row.dtype.names))
+
 def as_columns(rows, start=None, stop=None, stride=None):
 	# Emulate slice syntax: only one index present
 	if stop == None and stride == None:

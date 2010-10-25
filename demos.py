@@ -36,7 +36,6 @@ if False:
 	cat = ss.Catalog('sdss')
 	query = 'ra, dec, l, b, type, flags, flags2, resolve_status, u, uErr, uExt, uCalib, g, gErr, gExt, gCalib, r, rErr, rExt, rCalib, i, iErr, iExt, iCalib, z, zErr, zExt, zCalib, run, camcol, field, objid'
 	rows = cat.fetch(query=query, foot=ssfoot.rectangle(15, 15, 28, 75))
-	print rows.dtype.names
 	pyfits.writeto('sdss3-subset.fits', rows, clobber=True)
 	exit()
 

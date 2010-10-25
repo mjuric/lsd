@@ -66,9 +66,12 @@ class Catalog:
 
 	def all_columns(self):
 		# Return the list of all columns in all tables of the catalog
-		cols = []
-		for _, schema in self.tables.iteritems():
-			cols += schema['columns']
+		# Return the primary table's columns first, followed by other tables in alphabetical order
+		cols = self.tables[self.primary_table]['columns']
+		for name in sorted(self.tables.keys()):
+			if name == self.primary_table:
+				continue
+			cols += self.tables[name]['columns']
 		return [ name for name, _ in cols ]
 
 	def cell_for_id(self, id):
@@ -596,8 +599,8 @@ class Catalog:
 		#print "Resizing to", len(ret)
 		return ret
 
-	def iterate(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None, return_array=False):
-		""" Yield rows (either on a row-by-row basis if return_array==False
+	def iterate(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None, return_blocks=False):
+		""" Yield rows (either on a row-by-row basis if return_blocks==False
 		    or in chunks (numpy structured array)) within a
 		    given footprint. Calls 'filter' callable (if given) to filter
 		    the returned rows.
@@ -609,7 +612,7 @@ class Catalog:
 		filter, filter_args = unpack_callable(filter)
 
 		for rows in self.map_reduce(query, (_iterate_mapper, filter, filter_args), foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
-			if return_array:
+			if return_blocks:
 				yield rows
 			else:
 				for row in rows:

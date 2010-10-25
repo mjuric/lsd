@@ -1,0 +1,76 @@
+#!/usr/bin/env python
+import sys
+import os
+import os.path
+import numpy as np
+import getopt
+import skysurvey as ss
+from skysurvey.footprint import rectangle
+from skysurvey.utils import make_printf_string, as_tuple
+import pyfits
+
+def usage():
+	print "Usage: %s --bounds=bounds --format=[fits|text] --output=[outputfile] <catalog> <query>" % sys.argv[0]
+
+try:
+	optlist, args = getopt.getopt(sys.argv[1:], 'b:f:o:', ['bounds=', 'format=', 'output='])
+except getopt.GetoptError, err:
+	print str(err)
+	usage()
+	exit(-1)
+
+if len(args) != 2:
+	print "Error: Incorrect number of command line arguments."
+	usage()
+	exit(-1)
+
+foot = []
+format = 'text'
+output = 'output.fits'
+for o, a in optlist:
+	if o in ('-b', '--bounds'):
+		foot = eval(a)
+	if o in ('--format', '-f'):
+		if a not in ['text', 'fits']: usage(); exit(-1);
+		format = a
+	if o in ('--output', '-o'):
+		output = a
+catname, query = args
+
+
+
+######### Actual work
+
+cat = ss.Catalog(catname)
+if format == 'text':
+	# Text output
+	fmt = None
+	for row in cat.iterate(query, foot):
+		if fmt == None:
+			fmt = make_printf_string(row)
+			print '# ' + ' '.join(row.dtype.names)
+		print fmt % as_tuple(row)
+else:
+	# FITS output
+	rows = cat.fetch(query, foot)
+
+	# workaround for pyfits bug -- it doesn't know what to do with bool and uint?? columns
+	#                              so for now just convert these to signed, and emit a warning
+	dtype = []
+	for col in rows.dtype.names:
+		t, o = rows.dtype.fields[col]
+		conv=False
+		if   t == np.bool:	t = 'i1'; conv=True
+		elif t == np.uint64:	t = 'i8'; conv=True
+		elif t == np.uint32:	t = 'i4'; conv=True
+		elif t == np.uint16:	t = 'i2'; conv=True
+		dtype += [(col, t)]
+		if conv:
+			print >> sys.stderr, 'WARNING: Stored "%s" as a signed integer, as pyfits can\'t handle unsigned.' % (col)
+	rows = np.array(rows, dtype=dtype)
+
+	if os.path.exists(output):
+		os.unlink(output)
+	pyfits.writeto(output, rows)
+
+	print >> sys.stderr, 'Output in %s' % (output)
