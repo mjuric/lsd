@@ -25,6 +25,7 @@ import fcntl
 import Polygon.IO
 import utils
 import footprint
+from table import Table
 from utils import astype, gc_dist, unpack_callable
 
 # Special return type used in _mapper() and Catalog.map_reduce
@@ -197,7 +198,8 @@ class Catalog:
 					"columns":   data["columns"],
 					"primary_key": "id",
 					"spatial_keys": ("ra", "dec"),
-					"cached_flag": "cached"
+					"cached_flag": "cached",
+					"blobs": dict()
 				}
 			}
 			data["primary_table"] = 'catalog'
@@ -536,6 +538,12 @@ class Catalog:
 		if table in self.tables: return self.tables[table]
 		return self.hidden_tables[table]
 
+	def _fetch_blobs(fp, blobname, blobrefs):
+		# load the blobs arrays
+		blobstore = fp.root.blobs.__getattr__(blobname)		# get reference to VLArray where our blobs are pickled
+		blobs = blobstore[blobrefs]				# load and automatically unpickle
+		return blobs
+
 	def fetch_cell(self, cell_id, table=None, include_cached=False):
 		""" Load and return all rows from a given tablet
 		"""
@@ -549,6 +557,21 @@ class Catalog:
 					if include_cached and 'cached' in fp.root:
 						rows2 = fp.root.cached.read()
 						rows = np.append(rows, rows2)
+
+				# Convert blobs to object arrays, if any are present
+#				schema = cat._get_schema(table)
+#				if "blobs" in schema:
+#					blobnames = schema["blobs"]
+#					columns = [
+#						(colname, dtype) if dtype not in blobnames else object_
+#						for colname, dtype in schema['columns']
+#					]
+#					odtype = []
+#					for colname, dtype in schema['columns']:
+#						if colname not in blobnames:
+#							odtype += [ (colname, dtype) ]
+#						else:
+#							odtype += [ (colname, object_) ]
 		else:
 			schema = self._get_schema(table)
 			rows = np.empty(0, dtype=np.dtype(schema['columns']))
@@ -584,7 +607,7 @@ class Catalog:
 			# ensure enough memory has been allocated (and do it
 			# intelligently if not)
 			if ret == None:
-				ret = np.empty_like(rows)
+				ret = rows
 				nret = 0
 
 			while len(ret) < nret + len(rows):
@@ -1115,28 +1138,15 @@ class ColDict:
 
 	def rows(self):
 		# Extract out the filtered rows
-		self.t0 = time.time()
-		rows = np.empty(sum(self.in_), dtype=np.dtype(self.dtype))
-		for name, _ in self.dtype:
-			col = self[name][self.in_]
-			rows[name] = col
-		##rows = np.empty(len(self.in_), dtype=np.dtype(self.dtype))
-		##for name, _ in self.dtype:
-		##	rows[name] = self[name]
-		##rows = rows[self.in_]
-		##print 'Loaded %d rows in %f sec (%d columns).' % (len(rows), time.time() - self.t0, len(rows.dtype.names))
-		
-		#if len(rows):
-		#	(ra1, dec1, ra2, dec2, id2) = utils.as_columns(rows)
-		#	rows = rows[id2 != 0]
-		#	#d = gc_dist(ra1, dec1, ra2, dec2)*3600
-		#	#at = 0
-		#	#for i in xrange(len(d)):
-		#	#	if id2[i] == 0: continue
-		#	#	assert d[i] < 1, "Distance > 1arcsec: d=%f, row=%s" % (d[i], str(rows[i]))
-		#	#	#print rows[i], d[i]
-		#	#	#at = at + 1
-		#	#	#if at == 10: exit()
+		if False:
+			# Return structured ndarray
+			rows = np.empty(sum(self.in_), dtype=np.dtype(self.dtype))
+			for name, _ in self.dtype:
+				col = self[name][self.in_]
+				rows[name] = col
+		else:
+			# Return our table class
+			rows = Table( [ (name, self[name][self.in_]) for name, _ in self.dtype ] )
 		return rows
 
 	def _filter_joined(self, rows, catname):

@@ -67,7 +67,7 @@ else:
 		dtype += [(col, t)]
 		if conv:
 			print >> sys.stderr, 'WARNING: Stored "%s" as a signed integer, as pyfits can\'t handle unsigned.' % (col)
-	rows = np.array(rows, dtype=dtype)
+	rows = rows.as_ndarray().view(dtype=dtype)
 
 	if os.path.exists(output):
 		os.unlink(output)

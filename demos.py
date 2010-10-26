@@ -32,14 +32,6 @@ if False:
 	exit()
 
 if False:
-	# Extract a block of rows and store it in a FITS file
-	cat = ss.Catalog('sdss')
-	query = 'ra, dec, l, b, type, flags, flags2, resolve_status, u, uErr, uExt, uCalib, g, gErr, gExt, gCalib, r, rErr, rExt, rCalib, i, iErr, iExt, iCalib, z, zErr, zExt, zCalib, run, camcol, field, objid'
-	rows = cat.fetch(query=query, foot=ssfoot.rectangle(15, 15, 28, 75))
-	pyfits.writeto('sdss3-subset.fits', rows, clobber=True)
-	exit()
-
-if False:
 	# Execute a query using both fetch() and iterate(), and compare the results.
 	query = 'ra, dec, g, r, i, z, y'
 	foot  = ssfoot.rectangle(180, 10, 181, 11)
@@ -68,7 +60,7 @@ if False:
 	exit()
 #########################################################
 
-if False:
+if True:
 	# Compute and store the sky coverage at a given resolution (see skysurvey/tasks.py on how this is implemented)
 	cat = ss.Catalog('ps1')
 	print "Computing sky coverage map: ",
@@ -77,8 +69,6 @@ if False:
 	pyfits.writeto('foot.0.025.fits', sky.astype(float).transpose()[::-1,], clobber=True)
 	exit()
 #########################################################
-
-
 
 if False:
 	# A simple query with reference to an x-matched catalog
