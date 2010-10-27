@@ -30,6 +30,12 @@ def gc_dist(lon1, lat1, lon2, lat2):
 	return np.degrees(2*arcsin(sqrt( (sin((lat1-lat2)*0.5))**2 + cos(lat1)*cos(lat2)*(sin((lon1-lon2)*0.5))**2 )));
 
 def get_fmt(dtype):
+	#
+	# Note: there's a bug with formatting long integers (they're formatted as signed), that will be fixed in numpy 1.5.1
+	#       Once that is fixed, change the format chars for uints back to 'd'
+	#
+	# http://projects.scipy.org/numpy/ticket/1287
+	#
 	fmt_map = {
 		'int8':         '%4d',
 		'int16':	'%6d',
@@ -37,14 +43,16 @@ def get_fmt(dtype):
 		'int64':	'%21d',
 		'float32':	'%7.3f',
 		'float64':	'%12.8f',
-		'uint8':        '%3d',
-		'uint16':	'%5d',
-		'uint32':	'%10d',
-		'uint64':	'%20d',
+		'uint8':        '%3s',
+		'uint16':	'%5s',
+		'uint32':	'%10s',
+		'uint64':	'%20s',
 		'bool':		'%1d'
 	}
 	if dtype.kind == 'S':
 		return '%' + str(dtype.itemsize) + 's'
+	if dtype == np.dtype(np.object_):
+		return '%s'
 	return fmt_map[str(dtype)]
 
 def make_printf_string(row):

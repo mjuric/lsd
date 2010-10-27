@@ -28,6 +28,19 @@ import footprint
 from table import Table
 from utils import astype, gc_dist, unpack_callable
 
+def vecmd5(x):
+	import hashlib
+	l = np.empty(len(x), dtype='a32')
+	for i in xrange(len(x)):
+		l[i] = hashlib.md5(x[i]).hexdigest()
+	return l
+
+def veclen(x):
+	l = np.empty(len(x), dtype=int)
+	for i in xrange(len(x)):
+		l[i] = len(x[i])
+	return l
+
 # Special return type used in _mapper() and Catalog.map_reduce
 # to denote that the returned value should not be yielded to
 # the user
@@ -251,6 +264,11 @@ class Catalog:
 				raise Exception('Trying to create a primary table while one already exists!')
 			self.primary_table = table
 
+		if 'blobs' in schema:
+			cols = dict(schema['columns'])
+			for blobcol in schema['blobs']:
+				assert cols[blobcol] == np.dtype(np.int64)
+
 		self._store_dbinfo()
 
 	### Cell locking routines
@@ -278,10 +296,16 @@ class Catalog:
 
 		# Create the tablet
 		fp  = tables.openFile(fn, mode='w')
-		fp.createTable('/', 'table', np.dtype(schema["columns"]), expectedrows=20*1000*1000)
+		fp.createTable('/main', 'table', np.dtype(schema["columns"]), expectedrows=20*1000*1000, createparents=True)
+
 		if 'primary_key' in schema:
 			seqname = '_seq_' + schema['primary_key']
-			fp.createArray('/', seqname, np.array([1], dtype=np.uint64))
+			fp.createArray('/main', seqname, np.array([1], dtype=np.uint64))
+
+		if 'blobs' in schema:
+			for blobcol in schema['blobs']:
+				fp.createVLArray('/main/blobs', blobcol, tables.ObjectAtom(), "BLOBs", createparents=True)
+				fp.root.main.blobs.__getattr__(blobcol).append(0)	# ref=0 should be pointed to by no real element (equivalent to NULL pointer)
 
 		return fp
 
@@ -319,7 +343,7 @@ class Catalog:
 		#
 		fp  = self._open_tablet(cell_id, mode='w', table=table)
 
-		fp.root.table.append(rows)
+		fp.root.main.table.append(rows)
 
 		fp.close()
 
@@ -477,20 +501,37 @@ class Catalog:
 
 			# Store them in their tablets
 			for table, schema in self.tables.iteritems():
-				fp  = self._open_tablet(cell_id, mode='w', table=table)
-				t   = fp.root.table
+				fp    = self._open_tablet(cell_id, mode='w', table=table)
+				t     = fp.root.main.table
+				blobs = schema['blobs'] if 'blobs' in schema else dict()
 
 				if table == self.primary_table:
-					id_seq = fp.root.__getattr__('_seq_' + key)
+					id_seq = fp.root.main.__getattr__('_seq_' + key)
 					cols[key][incell] += np.arange(id_seq[0], id_seq[0] + nrows, dtype=np.uint64)
 					cols2[key] = cols[key][incell]
 					id_seq[0] += n
 
+				# Construct a compatible numpy array, leaving unspecified
+				# columns set to zero
 				rows = np.zeros(nrows, dtype=np.dtype(schema['columns']))
-				for col in rows.dtype.names:
-					if col not in cols2:
+				for colname in rows.dtype.names:
+					if colname not in cols2:
 						continue
-					rows[col] = cols2[col]
+					if colname not in blobs:
+						# Simple column
+						rows[colname] = cols2[colname]
+					else:
+						# BLOB column - find unique objects, insert them
+						# into the BLOB VLArray, and put the indices to these
+						# into the actual table
+						assert cols2[colname].dtype == np.object_
+						uobjs, _, ito = np.unique(cols2[colname], return_index=True, return_inverse=True)
+
+						barray = fp.root.main.blobs.__getattr__(colname)
+						rows[colname] = ito + len(barray)
+
+						for obj in uobjs:
+							barray.append(obj)
 
 				t.append(rows)
 				fp.close()
@@ -538,10 +579,48 @@ class Catalog:
 		if table in self.tables: return self.tables[table]
 		return self.hidden_tables[table]
 
-	def _fetch_blobs(fp, blobname, blobrefs):
+	def _smart_load_blobs(self, barray, indices):
+		""" Load an ndarray of BLOBs from a set of refs indices,
+		    taking into account not to instantiate duplicate
+		    objects for the same BLOBs
+		"""
+		ui, _, idx = np.unique(indices, return_index=True, return_inverse=True)
+		assert (ui > 0).all()	# Zero and negative indices are illegal
+
+		objlist = barray[ui]
+		if len(ui) == 1 and tables.__version__ == '2.2':
+			# bug workaround -- PyTables 2.2 returns a scalar for length-1 arrays
+			objlist = [ objlist ]
+		
+		blobs = np.array(objlist, dtype=np.object_)
+		blobs = blobs[idx]
+
+		#print >> sys.stderr, 'Loaded %d unique objects for %d indices' % (len(objlist), len(idx))
+
+		return blobs
+
+	def fetch_blobs(self, cell_id, table, column, indices, include_cached=False):
+		# short-circuit if there's nothing to be loaded
+		if len(indices) == 0:
+			return np.empty(0, dtype=np.object_)
+
 		# load the blobs arrays
-		blobstore = fp.root.blobs.__getattr__(blobname)		# get reference to VLArray where our blobs are pickled
-		blobs = blobstore[blobrefs]				# load and automatically unpickle
+		with self.get_cell(cell_id) as cell:
+			with cell.open(table) as fp:
+				b1 = fp.root.main.blobs.__getattr__(column)
+				if include_cached and 'cached' in fp.root:
+					# We have cached objects in 'cached' group -- read the blobs
+					# from there as well. blob refs of cached objects are
+					# negative.
+					assert (indices != 0).all()
+					b2 = fp.root.cached.blobs.__getattr__(column)
+					blobs = np.append(
+							self._smart_load_blobs(b1,  indices[indices > 0]),
+							self._smart_load_blobs(b2, -indices[indices < 0])
+						)
+					assert False, 'Test this bit'
+				else:
+					blobs = self._smart_load_blobs(b1, indices)
 		return blobs
 
 	def fetch_cell(self, cell_id, table=None, include_cached=False):
@@ -553,25 +632,10 @@ class Catalog:
 		if self.tablet_exists(cell_id, table):
 			with self.get_cell(cell_id) as cell:
 				with cell.open(table) as fp:
-					rows = fp.root.table.read()
+					rows = fp.root.main.table.read()
 					if include_cached and 'cached' in fp.root:
-						rows2 = fp.root.cached.read()
+						rows2 = fp.root.cached.table.read()
 						rows = np.append(rows, rows2)
-
-				# Convert blobs to object arrays, if any are present
-#				schema = cat._get_schema(table)
-#				if "blobs" in schema:
-#					blobnames = schema["blobs"]
-#					columns = [
-#						(colname, dtype) if dtype not in blobnames else object_
-#						for colname, dtype in schema['columns']
-#					]
-#					odtype = []
-#					for colname, dtype in schema['columns']:
-#						if colname not in blobnames:
-#							odtype += [ (colname, dtype) ]
-#						else:
-#							odtype += [ (colname, object_) ]
 		else:
 			schema = self._get_schema(table)
 			rows = np.empty(0, dtype=np.dtype(schema['columns']))
@@ -1124,15 +1188,18 @@ class ColDict:
 		# and have them ready for the where clause
 		self.dtype = []
 		nrows = 0
+		global_ = globals()
 		for (asname, name) in select_clause:
-			col = eval(name, {}, self)
+			#print eval("globals().keys()", globals())
+			#exit()
+			col = eval(name, global_, self)
 			self[asname] = col
 			self.dtype += [ (asname, str(col.dtype)) ]
 			nrows = len(self[asname])
 
 		# eval the WHERE clause, to obtain the final filter
 		self.in_    = np.empty(nrows, dtype=bool)
-		self.in_[:] = eval(where_clause, {}, self)
+		self.in_[:] = eval(where_clause, global_, self)
 		#print self.dtype
 		#exit()
 
@@ -1164,24 +1231,34 @@ class ColDict:
 		# Load the column from table 'table' of the catalog 'catname'
 		# Also cache the loaded tablet, for future reuse
 
-		# See if we have already loaded the required tablet
-		if table in self.catalogs[catname]['tables']:
-			return self.catalogs[catname]['tables'][table][name]
-
-		# Load
 		cat = self.catalogs[catname]['cat']
 		include_cached = self.include_cached if catname == self.primary_catalog else True
-		rows = cat.fetch_cell(cell_id=self.cell_id, table=table, include_cached=include_cached)
-		assert len(rows) == self.orig_rows[catname]
 
-		# Join
-		rows = self._filter_joined(rows, catname)
+		# See if we have already loaded the required tablet
+		if table in self.catalogs[catname]['tables']:
+			col = self.catalogs[catname]['tables'][table][name]
+		else:
+			# Load
+			rows = cat.fetch_cell(cell_id=self.cell_id, table=table, include_cached=include_cached)
+			assert len(rows) == self.orig_rows[catname]
 
-		# Cache
-		self.catalogs[catname]['tables'][table] = rows
+			# Join
+			rows = self._filter_joined(rows, catname)
 
-		# return the requested column (further caching is the responsibility of the caller)
-		return rows[name]
+			# Cache
+			self.catalogs[catname]['tables'][table] = rows
+
+			# return the requested column (further caching is the responsibility of the caller)
+			col = rows[name]
+
+		# Resolve blobs (if blob)
+		schema = cat._get_schema(table)
+		if 'blobs' in schema and name in schema['blobs']:
+			assert col.dtype == np.int64, "Data structure error: blob reference columns must be of int64 type"
+			col = cat.fetch_blobs(cell_id=self.cell_id, table=table, column=name, indices=col, include_cached=include_cached)
+
+		# Return the resolved column
+		return col
 
 	def __getitem__(self, name):
 		# An already loaded column?
@@ -1307,17 +1384,42 @@ def _cache_maker_mapper(rows, margin_x, margin_t):
 
 	# Now load all tablets, and keep only the neighbors within
 	# neighborhood
-	rows = {}
+	data = { }
 	for table in cat.tables:
-		rows[table] = cat.fetch_cell(cell_id=cell_id, table=table)[in_]
+		data[table] = {}
+
+		# load all rows
+		rows = cat.fetch_cell(cell_id=cell_id, table=table)[in_]
+
+		# load all blobs
+		data[table]['blobs'] = {}
+		schema = cat._get_schema(table)
+		if 'blobs' in schema:
+			for bcolname in schema['blobs']:
+				# Get only unique blobs, and reindex accordingly
+				blobrefs, _, idx = np.unique(rows[bcolname], return_index=True, return_inverse=True)
+				rows[bcolname] = idx
+				assert rows[bcolname].min() == 0
+				assert rows[bcolname].max() == len(blobrefs)-1
+
+				# Fetch unique blobs
+				blobs    = cat.fetch_blobs(cell_id, table, bcolname, blobrefs)
+				
+				# In the end, blobs will contain N unique blobs, while rows[bcolname] will
+				# have 0-based indices to those blobs
+				data[table]['blobs'][bcolname] = blobs
+
+		# This must follow the blob resolution, as it may
+		# modify the indices in the rows
+		data[table]['rows'] = rows
 
 	# Mark these to be replicated all over the neighborhood
 	res = []
-	if len(rows):
+	if len(data):
 		for neighbor in cat.neighboring_cells(cell_id):
-			res.append( (neighbor, rows) )
+			res.append( (neighbor, data) )
 
-	#print "Scanned margins of %s (%d objects)" % (cat._tablet_file(self.CELL_ID, table=cat.primary_table), len(rows[cat.primary_table]))
+	#print "Scanned margins of %s (%d objects)" % (cat._tablet_file(self.CELL_ID, table=cat.primary_table), len(data[cat.primary_table]))
 
 	return res
 
@@ -1343,22 +1445,46 @@ def _cache_maker_reducer(cell_id, nborblocks):
 				cachedFlag = None
 
 			with cell.open(table=table) as fp:
-				# Drop existing cached table, create an empty one
+				# Drop existing cache
 				if 'cached' in fp.root:
 					fp.root.cached.remove()
-				fp.root.table.copy('/', 'cached', start=0, stop=0)
 
-				# Append cached rows
+				# Create destinations
+				fp.createGroup('/', 'cached', title='Cached objects from neighboring cells')
+				fp.root.main.table.copy('/cached', 'table', start=0, stop=0, createparents=True)
+
+				blobs = set(( name for nbor in nborblocks for (name, _) in nbor[table]['blobs'].iteritems() ))
+				for name in blobs:
+					fp.createVLArray('/cached/blobs', name, tables.ObjectAtom(), "BLOBs", createparents=True)
+					fp.root.cached.blobs.__getattr__(name).append(0)	# ref=0 should be pointed to by no real element (equivalent to NULL pointer)
+
+				haveblobs = len(blobs) != 0
+
+				# Write records
 				for nbor in nborblocks:
-					newrows = nbor[table]
+					rows  = nbor[table]['rows']
+
+					if haveblobs:
+						# Append cached blobs, and adjust the offsets
+						rows = rows.copy()		# Need to do this, so that modifications to rows[name] aren't permanent
+						blobs = nbor[table]['blobs']
+						for (name, data) in blobs.iteritems():
+							barray = fp.root.cached.blobs.__getattr__(name)
+							rows[name] += len(barray)
+							rows[name] *= -1		# Convention: cached blob refs are negative
+							for obj in data:
+								barray.append(obj)
+
+					# Append cached rows
 					if cachedFlag:
-						newrows[cachedFlag] = True
-					fp.root.cached.append(newrows)
+						rows[cachedFlag] = True
+
+					fp.root.cached.table.append(rows)
 
 				# sanity
 				if ncached == 0:
-					ncached = fp.root.cached.nrows
-				assert ncached == fp.root.cached.nrows
+					ncached = fp.root.cached.table.nrows
+				assert ncached == fp.root.cached.table.nrows
 
 	# Return the number of new rows cached into this cell
 	return (cell_id, ncached)

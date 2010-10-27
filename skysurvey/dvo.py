@@ -5,6 +5,7 @@ import time
 import numpy as np
 from slalib import sla_eqgal
 from itertools import imap, izip
+import hashlib
 
 def initialize_column_definitions():
 	# Construct table definition
@@ -18,8 +19,7 @@ def initialize_column_definitions():
 		('flags',	'u4',	'flags'),
 		('obj_id',	'u4',	'obj_id'),
 		('cat_id',	'u4',	'cat_id'),
-		('ext_id',	'u8',	'ext_id'),
-		('file_id',	'a20',	'')
+		('ext_id',	'u8',	'ext_id')
 	];
 
 	magData = [ # FITS field, output suffix, type
@@ -49,6 +49,7 @@ def import_from_dvo(catdir, dvo_files, create=False):
 		cat = catalog.Catalog(catdir, name='ps1', mode='c')
 		cat.create_table('astrometry', { 'columns': to_dtype(astromCols), 'primary_key': 'id', 'spatial_keys': ('ra', 'dec'), "cached_flag": "cached" })
 		cat.create_table('photometry', { 'columns': to_dtype(photoCols) })
+		cat.create_table('import',     { 'columns': [ ('file_id', 'a20'), ('hdr', 'i8'), ('cksum', 'a32') ], 'blobs': [ 'hdr' ] })
 	else:
 		cat = catalog.Catalog(catdir)
 
@@ -66,8 +67,8 @@ def import_from_dvo(catdir, dvo_files, create=False):
 
 def import_from_dvo_aux(file, cat):
 	# Load object data
-	dat     = pyfits.getdata(file, 1)
-	cols    = dict(( (name, dat.field(fitsname))   for (name, _, fitsname) in astromCols if fitsname != ''))
+	dat, hdr = pyfits.getdata(file, 1, header=1)
+	cols     = dict(( (name, dat.field(fitsname))   for (name, _, fitsname) in astromCols if fitsname != ''))
 
 	# Load magnitudes (they're stored in groups of 5 rows)
 	mag = pyfits.getdata(file[:-1]+'s', 1)
@@ -107,6 +108,14 @@ def import_from_dvo_aux(file, cat):
 	assert(len(fn) < 20)
 	cols['file_id'] = np.empty(len(l), dtype='a20')
 	cols['file_id'][:] = fn
+
+	# Add some blobs (this is mostly for testing)
+	cols['hdr'] = np.empty(len(l), dtype=np.object_)
+	cols['hdr'][:] = str(hdr)
+
+	# BLOB checksum (for debugging)
+	cols['cksum'] = np.empty(len(l), dtype='a32')
+	cols['cksum'][:] = hashlib.md5(str(hdr)).hexdigest()
 
 	# sanity check
 	for (name, _, _) in astromCols + photoCols:

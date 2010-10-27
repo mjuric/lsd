@@ -54,20 +54,35 @@ else:
 	# FITS output
 	rows = cat.fetch(query, foot)
 
-	# workaround for pyfits bug -- it doesn't know what to do with bool and uint?? columns
-	#                              so for now just convert these to signed, and emit a warning
+	if 'cksumok' in rows.dtype.names:
+		# Do ./lsd-query --format=fits ps1 'vecmd5(hdr) == cksum as cksumok'
+		assert rows['cksumok'].all()
+		print "CHECKSUM OK"
+
+	# workaround for pyfits bugs -- it doesn't know what to do with bool and uint?? columns
+	#                               so for now just convert these to signed, and emit a warning
+	#			     -- it also incorrectly stores i1 columns as False
 	dtype = []
+	copy = False
 	for col in rows.dtype.names:
 		t, o = rows.dtype.fields[col]
-		conv=False
-		if   t == np.bool:	t = 'i1'; conv=True
-		elif t == np.uint64:	t = 'i8'; conv=True
-		elif t == np.uint32:	t = 'i4'; conv=True
-		elif t == np.uint16:	t = 'i2'; conv=True
+		conv = False
+		if   t == np.bool:	t = 'i2'; conv = True; copy = True
+		elif t == np.uint64:	t = 'i8'; conv = True
+		elif t == np.uint32:	t = 'i4'; conv = True
+		elif t == np.uint16:	t = 'i2'; conv = True
 		dtype += [(col, t)]
 		if conv:
-			print >> sys.stderr, 'WARNING: Stored "%s" as a signed integer, as pyfits can\'t handle unsigned.' % (col)
-	rows = rows.as_ndarray().view(dtype=dtype)
+			print >> sys.stderr, 'WARNING: Stored "%s" as a signed integer, as pyfits can\'t handle unsigned and/or bools.' % (col)
+	rows = rows.as_ndarray()
+
+	# pyfits bugs workarounds
+	if copy:
+		rows2 = np.empty(len(rows), dtype=dtype)
+		for col in rows.dtype.names: rows2[col] = rows[col]
+		rows = rows2
+	else:
+		rows = rows.view(dtype=dtype)
 
 	if os.path.exists(output):
 		os.unlink(output)
