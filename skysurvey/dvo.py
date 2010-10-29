@@ -49,7 +49,17 @@ def import_from_dvo(catdir, dvo_files, create=False):
 		cat = catalog.Catalog(catdir, name='ps1', mode='c')
 		cat.create_table('astrometry', { 'columns': to_dtype(astromCols), 'primary_key': 'id', 'spatial_keys': ('ra', 'dec'), "cached_flag": "cached" })
 		cat.create_table('photometry', { 'columns': to_dtype(photoCols) })
-		cat.create_table('import',     { 'columns': [ ('file_id', 'a20'), ('hdr', 'i8'), ('cksum', 'a32') ], 'blobs': [ 'hdr' ] })
+		cat.create_table('import',     { 'columns': [
+				('file_id', 'a20'),
+				('hdr', 'i8'),
+				('cksum', 'a32'),
+				('imageid',	'64i8'),
+				('blobarr',	'64i8'),
+			],
+			'blobs': [
+				'hdr',
+				'blobarr'
+			] })
 	else:
 		cat = catalog.Catalog(catdir)
 
@@ -116,6 +126,15 @@ def import_from_dvo_aux(file, cat):
 	# BLOB checksum (for debugging)
 	cols['cksum'] = np.empty(len(l), dtype='a32')
 	cols['cksum'][:] = hashlib.md5(str(hdr)).hexdigest()
+
+	# Add some array data
+	cols['imageid'] = np.empty(len(l), dtype='64i8')
+	cols['imageid'][:] = np.arange(len(l)*64, dtype='i8').reshape((len(l), 64))
+
+	# Add a blob array
+	s = np.array([ str(i) for i in np.random.random_integers(0, 100, 64) ])
+	cols['blobarr'] = np.empty(len(l), dtype='64O')
+	cols['blobarr'][:] = s[ np.random.random_integers(0, 63, len(l)*64) ].reshape((len(l), 64))
 
 	# sanity check
 	for (name, _, _) in astromCols + photoCols:

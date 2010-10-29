@@ -29,35 +29,54 @@ def gc_dist(lon1, lat1, lon2, lat2):
 
 	return np.degrees(2*arcsin(sqrt( (sin((lat1-lat2)*0.5))**2 + cos(lat1)*cos(lat2)*(sin((lon1-lon2)*0.5))**2 )));
 
+_fmt_map = {
+	'int8':         '%4d',
+	'int16':	'%6d',
+	'int32':	'%11d',
+	'int64':	'%21d',
+	'float32':	'%7.3f',
+	'float64':	'%12.8f',
+	'uint8':        '%3s',
+	'uint16':	'%5s',
+	'uint32':	'%10s',
+	'uint64':	'%20s',
+	'bool':		'%1d'
+}
+
 def get_fmt(dtype):
 	#
 	# Note: there's a bug with formatting long integers (they're formatted as signed), that will be fixed in numpy 1.5.1
-	#       Once that is fixed, change the format chars for uints back to 'd'
+	#       Once it's is fixed, change the format chars for uints back to 'd'
 	#
 	# http://projects.scipy.org/numpy/ticket/1287
 	#
-	fmt_map = {
-		'int8':         '%4d',
-		'int16':	'%6d',
-		'int32':	'%11d',
-		'int64':	'%21d',
-		'float32':	'%7.3f',
-		'float64':	'%12.8f',
-		'uint8':        '%3s',
-		'uint16':	'%5s',
-		'uint32':	'%10s',
-		'uint64':	'%20s',
-		'bool':		'%1d'
-	}
 	if dtype.kind == 'S':
 		return '%' + str(dtype.itemsize) + 's'
 	if dtype == np.dtype(np.object_):
 		return '%s'
-	return fmt_map[str(dtype)]
+
+	# Note: returning %s by default for unknown types
+	stype = str(dtype)
+	return _fmt_map[stype] if stype in _fmt_map else '%s'
 
 def make_printf_string(row):
 	fmt = ' '.join( [ get_fmt(row.dtype.fields[name][0]) for name in row.dtype.names ] )
 	return fmt
+
+def is_scalar_of_type(v, t):
+	s = np.array([], v).dtype.type
+	return s == t
+
+def full_dtype(arr):
+	""" Return the dtype string of the ndarray that includes
+	    the array shape. Useful when merging multiple ndarray
+	    columns into a single structured array table
+
+	    See http://docs.scipy.org/doc/numpy/reference/arrays.dtypes.html for details
+	"""
+	shape = arr.shape[1:]
+	dtype = str(shape) + str(arr.dtype) if len(shape) else str(arr.dtype)
+	return dtype
 
 def as_tuple(row):
 	return tuple((row[col] for col in row.dtype.names))

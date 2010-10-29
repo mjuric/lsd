@@ -1,6 +1,13 @@
 #!/usr/bin/env python
 
 import numpy as np
+from utils import full_dtype
+
+def make_record(dtype):
+	# Construct a numpy record corresponding to a row of this table
+	# There has to be a better way to construct a numpy.void of a given dtype, but I couldn't figure it out...
+	tmp = np.empty(1, dtype)
+	return tmp[0].copy()
 
 class RowIter:
 	""" Iterator to permit iteration over Table by row
@@ -11,11 +18,10 @@ class RowIter:
 		self.end = table.nrows()
 
 		if self.at < self.end:
-			tmp = np.empty(1, table.dtype)
-			self.row = tmp[0]
-
-			self.column_data  = table.column_data
+			# Cache some useful data
+			self.column_data = table.column_data
 			self.column_map = table.keys()
+			self.row = table.row.copy()
 
 	# Iterator protocol methods
 	def __iter__(self):
@@ -26,7 +32,13 @@ class RowIter:
 			raise StopIteration()
 
 		for i, name in enumerate(self.column_map):
-			self.row[name] = self.column_data[i][self.at]
+			val = self.column_data[i][self.at]
+			# Special care for vector columns
+			if isinstance(val, np.ndarray):
+				self.row[name][:] = val
+			else:
+				self.row[name] = val
+
 		self.at = self.at + 1
 
 		return self.row
@@ -34,6 +46,8 @@ class RowIter:
 class Table(object):
 	column_map = None	# Map from name->pos and pos->name
 	column_data = None	# A list of columns (individual numpy arrays)
+
+	row = None		# A np.void instance with the correct dtype for a row in this table
 
 	##
 	## dict-like interface implementation
@@ -53,15 +67,22 @@ class Table(object):
 		if isinstance(key, str) or isinstance(key, list) or isinstance(key, tuple):
 			return self.subtable(key)
 
-		# Return a slice of the table
-		cols = Table()
-		for (pos, col) in enumerate(self.column_data):
-			name = self.column_map[pos]
-			rcol = col[key]
-			if type(rcol) != np.ndarray:			# Ensure we always return a numpy array
-				rcol = np.array([rcol], col.dtype)
-			cols.add_column(name, rcol)
-		return cols
+		# Compute the slice
+		ret = [ (self.column_map[pos], col[key])   for (pos, col) in enumerate(self.column_data) ]
+
+		# Return a Table if the key was an instance of a slice,
+		# or numpy.void structure otherwise
+		if isinstance(key, slice):
+			return Table(ret)
+		else:
+			row = self.row.copy()
+			for name, val in ret:
+				# Special care for vector columns
+				if isinstance(val, np.ndarray):
+					row[name][:] = val
+				else:
+					row[name] = val
+			return row
 
 	def __setitem__(self, key, value):
 		# Append a column to the table, or replace data
@@ -72,14 +93,20 @@ class Table(object):
 			else:
 				self.add_column(key, value)
 		elif isinstance(key, slice):
-			assert isinstance(value, Table)
-			assert value.keys() == self.keys()
-
-			for (pos, col) in enumerate(self.column_data):
-				self.column_data[pos][key] = value.column_data[pos]
+			if isinstance(value, Table):
+				# fast but specialized
+				assert value.keys() == self.keys()
+				for (pos, col) in enumerate(self.column_data):
+					self.column_data[pos][key] = value.column_data[pos]
+			else:
+				# slow but generic
+				it_v = iter(value)
+				for i in xrange(*key.indices(len(self))):
+					self[i] = next(it_v)
 		else:
-			print type(key)
-			raise TypeError()
+			# Assume we're changing a single row
+			for (pos, val) in enumerate(value):
+				self.column_data[pos][key] = val
 
 	def __contains__(self, column):
 		# Test if a column exists in the table
@@ -90,15 +117,16 @@ class Table(object):
 	@property
 	def dtype(self):
 		# Return the dtype this column set would have if it was a numpy structured array
-		return np.dtype([ (self.column_map[pos], col.dtype.str) for (pos, col) in enumerate(self.column_data) ])
+		return np.dtype([ (self.column_map[pos], full_dtype(col)) for (pos, col) in enumerate(self.column_data) ])
 
 	def __init__(self, cols=[]):
 		self.column_map = dict()
 		self.column_data = []
 		for (name, col) in cols:
-			self.add_column(name, col)
+			self.add_column(name, col, supress_row_update=True)
+		self._mk_row()
 
-	def add_column(self, name, col):
+	def add_column(self, name, col, supress_row_update=False):
 		# sanity check: require numpy arrays
 		assert isinstance(col, np.ndarray)
 		assert self.ncols() == 0 or (len(col) == self.nrows())
@@ -109,6 +137,13 @@ class Table(object):
 		self.column_map[name] = pos
 		self.column_map[pos] = name
 		self.column_data.append(col)
+
+		if not supress_row_update:
+			self._mk_row()
+
+	def _mk_row(self):
+		if self.ncols() != 0:
+			self.row = make_record(self.dtype)
 
 	def resize(self, size):
 		for (pos, col) in enumerate(self.column_data):
@@ -151,10 +186,7 @@ class Table(object):
 			return self.column_data[self.column_map[key]]
 
 		# Return a subtable
-		cols = Table()
-		for name in key:
-			cols.add_column( name, self.column_data[self.column_map[name]] )
-		return cols
+		return Table((   (name, self.column_data[self.column_map[name]]) for name in key ))
 
 	def nrows(self):
 		return 0 if len(self.column_data) == 0 else len(self.column_data[0])
@@ -187,7 +219,7 @@ class Table(object):
 		for row in self[0:min(len(self.column_data[0]), 10)]:
 			ret = ret + str(row) + '\n'
 
-		return ret
+		return ret[:-1] if ret != '' else ''
 
 	def sort(self, cols=()):
 		""" Sort the table by one or more (or all) columns
@@ -221,6 +253,28 @@ class Table(object):
 		return res
 
 if __name__ == "__main__":
+	# Multi-dimensional arrays
+	ra   = np.arange(10, dtype=np.dtype('f8'))
+	dec  = np.arange(40, dtype='i4').reshape((10, 4))
+	blob = np.array([ [ 'blob' + str(j) + '_' + str(i) for i in xrange(3) ] for j in xrange(10)], dtype=np.object_)
+	tbl0  = Table([("ra", ra), ("dec", dec), ("blob", blob)])
+
+	print "Single tbl0 row:", tbl0[3], '\n'
+	tbl0['blob'][3,2] = 'new thing'
+	print "Modified tbl0 row:", tbl0[3], '\n'
+	print "tbl0 slice:", tbl0[3:6], '\n'
+
+	tbl  = tbl0[('ra', 'dec')]
+	print tbl[3:5], '\n'
+	tbl[3] = (42, (99, 88, 77, 66))
+	print tbl[3], '\n'
+	tbl[6:8] = [ (77, (99, 88, 77, 66)), (77, (94, 84, 74, 64)) ]
+	print tbl, '\n'
+	tbl['dec'][6:8] = np.zeros((2, 4))
+	print tbl0, '\n'
+	exit()
+
+	# Simple arrays
 	ra   = np.arange(1000, dtype=np.dtype('f8'))
 	dec  = np.arange(1000, dtype=np.dtype('f8'))
 	id   = np.arange(1000, dtype=np.dtype('i8'))
@@ -238,11 +292,21 @@ if __name__ == "__main__":
 	tbl2['id'] += 11
 	tbl2['blob'] += 'aaa'
 
-	print tbl2
-	print tbl
+	print "Selecting a single row"
+	row = tbl[1]
+	print "ROW:", row, type(row)
+	print ""
+
+	print "Changing an entry in a single row"
+	print "Before:", tbl[5]
+	tbl[5] = row
+	print "After:", tbl[5], '\n'
+
+	print tbl, '\n'
+	print tbl2, '\n'
 	tbl[2:4] = tbl2[2:4]
-	print tbl
-	print tbl2
+	print tbl, '\n'
+	print tbl2, '\n'
 
 	#t2  = tbl[tbl["id"] == 5]
 	#t2 = tbl[("ra", "dec", "blob")]

@@ -26,7 +26,7 @@ import Polygon.IO
 import utils
 import footprint
 from table import Table
-from utils import astype, gc_dist, unpack_callable
+from utils import astype, gc_dist, unpack_callable, full_dtype, is_scalar_of_type
 
 def vecmd5(x):
 	import hashlib
@@ -267,7 +267,7 @@ class Catalog:
 		if 'blobs' in schema:
 			cols = dict(schema['columns'])
 			for blobcol in schema['blobs']:
-				assert cols[blobcol] == np.dtype(np.int64)
+				assert is_scalar_of_type(cols[blobcol], np.int64)
 
 		self._store_dbinfo()
 
@@ -511,8 +511,8 @@ class Catalog:
 					cols2[key] = cols[key][incell]
 					id_seq[0] += n
 
-				# Construct a compatible numpy array, leaving unspecified
-				# columns set to zero
+				# Construct a compatible numpy array, that will leave
+				# unspecified columns set to zero
 				rows = np.zeros(nrows, dtype=np.dtype(schema['columns']))
 				for colname in rows.dtype.names:
 					if colname not in cols2:
@@ -525,10 +525,18 @@ class Catalog:
 						# into the BLOB VLArray, and put the indices to these
 						# into the actual table
 						assert cols2[colname].dtype == np.object_
-						uobjs, _, ito = np.unique(cols2[colname], return_index=True, return_inverse=True)
+						uobjs, _, ito = np.unique(cols2[colname], return_index=True, return_inverse=True)	# Note: implicitly flattens multi-D input arrays
+						ito = ito.reshape(rows[colname].shape)	# De-flatten the output indices
 
 						barray = fp.root.main.blobs.__getattr__(colname)
-						rows[colname] = ito + len(barray)
+						bsize = len(barray)
+						#print len(uobjs)
+						#print rows[colname]
+						rows[colname] = ito + bsize
+						#print rows[colname]
+
+						# Check we've correctly mapped everything
+						assert (uobjs[rows[colname]-bsize] == cols2[colname]).all()
 
 						for obj in uobjs:
 							barray.append(obj)
@@ -1186,35 +1194,27 @@ class ColDict:
 
 		# eval individual columns in select clause to slurp them up from disk
 		# and have them ready for the where clause
-		self.dtype = []
-		nrows = 0
+		retcols = []
+		nrows = None
 		global_ = globals()
 		for (asname, name) in select_clause:
-			#print eval("globals().keys()", globals())
-			#exit()
 			col = eval(name, global_, self)
-			self[asname] = col
-			self.dtype += [ (asname, str(col.dtype)) ]
-			nrows = len(self[asname])
 
-		# eval the WHERE clause, to obtain the final filter
-		self.in_    = np.empty(nrows, dtype=bool)
-		self.in_[:] = eval(where_clause, global_, self)
-		#print self.dtype
-		#exit()
+			self[asname] = col
+			retcols.append(asname)
+
+			if nrows != None:
+				assert nrows == len(col)
+			nrows = len(col)
+
+		# evaluate the WHERE clause, to obtain the final filter
+		in_    = np.empty(nrows, dtype=bool)
+		in_[:] = eval(where_clause, global_, self)
+
+		self.rows_ = Table( [ (name, self[name][in_]) for name in retcols ] )
 
 	def rows(self):
-		# Extract out the filtered rows
-		if False:
-			# Return structured ndarray
-			rows = np.empty(sum(self.in_), dtype=np.dtype(self.dtype))
-			for name, _ in self.dtype:
-				col = self[name][self.in_]
-				rows[name] = col
-		else:
-			# Return our table class
-			rows = Table( [ (name, self[name][self.in_]) for name, _ in self.dtype ] )
-		return rows
+		return self.rows_
 
 	def _filter_joined(self, rows, catname):
 		# Join
@@ -1398,13 +1398,14 @@ def _cache_maker_mapper(rows, margin_x, margin_t):
 			for bcolname in schema['blobs']:
 				# Get only unique blobs, and reindex accordingly
 				blobrefs, _, idx = np.unique(rows[bcolname], return_index=True, return_inverse=True)
+				idx = idx.reshape(rows[bcolname].shape)
 				rows[bcolname] = idx
 				assert rows[bcolname].min() == 0
 				assert rows[bcolname].max() == len(blobrefs)-1
 
 				# Fetch unique blobs
 				blobs    = cat.fetch_blobs(cell_id, table, bcolname, blobrefs)
-				
+
 				# In the end, blobs will contain N unique blobs, while rows[bcolname] will
 				# have 0-based indices to those blobs
 				data[table]['blobs'][bcolname] = blobs
