@@ -45,11 +45,16 @@ cat = ss.Catalog(catname)
 if format == 'text':
 	# Text output
 	fmt = None
+	##rprev = None
 	for row in cat.iterate(query, foot):
 		if fmt == None:
 			fmt = make_printf_string(row)
 			print '# ' + ' '.join(row.dtype.names)
 		print fmt % as_tuple(row)
+		##if rprev != None and rprev['ra'] == row['ra']:
+		##	print fmt % as_tuple(row)
+		##	print fmt % as_tuple(rprev)
+		##rprev = row.copy()
 else:
 	# FITS output
 	rows = cat.fetch(query, foot)

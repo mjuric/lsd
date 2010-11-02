@@ -66,8 +66,8 @@ class Catalog:
 	"""
 	path = '.'
 	level = 6
-	t0 = 47892		# default starting epoch (MJD, 47892 == Jan 1st 1990)
-	dt = 90			# default temporal resolution (in days)
+	t0 = 54335		# default starting epoch (== 2pm HST, Aug 22 2007 (night of GPC1 first light))
+	dt = 1			# default temporal resolution (in days)
 	__nrows = 0
 
 	NULL = 0		# The value for NULL in JOINed rows that had no matches
@@ -174,9 +174,9 @@ class Catalog:
 		subpath = bhpix.get_path(x, y, self.level)
 
 		if t >= self.t0 + self.dt:
-			prefix = '%s/%s/mjd%05d%+d' % (self.path, subpath, t, self.dt)
+			prefix = '%s/%s/T%05d/catalog' % (self.path, subpath, t)
 		else:
-			prefix = '%s/%s/static' % (self.path, subpath)
+			prefix = '%s/%s/static/catalog' % (self.path, subpath)
 
 		return prefix
 
@@ -305,7 +305,7 @@ class Catalog:
 		if 'blobs' in schema:
 			for blobcol in schema['blobs']:
 				fp.createVLArray('/main/blobs', blobcol, tables.ObjectAtom(), "BLOBs", createparents=True)
-				fp.root.main.blobs.__getattr__(blobcol).append(0)	# ref=0 should be pointed to by no real element (equivalent to NULL pointer)
+				fp.root.main.blobs.__getattr__(blobcol).append(None)	# ref=0 should be pointed to by no real element (equivalent to NULL pointer)
 
 		return fp
 
@@ -509,7 +509,7 @@ class Catalog:
 					id_seq = fp.root.main.__getattr__('_seq_' + key)
 					cols[key][incell] += np.arange(id_seq[0], id_seq[0] + nrows, dtype=np.uint64)
 					cols2[key] = cols[key][incell]
-					id_seq[0] += n
+					id_seq[0] += nrows
 
 				# Construct a compatible numpy array, that will leave
 				# unspecified columns set to zero
@@ -528,15 +528,24 @@ class Catalog:
 						uobjs, _, ito = np.unique(cols2[colname], return_index=True, return_inverse=True)	# Note: implicitly flattens multi-D input arrays
 						ito = ito.reshape(rows[colname].shape)	# De-flatten the output indices
 
+						# Offset indices
 						barray = fp.root.main.blobs.__getattr__(colname)
 						bsize = len(barray)
-						#print len(uobjs)
-						#print rows[colname]
-						rows[colname] = ito + bsize
-						#print rows[colname]
+						ito = ito + bsize
+
+						# Remap any None values to index 0 (where None is stored by fiat)
+						# We use the fact that None will be sorted to the front of the unique sequence, if exists
+						if len(uobjs) and uobjs[0] == None:
+							##print "Remapping None", len((ito == bsize).nonzero()[0])
+							uobjs = uobjs[1:]
+							ito -= 1
+							ito[ito == bsize-1] = 0
+
+						rows[colname] = ito
 
 						# Check we've correctly mapped everything
-						assert (uobjs[rows[colname]-bsize] == cols2[colname]).all()
+						uobjs2 = np.append(uobjs, [None])
+						assert (uobjs2[np.where(rows[colname] != 0, rows[colname]-bsize, len(uobjs))] == cols2[colname]).all()
 
 						for obj in uobjs:
 							barray.append(obj)
@@ -1085,6 +1094,40 @@ class TableColsProxy:
 		if catname == '': return self.cat.all_columns()
 		return self.cat.get_xmatched_catalog(catname).all_columns()
 
+class iarray(np.ndarray):
+	""" Subclass of ndarray allowing per-row indexing.
+	
+	    Used by ColDict.load_column()
+	"""
+	def __call__(self, *args):
+		"""
+		   Apply numpy indexing on a per-row basis. A rough
+		   equivalent of:
+			
+			self[ arange(len(self)) , *args]
+
+		   Where any tuple in args will be converted to a
+		   corresponding slice, while integers and numpy
+		   arrays will be passed in as-given. Any numpy array
+		   given as index must be of len(self).
+
+		   Simple example: assuming we have a chip_temp column
+		   that was defined with 64f8, to select the temperature
+		   of the chip corresponding to the observation, do:
+		   
+		   	chip_temp(chip_id)
+
+		   Note: A tuple of the form (x,y,z) is will be
+		   conveted to [x:y:z] slice. (x,y) converts to [x:y:]
+		   and (x,) converts to [x::]
+		"""
+		# Note: numpy multidimensional indexing is mind numbing...
+		#       See: http://docs.scipy.org/doc/numpy/reference/arrays.indexing.html#advanced-indexing
+		idx = [(slice(*arg) if len(arg) > 1 else np.s_[arg[0]:]) if isinstance(arg, tuple) else arg for arg in args ]
+		idx = tuple([ np.arange(len(self)) ] + idx)
+
+		return self.__getitem__(idx)
+
 class ColDict:
 	catalogs = None		# Cache of loaded catalogs and tables
 	columns  = None		# Cache of already referenced columns
@@ -1258,7 +1301,7 @@ class ColDict:
 			col = cat.fetch_blobs(cell_id=self.cell_id, table=table, column=name, indices=col, include_cached=include_cached)
 
 		# Return the resolved column
-		return col
+		return col.view(iarray)
 
 	def __getitem__(self, name):
 		# An already loaded column?
