@@ -104,6 +104,7 @@ det_cat_def = \
 			('flags',		'u4', 'flags',		''),
 			('flags2',		'u4', 'flags2',		''),
 			('n_frames',		'i2', 'n_frames',	''),
+			('cached',		'bool', '',		''),
 		],
 		'primary_key': 'det_id',
 		'temporal_key': 'mjd_obs',

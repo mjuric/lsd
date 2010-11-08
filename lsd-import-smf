@@ -41,7 +41,7 @@ smf.import_from_smf(det_catdir, exp_catdir, files, create)
 print >> sys.stderr, "done."
 
 # Build neighbor caches for images tables
-print >> sys.stderr, "Building n'bor cache: ",
+print >> sys.stderr, "Building neighbor cache (exposures): ",
 smf.make_image_cache(det_catdir, exp_catdir)
 
 # Sanity check: all queries linking to images must resolve within cell
@@ -51,9 +51,8 @@ for row in det_cat.iterate('det_id, ra, dec, exp_id, equinox JOIN ps1_exp(outer)
 	raise Exception("Inconsistency detected: (det_id, ra, dec, exp_id, equinox) = " + str(row))
 
 # Build neighbor caches for detections
-#print >> sys.stderr, "Building neighbor cache (detections): ",
-#det_cat.build_neighbor_cache()
-#print "Done."
+print >> sys.stderr, "Building neighbor cache (detections): ",
+det_cat.build_neighbor_cache()
 
 # Compute summary stats for both catalogs
 print >> sys.stderr, "Computing summary statistics (detections): ",

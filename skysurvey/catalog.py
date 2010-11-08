@@ -882,7 +882,7 @@ class Catalog:
 		"""
 		return True
 
-	def build_neighbor_cache(self, margin_x_arcsec=30, margin_t_days=0):
+	def build_neighbor_cache(self, margin_x_arcsec=30):
 		""" Cache the objects found within margin_x (arcsecs) of
 		    each cell into neighboring cells as well, to support
 		    efficient nearest-neighbor lookups.
@@ -891,7 +891,6 @@ class Catalog:
 		    and _cache_maker_reducer auxilliary routines.
 		"""
 		margin_x = sqrt(2.) / 180. * (margin_x_arcsec/3600.)
-		margin_t = margin_t_days
 
 		# Find out which columns are our spatial keys
 		schema = self._get_schema(self.primary_table)
@@ -900,7 +899,7 @@ class Catalog:
 
 		ntotal = 0
 		ncells = 0
-		for (cell_id, ncached) in self.map_reduce(query, (_cache_maker_mapper, margin_x, margin_t), _cache_maker_reducer):
+		for (cell_id, ncached) in self.map_reduce(query, (_cache_maker_mapper, margin_x), _cache_maker_reducer):
 			ntotal = ntotal + ncached
 			ncells = ncells + 1
 			#print self._cell_prefix(cell_id), ": ", ncached, " cached objects"
@@ -1450,7 +1449,7 @@ def _mapper(partspec, mapper, cat, query, include_cached, mapper_args):
 ###################################################################
 ## Auxilliary functions implementing Catalog.build_neighbor_cache
 ## functionallity
-def _cache_maker_mapper(rows, margin_x, margin_t):
+def _cache_maker_mapper(rows, margin_x):
 	# Map: fetch all objects to be mapped, return them keyed
 	# by cell ID and table
 	self         = _cache_maker_mapper
@@ -1491,12 +1490,9 @@ def _cache_maker_mapper(rows, margin_x, margin_t):
 	# (for simplicity) send everything within the margin,
 	# no matter close to which edge it actually is, to
 	# all neighbors.
-	(ra, dec) = utils.as_columns(rows)
+	(ra, dec) = rows.as_columns()
 	(x, y) = bhpix.proj_bhealpix(ra, dec)
 	in_ = np.fromiter( (not p.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool)
-	if margin_t != 0:
-		tcol = utils.as_columns(rows, 2)
-		in_ &= np.fromiter( ( 0. < fabs(pt - t) - 0.5*dt < margin_t for pt in tcol ), dtype=np.bool)
 
 	if not in_.any():
 		return Empty
@@ -1511,7 +1507,7 @@ def _cache_maker_mapper(rows, margin_x, margin_t):
 		for neighbor in cat.neighboring_cells(cell_id):
 			res.append( (neighbor, data) )
 
-	#print "Scanned margins of %s (%d objects)" % (cat._tablet_file(self.CELL_ID, table=cat.primary_table), len(data[cat.primary_table]))
+	##print "Scanned margins of %s (%d objects)" % (cat._tablet_file(self.CELL_ID, table=cat.primary_table), len(data[cat.primary_table]['rows']))
 
 	return res
 
@@ -1651,6 +1647,9 @@ def write_neighbor_cache(cat, cell_id, nborblocks):
 def _cache_maker_reducer(cell_id, nborblocks):
 	self = _cache_maker_reducer
 	cat          = self.CATALOG
+
+	#print "Would write to %s." % (cat._tablet_file(cell_id, table=cat.primary_table));
+	#exit()
 
 	ncached = write_neighbor_cache(cat, cell_id, nborblocks);
 

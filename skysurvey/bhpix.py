@@ -9,7 +9,7 @@ def autovectorized(f):
 	Taken from http://mail.scipy.org/pipermail/numpy-discussion/2006-July/009480.html
 	"""
 	def wrapper(l, b):
-		if type(l) == np.ndarray or type(b) == np.ndarray:
+		if isinstance(l, np.ndarray) or isinstance(b, np.ndarray):
 			return np.vectorize(f)(l, b)
 		return f(l, b)
 	return wrapper
