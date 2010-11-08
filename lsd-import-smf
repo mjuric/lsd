@@ -10,10 +10,10 @@ import skysurvey as lsd
 from   skysurvey.utils import *
 
 def usage():
-	print "Usage: %s [-c|--create] <det_cat_dir> <exp_cat_dir> <smf_file(s)>" % sys.argv[0]
+	print "Usage: %s [-c|--create] [-f|--file-list] <det_cat_dir> <exp_cat_dir> <smf_file(s)>" % sys.argv[0]
 
 try:
-	optlist, args = getopt.getopt(sys.argv[1:], 'c', ['create'])
+	optlist, args = getopt.getopt(sys.argv[1:], 'cf', ['create', 'file-list'])
 except getopt.GetoptError, err:
 	print str(err)
 	usage()
@@ -27,9 +27,15 @@ if len(args) < 3:
 (det_catdir, exp_catdir, files) = args[0], args[1], args[2:]
 
 create = False
+filelist = True
 for (o, a) in optlist:
 	if o == '-c' or o == '--create':
 		create = True
+	if o == '-f' or o == '--file-list':
+		filelist = True
+
+if filelist:
+	files = open(files[0]).readlines()
 
 #
 # Actual work

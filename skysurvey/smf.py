@@ -485,15 +485,19 @@ def _exp_id_load(kv, exp_cat):
 		in_[idx] = True
 		idx_list[det_cell] = sorted_idx[idx]
 
-	# return in_ to original ordering (before sorting)
+	# return in_ to original (pre-sorting) ordering
 	in_[sorted_idx] = in_.copy()
+	idxin = np.arange(len(in_))[in_]			# Indexes of tablet rows that will be loaded
 
 	# Load full rows
 	allrows = catalog.load_full_rows(exp_cat, exp_cell, in_)
 
 	# Dispatch the right rows to right det_cells
 	ret = []
-	for (det_cell, idx) in idx_list.iteritems():
+	for (det_cell, idx_) in idx_list.iteritems():
+		idx = np.searchsorted(idxin, idx_)		# idxall are indices in the full table. Reduce to only those appearing after culling by in_
+		assert (idxin[idx] == idx_).all()
+
 		rows = catalog.extract_full_rows_subset(allrows, idx)
 		ret.append( (det_cell, rows) )
 
