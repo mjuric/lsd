@@ -26,7 +26,7 @@ import Polygon.IO
 import utils
 import footprint
 from table import Table
-from utils import astype, gc_dist, unpack_callable, full_dtype, is_scalar_of_type
+from utils import astype, gc_dist, unpack_callable, full_dtype, is_scalar_of_type, isiterable
 
 def vecmd5(x):
 	import hashlib
@@ -76,16 +76,17 @@ class Catalog:
 	hidden_tables = None	# Tables in catalog that do not participate in direct joins/fetches (e.g., xmatch tables)
 	primary_table = None	# Primary table of this catalog ( the one holding the IDs and spatial/temporal keys)
 
-	xmatched_catalogs = None	# External, cross-matched catalogs (see add_xmatched_catalog for schema of this dict)
+	joined_catalogs = None	# External, cross-matched catalogs (see add_joined_catalog for schema of this dict)
 
 	def all_columns(self):
 		# Return the list of all columns in all tables of the catalog
 		# Return the primary table's columns first, followed by other tables in alphabetical order
-		cols = self.tables[self.primary_table]['columns']
+		cols = list(self.tables[self.primary_table]['columns'])	# Note: wrapped in list() to get a copy
 		for name in sorted(self.tables.keys()):
 			if name == self.primary_table:
 				continue
 			cols += self.tables[name]['columns']
+		# Extract just the names
 		return [ name for name, _ in cols ]
 
 	def cell_for_id(self, id):
@@ -105,7 +106,7 @@ class Catalog:
 		return self._id_from_xy(x, y, t, level)
 
 	def _id_from_xy(self, x, y, t=None, level=10):
-		if t == None:
+		if t is None:
 			t = np.array([self.t0])
 
 		(x, y) = bhpix.xy_center(x, y, level)		# round to requested pixelization level
@@ -157,7 +158,7 @@ class Catalog:
 		return (bounds, t)
 
 	def _cell_bounds_xy(self, x, y, dx = None):
-		if dx == None:
+		if dx is None:
 			dx = bhpix.pix_size(self.level)
 
 		bounds = Polygon.Shapes.Rectangle(dx)
@@ -184,7 +185,7 @@ class Catalog:
 		return "%s.%s.h5" % (self._cell_prefix(cell_id), table)
 
 	def tablet_exists(self, cell_id, table=None):
-		if table == None:
+		if table is None:
 			table = self.primary_table
 
 		assert (table in self.tables) or (table in self.hidden_tables)
@@ -217,14 +218,14 @@ class Catalog:
 			}
 			data["primary_table"] = 'catalog'
 		if "hidden_tables" not in data: data["hidden_tables"] = {}
-		if "xmatched_catalogs" not in data: data["xmatched_catalogs"] = {}
+		if "joined_catalogs" not in data: data["joined_catalogs"] = {}
 		###############################
 
 		# Load table definitions
 		self.tables = data["tables"]
 		self.hidden_tables = data["hidden_tables"]
 		self.primary_table = data["primary_table"]
-		self.xmatched_catalogs = data["xmatched_catalogs"]
+		self.joined_catalogs = data["joined_catalogs"]
 
 		# Postprocessing: fix cases where JSON restores arrays instead
 		# of tuples, and tuples are required
@@ -241,7 +242,7 @@ class Catalog:
 		data["hidden_tables"] = self.hidden_tables
 		data["primary_table"] = self.primary_table
 		data["name"] = self.name
-		data["xmatched_catalogs"] = self.xmatched_catalogs
+		data["joined_catalogs"] = self.joined_catalogs
 
 		f = open(self.path + '/dbinfo.json', 'w')
 		f.write(json.dumps(data, indent=4, sort_keys=True))
@@ -349,8 +350,8 @@ class Catalog:
 
 	## Cell enumeration routines
 	def _get_cells_recursive(self, cells, foot, pix):
-		""" Helper for _get_cells(). See documentation of
-		    _get_cells() for usage
+		""" Helper for get_cells(). See documentation of
+		    get_cells() for usage
 		"""
 		# Check for nonzero overlap
 		lev = bhpix.get_pixel_level(pix[0], pix[1])
@@ -366,18 +367,17 @@ class Catalog:
 		# more than one file in catalogs with a time component
 		prefix = self.path + '/' + bhpix.get_path(pix[0], pix[1], lev)
 		fn = None
-		pattern = "%s/*.%s.h5" % (prefix, self.primary_table)
+		pattern = "%s/*/*.%s.h5" % (prefix, self.primary_table)
 		for fn in glob.iglob(pattern):
-			if(foot.area() == box.area()):
-				foot = None
-
 			# parse out the time, construct cell ID
-			fname = fn[fn.rfind('/')+1:];
-			t = fname.split('.')[-3]
-			t = self.t0 if t == 'static' else float(t)
+			(t, fname) = fn.split('/')[-2:]
+			t = self.t0 if t == 'static' else float(t[1:])
 			cell_id = self._id_from_xy(pix[0], pix[1], t, self.level)
 
-			cells += [ (cell_id, foot) ]
+			cellBounds = None if(foot.area() == box.area()) else foot
+			cells += [ (cell_id, cellBounds) ]
+			#print fname, t, cell_id, cellBounds
+
 		if fn != None:
 			return
 
@@ -390,21 +390,45 @@ class Catalog:
 		for d in np.array([(0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5), (0.5, -0.5)]):
 			self._get_cells_recursive(cells, foot & box, pix + dx*d)
 
-	def _get_cells(self, foot = All):
+	def get_cells(self, foot = All, return_bounds=False):
 		""" Return a list of (cell_id, footprint) tuples completely
-		    covering the requested footprint
+		    covering the requested footprint.
+		    
+		    The footprint can either be a Polyon, a cell_id integer,
+		    or an array of the two.
 		"""
-		# Handle all-sky
+		# Handle all-sky requests, and scalars
 		if foot == All:
-			foot = footprint.ALLSKY
+			foots = [ footprint.ALLSKY ]
+		elif not isinstance(foot, list):
+			foots = [ foot ]
 		else:
+			foots = foot
+
+		# Group together all Polygons, exclude inexisting cells
+		cells = []
+		foot = None
+		for v in foots:
+			if isinstance(v, Polygon.Polygon):
+				if foot is None:
+					foot = v
+				else:
+					foot += v
+			elif self.tablet_exists(v):
+				cells.append( (v, None) )
+
+		# Handle the polygon
+		if foot is not None:
 			# Restrict to valid sky
 			foot = foot & footprint.ALLSKY
 
-		# Divide and conquer to find the database cells
-		cells = []
-		self._get_cells_recursive(cells, foot, (0., 0.))
-		return cells
+			# Divide and conquer to find the cells covered by footprint
+			self._get_cells_recursive(cells, foot, (0., 0.))
+
+		if not return_bounds:
+			return [ cell_id for cell_id, _ in cells ]
+		else:
+			return cells
 
 	### Public methods
 	def __init__(self, path, mode='r', name=None, level=Automatic, t0=Automatic, dt=Automatic):
@@ -426,7 +450,7 @@ class Catalog:
 
 		self.tables = {}
 		self.hidden_tables = {}
-		self.xmatched_catalogs = {}
+		self.joined_catalogs = {}
 		self.name = name
 
 		if level != Automatic: self.level = level
@@ -453,7 +477,7 @@ class Catalog:
 		assert len(cols)
 		n = None
 		for _, col in cols.iteritems():
-			if n == None: n = len(col)
+			if n is None: n = len(col)
 			assert n == len(col), 'n=%d len(col)=%d' % (n, len(col))
 
 		# Locate cells into which we're going to store the results
@@ -535,7 +559,7 @@ class Catalog:
 
 						# Remap any None values to index 0 (where None is stored by fiat)
 						# We use the fact that None will be sorted to the front of the unique sequence, if exists
-						if len(uobjs) and uobjs[0] == None:
+						if len(uobjs) and uobjs[0] is None:
 							##print "Remapping None", len((ito == bsize).nonzero()[0])
 							uobjs = uobjs[1:]
 							ito -= 1
@@ -602,7 +626,7 @@ class Catalog:
 		    objects for the same BLOBs
 		"""
 		ui, _, idx = np.unique(indices, return_index=True, return_inverse=True)
-		assert (ui > 0).all()	# Zero and negative indices are illegal
+		assert (ui >= 0).all()	# Negative indices are illegal. Index 0 means None
 
 		objlist = barray[ui]
 		if len(ui) == 1 and tables.__version__ == '2.2':
@@ -640,10 +664,10 @@ class Catalog:
 					blobs = self._smart_load_blobs(b1, indices)
 		return blobs
 
-	def fetch_cell(self, cell_id, table=None, include_cached=False):
+	def fetch_tablet(self, cell_id, table=None, include_cached=False):
 		""" Load and return all rows from a given tablet
 		"""
-		if table == None:
+		if table is None:
 			table = self.primary_table
 
 		if self.tablet_exists(cell_id, table):
@@ -658,6 +682,13 @@ class Catalog:
 			rows = np.empty(0, dtype=np.dtype(schema['columns']))
 
 		return rows
+
+	def query_cell(self, cell_id, query='*'):
+		""" Execute a query on a local cell.
+		"""
+		assert self.is_cell_local(cell_id)
+
+		return self.fetch(query, cell_id, progress_callback=pool2.progress_pass);
 
 	def fetch(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None):
 		""" Return a table (numpy structured array) of all rows within a
@@ -687,7 +718,7 @@ class Catalog:
 		for rows in self.map_reduce(query=query, mapper=(_iterate_mapper, filter, filter_args), foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
 			# ensure enough memory has been allocated (and do it
 			# intelligently if not)
-			if ret == None:
+			if ret is None:
 				ret = rows
 				nret = 0
 
@@ -750,7 +781,7 @@ class Catalog:
 		reducer, reducer_args = unpack_callable(reducer)
 
 		# slice up the job down to individual cells
-		partspecs = self._get_cells(foot)
+		partspecs = self.get_cells(foot, return_bounds=True)
 
 		# tell _mapper not to test polygon boundaries if the user requested so
 		if not testbounds:
@@ -758,7 +789,7 @@ class Catalog:
 
 		# start and run the workers
 		pool = pool2.Pool(nworkers)
-		if reducer == None:
+		if reducer is None:
 			for result in pool.imap_unordered(
 					partspecs, _mapper,
 					mapper_args = (mapper, self, query, include_cached, mapper_args),
@@ -786,7 +817,7 @@ class Catalog:
 
 		@contextmanager
 		def open(self, table=None):
-			if table == None:
+			if table is None:
 				table = self.cat.primary_table
 
 			fp = self.cat._open_tablet(self.cell_id, mode=self.mode, table=table)
@@ -892,43 +923,72 @@ class Catalog:
 		# Find out which columns are our spatial keys
 		return self._get_schema(self.primary_table)["primary_key"]
 
-	def _fetch_xmatches(self, cell_id, ids, cat_to_name):
+	def _fetch_joins(self, cell_id, ids, cat_to_name, fetch_tablet=None):
 		"""
 			Return a list of crossmatches corresponding to ids
 		"""
-		table = self.xmatched_catalogs[cat_to_name]['xmatch_table']
+		if fetch_tablet is None:
+			fetch_tabled = self.fetch_tablet
+		
+		table_from = self.joined_catalogs[cat_to_name]['table_from']
+		table_to   = self.joined_catalogs[cat_to_name]['table_to']
+		column_to   = self.joined_catalogs[cat_to_name]['column_to']
+		column_from = self.joined_catalogs[cat_to_name]['column_from']
 
-		if len(ids) == 0 or not self.tablet_exists(cell_id, table):
+		if len(ids) == 0 \
+		   or not self.tablet_exists(cell_id, table_from) \
+		   or not self.tablet_exists(cell_id, table_to):
 			return ([], [])
 
-		rows = self.fetch_cell(cell_id, table)
+		if table_from == table_to:
+			# Both the primary and foreign key maps are in the same table
+			#  - this must be the case for many-to-many or one-to-many joins
+			#  - it can be the case for one-to-one joins
+			rows    = fetch_tablet(self, cell_id, table_from)
+		else:
+			# The primary and foreign key columns are in the same table
+			#  - this can only be a one-to-one or many-to-one join
+			#  - the number of rows in the two tables must be the same
+			colFrom = fetch_tablet(self, cell_id, table_from)[column_from]
+			rows  = np.empty(len(colFrom), dtype=[(column_from, 'u8'), (column_to, 'u8')])
+			rows[column_from] = colFrom
+			rows[column_to]   = fetch_tablet(self, cell_id, table_to)[column_to]
 
 		# drop all links where id1 is not in ids
 		sids = np.sort(ids)
-		res = np.searchsorted(sids, rows['id1'])
+		res = np.searchsorted(sids, rows[column_from])
 		res[res == len(sids)] = 0
-		ok = sids[res] == rows['id1']
+		ok = sids[res] == rows[column_from]
 		rows = rows[ok]
 
-		return (rows['id1'], rows['id2'])
+		return (rows[column_from], rows[column_to])
 
-	def add_xmatched_catalog(self, cat, xmatch_table):
+	def define_join(self, cat, table_from, table_to, column_from, column_to):
 		# Schema:
 		#	catalog_name: {
 		#		'path': path,
-		#		'xmatch_table': table_name
+		#		'table_from': table_name
+		#		'table_to':   table_name
+		#		'column_from':  'id1'
+		#		'column_to':    'id2'
 		#	}
-		assert xmatch_table in self.hidden_tables
-		self.xmatched_catalogs[cat.name] = \
+		#
+		# A simple case is where table_from = table_to, with only column_from and
+		# column_to as their columns.
+		self.joined_catalogs[cat.name] = \
 		{
-			'path':		cat.path,
-			'xmatch_table':	xmatch_table
+			'path':			cat.path,	# The path to the foreign catalog
+
+			'table_from':		table_from,	# The table in _this_ catalog with the 'column_from' column
+			'table_to':		table_to,	# The table in _this_ catalog with the 'column_to' column
+			'column_from':		column_from,	# The primary keys of rows in this catalog, to be joined with the other catalog
+			'column_to':		column_to	# The primary keys of corresponding rows in the foreign catalog
 		}
 		self._store_dbinfo()
 
-	def get_xmatched_catalog(self, catname):
-		assert catname in self.xmatched_catalogs
-		return Catalog(self.xmatched_catalogs[catname]['path'])
+	def get_joined_catalog(self, catname):
+		assert catname in self.joined_catalogs
+		return Catalog(self.joined_catalogs[catname]['path'])
 
 ###############################################################
 # Aux functions implementing Catalog.iterate and Catalog.fetch
@@ -1092,7 +1152,7 @@ class TableColsProxy:
 	def __getitem__(self, catname):
 		# Return a list of columns in catalog catname
 		if catname == '': return self.cat.all_columns()
-		return self.cat.get_xmatched_catalog(catname).all_columns()
+		return self.cat.get_joined_catalog(catname).all_columns()
 
 class iarray(np.ndarray):
 	""" Subclass of ndarray allowing per-row indexing.
@@ -1136,7 +1196,7 @@ class ColDict:
 	primary_catalog = None	# the primary catalog
 	include_cached = None	# whether we should include the cached data within the cell
 
-	orig_rows= None		# Debugging/sanity checking: dict of catname->number_of_rows that any tablet of this catalog correctly fetched with fetch_cell() should have
+	orig_rows= None		# Debugging/sanity checking: dict of catname->number_of_rows that any tablet of this catalog correctly fetched with fetch_tablet() should have
 
 	def __init__(self, query, cat, cell_id, bounds, include_cached):
 
@@ -1151,7 +1211,7 @@ class ColDict:
 		#exit()
 
 		# Fetch all rows of the base table, including the cached ones (if requested)
-		rows2 = cat.fetch_cell(cell_id=cell_id, table=cat.primary_table, include_cached=include_cached)
+		rows2 = cat.fetch_tablet(cell_id=cell_id, table=cat.primary_table, include_cached=include_cached)
 		idx2  = np.arange(len(rows2))
 		self.orig_rows = { cat.name: len(rows2) }
 
@@ -1180,6 +1240,21 @@ class ColDict:
 		}
 		self.keys     = rows2[idx2][cat.tables[cat.primary_table]["primary_key"]]
 
+		def fetch_cached_tablet(cat, cell_id, table):
+			""" A nested function designed to return the tablet
+			    from cache (if loaded), or call cat.fetch_tablet
+			    otherwise.
+			    
+			    Used as a parameter to cat._fetch_joins
+			"""
+			if cat.name in self.catalogs and table in self.catalogs[cat.name]['tables']:
+				return self.catalogs[cat.name]['tables'][table]
+				
+			# TODO: we should cache the resulting tablet, for ColDict use later on
+			#       (marginally non-trivial, need to be careful about caching and which
+			#       rows to keep and which not to)
+			return cat.fetch_tablet(cell_id, table)
+
 		# Load catalog indices to be joined
 		for (catname, join_type) in from_clause:
 			if cat.name == catname:
@@ -1189,9 +1264,9 @@ class ColDict:
 			assert include_cached == False, "include_cached=True in JOINs is a recipe for disaster. Don't do it"
 
 			# load the xmatch table and instantiate the second catalog object
-			(m1, m2) = cat._fetch_xmatches(cell_id, self.keys, catname)
-			cat2     = cat.get_xmatched_catalog(catname)
-			rows2    = cat2.fetch_cell(cell_id=cell_id, table=cat2.primary_table, include_cached=True)
+			(m1, m2) = cat._fetch_joins(cell_id, self.keys, catname, fetch_tablet=fetch_cached_tablet)
+			cat2     = cat.get_joined_catalog(catname)
+			rows2    = cat2.fetch_tablet(cell_id=cell_id, table=cat2.primary_table, include_cached=True)
 			id2      = rows2[cat2.tables[cat2.primary_table]["primary_key"]]
 			self.orig_rows[cat2.name] = len(rows2)
 
@@ -1279,10 +1354,11 @@ class ColDict:
 
 		# See if we have already loaded the required tablet
 		if table in self.catalogs[catname]['tables']:
+			#print table, name, ':', self.catalogs[catname]['tables'][table].dtype.names
 			col = self.catalogs[catname]['tables'][table][name]
 		else:
 			# Load
-			rows = cat.fetch_cell(cell_id=self.cell_id, table=table, include_cached=include_cached)
+			rows = cat.fetch_tablet(self.cell_id, table, include_cached=include_cached)
 			assert len(rows) == self.orig_rows[catname]
 
 			# Join
@@ -1425,14 +1501,45 @@ def _cache_maker_mapper(rows, margin_x, margin_t):
 	if not in_.any():
 		return Empty
 
-	# Now load all tablets, and keep only the neighbors within
-	# neighborhood
+	# Load full rows, across all tablets, keeping only
+	# those with in_ == True
+	data = load_full_rows(cat, cell_id, in_)
+
+	# Mark these to be replicated all over the neighborhood
+	res = []
+	if len(data):
+		for neighbor in cat.neighboring_cells(cell_id):
+			res.append( (neighbor, data) )
+
+	#print "Scanned margins of %s (%d objects)" % (cat._tablet_file(self.CELL_ID, table=cat.primary_table), len(data[cat.primary_table]))
+
+	return res
+
+def load_full_rows(cat, cell_id, in_):
+	""" Load all rows for all tablets, keeping only those with in_ == True.
+	    Return a nested dict:
+
+	    	ret = {
+		    	table_name: {
+		    		'rows': rows (ndarray)
+		    		'blobs': {
+		    			blobcolname: blobs (ndarray)
+		    			...
+		    		}
+			}
+		}
+
+	    Any blobs referred to in rows will be stored in blobs, to be indexed
+	    like:
+
+	       blobs = ret[table]['blobs'][blobcol][ ret[table][blobcolref] ]
+	"""
 	data = { }
 	for table in cat.tables:
 		data[table] = {}
 
 		# load all rows
-		rows = cat.fetch_cell(cell_id=cell_id, table=table)[in_]
+		rows = cat.fetch_tablet(cell_id, table)[in_]
 
 		# load all blobs
 		data[table]['blobs'] = {}
@@ -1457,29 +1564,40 @@ def _cache_maker_mapper(rows, margin_x, margin_t):
 		# modify the indices in the rows
 		data[table]['rows'] = rows
 
-	# Mark these to be replicated all over the neighborhood
-	res = []
-	if len(data):
-		for neighbor in cat.neighboring_cells(cell_id):
-			res.append( (neighbor, data) )
+	return data
 
-	#print "Scanned margins of %s (%d objects)" % (cat._tablet_file(self.CELL_ID, table=cat.primary_table), len(data[cat.primary_table]))
+def extract_full_rows_subset(allrows, in_):
+	# Takes allrows in the format returned by load_full_rows and
+	# extracts those with in_==True, while correctly reindexing any
+	# BLOBs that are in there.
+	#
+	# Also works if in_ is a ndarray of indices.
+	ret = {}
+	for table, data in allrows.iteritems():
+		rows = data['rows'][in_]
+		xblobs = {}
+		for (bcolname, blobs) in data['blobs'].iteritems():
+			# reindex blob refs
+			blobrefs, i, idx = np.unique(rows[bcolname], return_index=True, return_inverse=True)
+			idx = idx.reshape(rows[bcolname].shape)
 
-	return res
+			xblobs[bcolname] = blobs[blobrefs];
+			rows[bcolname]   = idx
 
-def _cache_maker_reducer(cell_id, nborblocks):
-	# Reduce: the key is the cell ID, the value is
-	# a list of objects to be copied there.
-	# 1. copy all existing non-cached objects to a temporary table
-	# 2. append cached objects
-	# 3. remove the original table
-	# 4. rename the cached table
-	self = _cache_maker_reducer
-	cat          = self.CATALOG
+			assert rows[bcolname].min() == 0
+			assert rows[bcolname].max() == len(blobrefs)-1
+			assert (xblobs[bcolname][ rows[bcolname] ] == blobs[ data['rows'][in_][bcolname] ]).all()
+
+		ret[table] = { 'rows': rows, 'blobs': xblobs }
+	return ret
+
+def write_neighbor_cache(cat, cell_id, nborblocks):
+	# Store a list of full rows (as returned by load_full_rows)
+	# to neighbor tables of tablets in cell cell_id
+	# of catalog cat
 
 	assert cat.is_cell_local(cell_id)
 
-	# Update all tables
 	ncached = 0
 	with cat.get_cell(cell_id, mode='w') as cell:
 		for table, schema in cat.tables.iteritems():
@@ -1491,20 +1609,18 @@ def _cache_maker_reducer(cell_id, nborblocks):
 			with cell.open(table=table) as fp:
 				# Drop existing cache
 				if 'cached' in fp.root:
-					fp.root.cached.remove()
+					fp.removeNode('/', 'cached', recursive=True);
 
-				# Create destinations
+				# Create destinations for rows and blobs
 				fp.createGroup('/', 'cached', title='Cached objects from neighboring cells')
 				fp.root.main.table.copy('/cached', 'table', start=0, stop=0, createparents=True)
-
 				blobs = set(( name for nbor in nborblocks for (name, _) in nbor[table]['blobs'].iteritems() ))
 				for name in blobs:
 					fp.createVLArray('/cached/blobs', name, tables.ObjectAtom(), "BLOBs", createparents=True)
 					fp.root.cached.blobs.__getattr__(name).append(0)	# ref=0 should be pointed to by no real element (equivalent to NULL pointer)
-
 				haveblobs = len(blobs) != 0
 
-				# Write records
+				# Write records (rows and blobs)
 				for nbor in nborblocks:
 					rows  = nbor[table]['rows']
 
@@ -1530,6 +1646,15 @@ def _cache_maker_reducer(cell_id, nborblocks):
 					ncached = fp.root.cached.table.nrows
 				assert ncached == fp.root.cached.table.nrows
 
+	return ncached
+
+def _cache_maker_reducer(cell_id, nborblocks):
+	self = _cache_maker_reducer
+	cat          = self.CATALOG
+
+	ncached = write_neighbor_cache(cat, cell_id, nborblocks);
+
 	# Return the number of new rows cached into this cell
 	return (cell_id, ncached)
+
 ###################################################################

@@ -1,6 +1,13 @@
 import subprocess, os, errno
 import numpy as np
 
+def isiterable(x):
+	try:
+		iter(x)
+		return True
+	except TypeError:
+		return False
+
 def unpack_callable(func):
 	""" Unpack a (function, function_args) tuple
 	"""

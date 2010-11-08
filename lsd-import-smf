@@ -35,15 +35,32 @@ for (o, a) in optlist:
 # Actual work
 #
 
-print "Importing SMF files ",
+# SMF file import
+print >> sys.stderr, "Importing SMF files:"
 smf.import_from_smf(det_catdir, exp_catdir, files, create)
-print " done."
+print >> sys.stderr, "done."
 
-#cat = lsd.Catalog(cat_dir)
-#print "Building neighbor cache ",
-#cat.build_neighbor_cache()
-#print " done."
-#
-#print "Computing summary statistics ",
-#cat.compute_summary_stats()
-#print " done."
+# Build neighbor caches for images tables
+print >> sys.stderr, "Building n'bor cache: ",
+smf.make_image_cache(det_catdir, exp_catdir)
+
+# Sanity check: all queries linking to images must resolve within cell
+print >> sys.stderr, "Consistency check: ",
+det_cat = lsd.Catalog(det_catdir)
+for row in det_cat.iterate('det_id, ra, dec, exp_id, equinox JOIN ps1_exp(outer) WHERE equinox == 0'):
+	raise Exception("Inconsistency detected: (det_id, ra, dec, exp_id, equinox) = " + str(row))
+
+# Build neighbor caches for detections
+#print >> sys.stderr, "Building neighbor cache (detections): ",
+#det_cat.build_neighbor_cache()
+#print "Done."
+
+# Compute summary stats for both catalogs
+print >> sys.stderr, "Computing summary statistics (detections): ",
+det_cat.compute_summary_stats()
+exp_cat = lsd.Catalog(exp_catdir)
+print >> sys.stderr, "Computing summary statistics (exposures): ",
+exp_cat.compute_summary_stats()
+
+# Done
+print "Import done.", det_cat.nrows(), "detections in", exp_cat.nrows() , "exposures."

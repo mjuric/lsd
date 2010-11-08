@@ -76,7 +76,8 @@ def ls_mapper(rows):
 
 def compute_counts(cat, include_cached=False):
 	ntotal = 0
-	for (cell_id, nobjects) in cat.map_reduce('id', ls_mapper, include_cached=include_cached):
+	primary_key = cat._get_schema(cat.primary_table)['primary_key']
+	for (cell_id, nobjects) in cat.map_reduce(primary_key, ls_mapper, include_cached=include_cached):
 		ntotal = ntotal + nobjects
 	return ntotal
 ###################################################################
@@ -128,43 +129,6 @@ def _xmatch_mapper(rows, cat_to, xmatch_radius, xmatch_table):
 	matched = xmatch['d1'] < xmatch_radius
 	xmatch = xmatch[matched]
 
-#	if len(rows) and cat.name == cat_to.name:	# debugging: self-match
-#		# This test revealed duplicate objects in DVO files. Example:
-#		# In /raid14/panstarrs/dvo-201008/s2230/6485.06.cpt, objid = 1823 and 1824 are the same object (have the same ra/dec)
-#		assert len(rows) == len(xmatch)
-#		#if not (xmatch['id1'] == xmatch['id2']).all():
-#		#	ra1 = ra1[matched]
-#		#	ra2 = ra2[match_idx][matched]
-#		#	dec1 = dec1[matched]
-#		#	dec2 = dec2[match_idx][matched]
-#		#	cat_id1 = cat_id1[matched]
-#		#	cat_id2 = cat_id2[match_idx][matched]
-#		#	ext_id1 = ext_id1[matched]
-#		#	ext_id2 = ext_id2[match_idx][matched]
-#		#	obj_id1 = obj_id1[matched]
-#		#	obj_id2 = obj_id2[match_idx][matched]
-#		#	file_id1 = file_id1[matched]
-#		#	file_id2 = file_id2[match_idx][matched]
-#		#	diff = xmatch['id1'] != xmatch['id2']
-#		#	print xmatch['id1'][diff]
-#		#	print xmatch['id2'][diff]
-#		#	print xmatch['d1'][diff]
-#		#	print ra1[diff]
-#		#	print ra2[diff]
-#		#	print dec1[diff]
-#		#	print dec2[diff]
-#		#	print cat_id1[diff]
-#		#	print cat_id2[diff]
-#		#	print ext_id1[diff]
-#		#	print ext_id2[diff]
-#		#	print obj_id1[diff]
-#		#	print obj_id2[diff]
-#		#	print file_id1[diff]
-#		#	print file_id2[diff]
-#		#	print cat._tablet_file(cell_id, 'astrometry')
-#		assert (xmatch['id1'] == xmatch['id2']).all()
-#		assert (np.abs(xmatch['d1']) < 1.e-14).all()
-
 	if len(xmatch) != 0:
 		# Store the xmatch table
 		cat._drop_tablet(cell_id, xmatch_table)
@@ -203,6 +167,6 @@ def xmatch(cat_from, cat_to, radius=1./3600.):
 	print "Matched a total of %d sources." % (ntot)
 
 	# Add metadata about this xmatch to dbinfo
-	cat_from.add_xmatched_catalog(cat_to, xmatch_table)
+	cat_from.define_join(cat_to, xmatch_table, xmatch_table, 'id1', 'id2')
 
 ###################################################################

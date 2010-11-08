@@ -225,6 +225,9 @@ def import_from_smf(det_catdir, exp_catdir, smf_files, create=False):
 		# Create the new database
 		det_cat = create_catalog(det_catdir, 'ps1_det', det_cat_def)
 		exp_cat = create_catalog(exp_catdir, 'ps1_exp', exp_cat_def)
+
+		# Set up a one-to-X join relationship between the two catalogs (join det_cat:exp_id->exp_cat:exp_id)
+		det_cat.define_join(exp_cat, 'astrometry', 'astrometry', 'det_id', 'exp_id')
 	else:
 		det_cat = catalog.Catalog(det_catdir)
 		exp_cat = catalog.Catalog(exp_catdir)
@@ -235,7 +238,7 @@ def import_from_smf(det_catdir, exp_catdir, smf_files, create=False):
 	t0 = time.time()
 	at = 0; ntot = 0
 	pool = pool2.Pool()
-	for (file, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_cat, exp_cat, det_c2f, exp_c2f)):
+	for (file, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_cat, exp_cat, det_c2f, exp_c2f), progress_callback=pool2.progress_pass):
 	#for (file, nloaded, nin) in imap(lambda file: import_from_smf_aux(file, cat), smf_files):
 		at = at + 1
 		ntot = ntot + nloaded
@@ -356,3 +359,108 @@ def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
 	ids = det_cat.append(det_cols_all)
 
 	return (file, len(ids), len(ids))
+
+#########
+
+# image cache creator kernels
+# 1) stream through entire detection catalog, recording exp_ids of images
+#    from other cells. Key these by their cell_id, our cell_id, and return.
+# 2) stream through the image catalog, collecting rows of images that are
+#    referenced out of their cells. Return the rows keyed by destination
+#    cells.
+# 3) store the copies into the cache of each cell.
+
+def make_image_cache(det_cat_path, exp_cat_path):
+	# Entry point for creation of image cache
+	det_cat = catalog.Catalog(det_cat_path)
+	exp_cat = catalog.Catalog(exp_cat_path)
+
+	# Fetch all non-empty cells with detections. This will be the
+	# list over which the first kernel will map.
+	det_cells = det_cat.get_cells()
+
+	pool = pool2.Pool()
+	for _ in pool.map_reduce_chain(det_cells,
+					      [
+						(_exp_id_gather,  det_cat, exp_cat),
+						(_exp_id_load,    exp_cat),
+						(_exp_store_rows, exp_cat)
+					      ]):
+		pass;
+
+def _exp_id_gather(det_cell, det_cat, exp_cat):
+	#-- This kernel is called once for each cell in det_cat.
+
+	# Fetch all exp_ids referenced from this cell
+	(exp_id, ) = det_cat.query_cell(det_cell, 'exp_id').as_columns()
+	exp_id     = np.unique(exp_id)
+	exp_cells  = exp_cat.cell_for_id(exp_id)
+
+	# keep only those that aren't local
+	outside    = exp_cells != det_cell
+	exp_id     =    exp_id[outside]
+	exp_cells  = exp_cells[outside]
+
+	# pack them in (exp_cell, (det_cell, exposures)) tuples
+	ret = [];
+	for exp_cell in set(exp_cells):
+		# List of exposure IDs from exp_cell, that need
+		# to be cached in det_cell
+		exps = exp_id[exp_cells == exp_cell]
+
+		ret.append( (exp_cell, (det_cell, exps)) )
+
+	return ret
+
+def _exp_id_load(kv, exp_cat):
+	#-- This kernel is called once for each exp_cat cell referenced from det_cat
+	#
+	# kv = (exp_cell, detexps) with
+	#    detexps = [ (det_cell1, exps1), (det_cell, exps2), ... ]
+	# where exps are the list of exp_ids to load, and det_cell
+	# are the cells that should get a copy of each of those
+	# exposure IDs.
+	#
+
+	exp_cell, detexps = kv
+
+	# Load exp_id and sort it
+	(exp_id,) = exp_cat.query_cell(exp_cell, 'exp_id').as_columns()
+	sorted_idx = np.argsort(exp_id)
+	exp_id = exp_id[sorted_idx]
+
+	# Find all rows that appear in any of the detexps lists
+	in_ = np.zeros(len(exp_id), dtype=bool)
+	idx_list = {}
+	for (det_cell, exps) in detexps:
+		idx = np.searchsorted(exp_id, exps)
+		assert (exp_id[idx] == exps).all()		# It's a bug if there are exp_id duplicates or unmatched exp_ids
+
+		in_[idx] = True
+		idx_list[det_cell] = sorted_idx[idx]
+
+	# return in_ to original ordering (before sorting)
+	in_[sorted_idx] = in_.copy()
+
+	# Load full rows
+	allrows = catalog.load_full_rows(exp_cat, exp_cell, in_)
+
+	# Dispatch the right rows to right det_cells
+	ret = []
+	for (det_cell, idx) in idx_list.iteritems():
+		rows = catalog.extract_full_rows_subset(allrows, idx)
+		ret.append( (det_cell, rows) )
+
+	#print exp_cell, " -> ", [ (det_cell, len(rows[exp_cat.primary_table]['rows'])) for (det_cell, rows) in ret ]
+
+	# Returns a list of (dec_cell, fullrows) tuples
+	return ret
+
+def _exp_store_rows(kv, exp_cat):
+	# Store all rows to the correct cells.
+	cell_id, nborblocks = kv
+
+	ncached = catalog.write_neighbor_cache(exp_cat, cell_id, nborblocks);
+
+	# Return the number of new rows cached into this cell
+	return (cell_id, ncached)

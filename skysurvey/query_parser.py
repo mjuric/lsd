@@ -19,7 +19,7 @@ def parse(query, tablecols):
 				break
 
 			col = ''
-			while token.lower() not in ['', ',', 'where', 'as', 'xmatch']:
+			while token.lower() not in ['', ',', 'where', 'as', 'join']:
 				col = col + token
 				if token == '(':
 					# find matching ')'
@@ -50,9 +50,9 @@ def parse(query, tablecols):
 				newcols = [(name, col)]
 
 			# Column delimiter or end of SELECT clause
-			if token.lower() in ['', ',', 'where', 'xmatch']:
+			if token.lower() in ['', ',', 'where', 'join']:
 				select_clause += newcols
-				if token.lower() == "xmatch":
+				if token.lower() == "join":
 					first = True
 					# JOIN clause
 					while token.lower() not in ['', 'where']:
@@ -100,13 +100,13 @@ if __name__ == '__main__':
 		'': ['a', 'b', 'c'],
 		'sdss': ['haha', 'hihi']
 	}
-	print parse("sdss.ra, sdss.dec XMATCH with sdss", tablecols)
+	print parse("sdss.ra, sdss.dec JoIN WitH sdss", tablecols)
 	exit()
 	print parse("*, sdss.*", tablecols);
 	exit()
 	print parse("ra, dec", tablecols);
 	exit()
-	print parse("sdss.*, ra, sdss.gic as a, dec as DEC, (where(sdss.dec,where,ra,dec)) as blarg XMATCH ps1, sdss(outer), tmass WHERE 0.1 < g-r < 0.5", tablecols)
+	print parse("sdss.*, ra, sdss.gic as a, dec as DEC, (where(sdss.dec,where,ra,dec)) as blarg JOIN ps1, sdss(outer), tmass WHERE 0.1 < g-r < 0.5", tablecols)
 	exit()
 
 	vd = VerboseDict()

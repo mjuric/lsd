@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import time
+from utils import unpack_callable
 
 def _worker(qin, qout):
 	# Just dispatch the call to the target function
@@ -84,28 +85,38 @@ def progress_dots(stage, step, input, index, result):
 def progress_pass(stage, step, input, index, result):
 	pass
 
+def where(cond, a, b):
+	""" A readable C-ish ternary operator.
+	"""
+	return a if cond else b
+
 class Pool:
 	qin = None
 	qout = None
 	ps = []
-	#DEBUG = False
-	#DEBUG = True
-	DEBUG = os.getenv('DEBUG', False)
+	DEBUG = int(os.getenv('DEBUG', False))
+	min_tasks_for_parallel = 3
+	nworkers = cpu_count()
 
-	def __init__(self, nworkers = None):
-	        if self.DEBUG:
-	            return
-
-		if nworkers == None:
-			nworkers = cpu_count()
+	def _create_workers(self):
+		""" Lazily create workers, when needed. This routine
+		    creates the worker processes when called the first
+		    time.
+		"""
+		if len(self.ps) == self.nworkers:	# Already created?
+			return
 
 		self.qin = Queue()
-		self.qout = Queue(nworkers*2)
-		self.ps = [ Process(target=_worker, args=(self.qin, self.qout)) for i in xrange(nworkers) ]
+		self.qout = Queue(self.nworkers*2)
+		self.ps = [ Process(target=_worker, args=(self.qin, self.qout)) for i in xrange(self.nworkers) ]
 
 		for p in self.ps:
 			p.daemon = True
 			p.start()
+
+	def __init__(self, nworkers = None):
+		if nworkers != None:
+			self.nworkers = nworkers
 
 	def imap_unordered(self, input, mapper, mapper_args=(), return_index=False, progress_callback=None, progress_callback_stage='map'):
 		""" Execute in parallel a callable <mapper> on all values of
@@ -116,7 +127,20 @@ class Pool:
 
 		progress_callback(progress_callback_stage, 'begin', input, None, None)
 
-		if not self.DEBUG:
+		# Try to optimize and not dispatch to workers if there are less
+		# than self.min_tasks_for_parallel tasks
+		try:
+			parallel = len(input) >= self.min_tasks_for_parallel
+		except TypeError:
+			parallel = True
+
+		parallel = parallel and not self.DEBUG
+
+		# Dispatch/execute
+		if parallel:
+			# Create workers (if not created already)
+			self._create_workers()
+
 			i = -1
 			for (i, val) in enumerate(input):
 				self.qin.put( (mapper, i, (val,) + mapper_args) )
@@ -131,6 +155,7 @@ class Pool:
 				else:
 					yield result
 		else:
+			# Execute in-thread, without external workers
 			for (i, val) in enumerate(input):
 				result = mapper(val, *mapper_args)
 				progress_callback(progress_callback_stage, 'step', input, i, result)
@@ -211,3 +236,124 @@ class Pool:
 
 		if progress_callback != None:
 			progress_callback('mapreduce', 'end', None, None, None)
+
+	def map_reduce_chain(self, input, kernels, progress_callback=None):
+		""" A poor-man's map-reduce implementation.
+		
+		    Calls the mapper for each value in the <input> iterable. 
+		    The mapper shall return a list of key/value pairs as a
+		    result.  Once all mappers have run, reducers will be
+		    called with a key, and a list of values associated with
+		    that key, once for each key.  The reducer's return
+		    values are yielded to the user.
+
+		    Input: Any iterable
+		    Output: Iterable (generated)
+
+		    Notes:
+		    	- mapper must return a dictionary of (key, value) pairs
+		    	- reducer must expect a (key, value) pair as the first
+		    	  argument, where the value will be an iterable
+		"""
+
+		if progress_callback == None:
+			progress_callback = progress_default
+
+		progress_callback('mapreduce', 'begin', input, None, None)
+
+		for i, K in enumerate(kernels):
+			K_fun, K_args = unpack_callable(K)
+			last_step = (i + 1 == len(kernels))
+			stage = where(i == 0, 'map', 'reduce')
+
+			mresult = defaultdict(list)
+			for r in self.imap_unordered(input, K_fun, K_args, progress_callback=progress_callback, progress_callback_stage=stage):
+				if last_step:
+					# yield the final result
+					yield r
+				else:
+					# Prepare for next reduction
+					for (k, v) in r:
+						mresult[k].append(v)
+
+			input = mresult.items()
+
+		if progress_callback != None:
+			progress_callback('mapreduce', 'end', None, None, None)
+
+#	def distributed_map_reduce_chain(self, input, kernels, partitioners, progress_callback=None):
+#		""" A poor-man's map-reduce implementation.
+#		
+#		    Calls the mapper for each value in the <input> iterable. 
+#		    The mapper shall return a list of key/value pairs as a
+#		    result.  Once all mappers have run, reducers will be
+#		    called with a key, and a list of values associated with
+#		    that key, once for each key.  The reducer's return
+#		    values are yielded to the user.
+#
+#		    Input: Any iterable
+#		    Output: Iterable (generated)
+#
+#		    Notes:
+#		    	- mapper must return a dictionary of (key, value) pairs
+#		    	- reducer must expect a (key, value) pair as the first
+#		    	  argument, where the value will be an iterable
+#		"""
+#
+#		# Launch first mapping, and wait for the wave to finish
+#		mr = MapReduceSwarm(16, kernels, partitioners)
+#		mr.run()
+#
+#		for v in input:
+#			mr.push(v)
+#		for (msg, r) in mr:
+#			if msg == 'result':
+#				yield
+#			else:
+#				... progress report or something ...
+#				... we could pass this to the application layer as well ...
+#
+#
+#		class MapReduceSwarm:
+#			def __init__(self, nmembers, kernels, partitioners):
+#				self.comm = MPI.COMM_WORLD
+#				self.rank = MPI.Get_rank()
+#
+#				if self.rank == 0:
+#					# Make yourself a daemon, listening for user commands
+#					# on a given socket
+#					...
+#				else:
+#					# Listen for master's commands through MPI
+#					(cmd, args) = comm.recv(source=0)
+#					if cmd == 'run':
+#						...
+#
+#			def push(self, val):
+#				...
+#
+#		# - controller: receives messages from workers (progress or results)
+#		# - workers: just work
+#		#
+#		# - Each process should have two threads (subprocesses) -- one for
+#		#   communicating with MPI (monitor), one for the actual work.
+#		#   - e.g., the monitor could then receive and store data sent
+#		#     to it by nodes wishing to reduce
+#		#   - might be good if these were two separate MPI instances?
+#
+#		def cell_partitioner(hosts, key):
+#			# Cell partitioner with no location awareness (assumes shared storage)
+#			# Always places the same key to the same host (assuming constant len(hosts))
+#			hash = int(hashlib.md5(str(key)).hexdigest(), base=16)
+#			return hosts[hash % len(hosts)]
+#
+#		def cell_partitioner(hosts, key, args):
+#			# location-aware assignment partitioner might look something like this
+#			(cat, occ) = args
+#			
+#			# Get a list of suitable hosts (this is all propagated at initialization time)
+#			chosts = cat.get_hosts_containing_cell(key, hosts)
+#
+#			# Choose one at random
+#			return chosts[random_integer(0, len(chosts)-1)]
+#
