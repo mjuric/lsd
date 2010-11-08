@@ -36,7 +36,7 @@ exp_cat_def = \
 		'spatial_keys': ('ra', 'dec'),
 		"cached_flag" : "cached"
 	},
-	'meta': {
+	'obsdet': {
 		'columns': [
 			('m2z',			'f4',	'M2Z'	  ,	'Telescope focus'		      ),
 			('obstype',		'a20',	'OBSTYPE' ,	'Type of observation'		      ),
@@ -46,6 +46,13 @@ exp_cat_def = \
 			('filename',		'a20',	'FILENAME', 	'FPA observation identifier'	      ),
 			('nghosts',		'u4',	'NGHOSTS' ,	'total expected ghosts'	              ),
 		],
+	},
+	'meta': {
+		'columns': [
+			('notfound_keys',	'i8',	''	 ,	'BLOB list listing header keys that were not found in source .smf file'),
+			('notfound_cols',	'64i8',	''	 ,	'BLOB list listing columns that were not found in the source .smf file'),
+		],
+		'blobs': [ 'notfound_keys', 'notfound_cols' ]
 	},
 	'zeropoints_ifa': {
 		'columns': [
@@ -257,13 +264,37 @@ def add_lb(cols):
 	cols['l']      = l
 	cols['b']      = b
 
-def load_columns_from_data(dat, c2f):
-	cols = dict(( (name, dat.field(fitsname))   for (name, fitsname) in c2f.iteritems() if fitsname != ''))
-	return cols
+def load_columns_from_data(dat, c2f, c2t):
+	#cols = dict(( (name, dat.field(fitsname))   for (name, fitsname) in c2f.iteritems() if fitsname != ''))
+	cols = dict()
+	nullkeys = []
+	for (name, fitsname) in c2f.iteritems():
+		if fitsname == '': pass
+		try:
+			cols[name] = dat.field(fitsname)
+		except KeyError:
+			cols[name] = np.zeros(len(dat), dtype=c2t[name])
+			nullkeys.append(name)
+			if(cols[name].dtype.kind == 'f'):
+				cols[name][:] = np.nan
+			#print "Column %s does not exist." % (fitsname,)
+	return cols, nullkeys
 
-def load_columns_from_header(hdr, c2f):
-	cols = dict(( (name, np.array([hdr[fitsname]]))   for (name, fitsname) in c2f.iteritems() if fitsname != ''))
-	return cols
+def load_columns_from_header(hdr, c2f, c2t):
+	#cols = dict(( (name, np.array([hdr[fitsname]]))   for (name, fitsname) in c2f.iteritems() if fitsname != ''))
+	cols = dict()
+	nullkeys = []
+	for (name, fitsname) in c2f.iteritems():
+		if fitsname == '': pass
+		try:
+			cols[name] = np.array([ hdr[fitsname] ])
+		except KeyError:
+			cols[name] = np.zeros(1, dtype=c2t[name])
+			nullkeys.append(name)
+			if(cols[name].dtype.kind == 'f'):
+				cols[name][:] = np.nan
+			#print "Key %s does not exist in header." % (fitsname,)
+	return cols, nullkeys
 
 def all_chips():
 	""" Iterate over all valid chip IDs.
@@ -281,14 +312,25 @@ def all_chips():
 		yield chip_id, chip_xy
 
 def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
+	det_c2t = gen_cat2type(det_cat_def)
+	exp_c2t = gen_cat2type(exp_cat_def)
+
 	# Load the .smf file
 	hdus = pyfits.open(file)
 
 	# Do the exposure table entry first; we'll need the
 	# image ID to fill in the detections table
 	imhdr = hdus[0].header
-	exp_cols = load_columns_from_header(imhdr, exp_c2f)
+	exp_cols, exp_nullcols = load_columns_from_header(imhdr, exp_c2f, exp_c2t)
 	add_lb(exp_cols)
+
+	# Record the list of keywords not found in the header
+	# and prepare the lists of columns not found in the header
+	exp_cols['notfound_keys'] = np.empty(1, dtype=object)
+	if len(exp_nullcols):
+		exp_cols['notfound_keys'][0] = exp_nullcols
+	exp_cols['notfound_cols']	= np.empty(1, dtype='64O')
+	exp_cols['notfound_cols'][:]	= None
 
 	# Add the filename of the .smf we drew this from
 	fn = '/'.join(file.split('/')[-2:])
@@ -313,25 +355,29 @@ def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
 			exp_cols['chip_hdr'][0][chip_id] = str(hdr)
 
 			dat = hdus[chip_xy + '.psf'].data
-			nrows = nrows + len(dat)
-
-	(exp_id,) = exp_cat.append(exp_cols)
+			if dat is not None:
+				nrows = nrows + len(dat)
 
 	### Detections
 	filterid = imhdr['FILTERID']
 	mjd_obs  = imhdr['MJD-OBS']
-	cat2type = gen_cat2type(det_cat_def)
 	det_cols_all = None
 	at = 0
 	for (idx, (chip_id, chip_xy)) in enumerate(all_chips()):
 
 		try:	
 			dat = hdus[chip_xy + '.psf'].data
+			if dat is None:
+				continue
 		except KeyError:
 			continue
 
 		# Slurp all columns from FITS to 
-		det_cols  = load_columns_from_data(dat, det_c2f)
+		det_cols, nullcols  = load_columns_from_data(dat, det_c2f, det_c2t)
+
+		# Record any columns that were not found
+		if len(nullcols):
+			exp_cols['notfound_cols'][0][chip_id] = nullcols
 
 		# Add computed columns
 		add_lb(det_cols)
@@ -341,22 +387,21 @@ def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
 		det_cols['chip_id']     = np.empty(len(dat), dtype='u1')
 		det_cols['filterid'][:] = filterid
 		det_cols['mjd_obs'][:]  = mjd_obs
-		det_cols['exp_id'][:]   = exp_id
 		det_cols['chip_id'][:]  = chip_id
 
 		# Create output array, if needed
 		if det_cols_all is None:
-			det_cols_all = dict(( (col, np.empty(nrows, dtype=cat2type[col])) for col in det_cols ))
+			det_cols_all = dict(( (col, np.empty(nrows, dtype=det_c2t[col])) for col in det_cols ))
 
 		# Store to output array
 		for col in det_cols_all:
 			det_cols_all[col][at:at+len(det_cols[col])] = det_cols[col]
 		at = at + len(det_cols['exp_id'])
-
-		#print "GO", idx, chip_id, chip_xy, len(det_cols['ra'])
 	assert at == nrows
 
-	##print "Saving ", len(det_cols_all['ra'])
+	(exp_id,) = exp_cat.append(exp_cols)
+	det_cols_all['exp_id'][:] = exp_id
+
 	ids = det_cat.append(det_cols_all)
 
 	return (file, len(ids), len(ids))

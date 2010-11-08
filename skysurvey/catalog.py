@@ -626,6 +626,7 @@ class Catalog:
 		    objects for the same BLOBs
 		"""
 		ui, _, idx = np.unique(indices, return_index=True, return_inverse=True)
+		idx = idx.reshape(indices.shape)
 		assert (ui >= 0).all()	# Negative indices are illegal. Index 0 means None
 
 		objlist = barray[ui]
@@ -643,7 +644,7 @@ class Catalog:
 	def fetch_blobs(self, cell_id, table, column, indices, include_cached=False):
 		# short-circuit if there's nothing to be loaded
 		if len(indices) == 0:
-			return np.empty(0, dtype=np.object_)
+			return np.empty(indices.shape, dtype=np.object_)
 
 		# load the blobs arrays
 		with self.get_cell(cell_id) as cell:
@@ -653,7 +654,6 @@ class Catalog:
 					# We have cached objects in 'cached' group -- read the blobs
 					# from there as well. blob refs of cached objects are
 					# negative.
-					assert (indices != 0).all()
 					b2 = fp.root.cached.blobs.__getattr__(column)
 					blobs = np.append(
 							self._smart_load_blobs(b1,  indices[indices > 0]),
@@ -1328,7 +1328,11 @@ class ColDict:
 		in_    = np.empty(nrows, dtype=bool)
 		in_[:] = eval(where_clause, global_, self)
 
-		self.rows_ = Table( [ (name, self[name][in_]) for name in retcols ] )
+		if nrows == 0:
+			# We need to handle this separately, because of multidimensional columns
+			self.rows_ = Table( [ (name, self[name]) for name in retcols ] )
+		else:
+			self.rows_ = Table( [ (name, self[name][in_]) for name in retcols ] )
 
 	def rows(self):
 		return self.rows_
@@ -1340,8 +1344,9 @@ class ColDict:
 		if len(rows) == 0:
 			rows = np.zeros(1, dtype=rows.dtype)
 		rows = rows[idx]
-		for name in rows.dtype.names:
-			rows[name][isnull] = cat.NULL
+		if len(rows):
+			for name in rows.dtype.names:
+				rows[name][isnull] = cat.NULL
 		return rows
 
 	def load_column(self, name, table, catname):
