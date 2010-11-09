@@ -651,6 +651,7 @@ class Catalog:
 		    The input array of refs must be one-dimensional.
 		    The output is a 1D array of blobs, corresponding to the refs.
 		"""
+		##return np.ones(len(refs), dtype=object);
 		assert len(refs.shape) == 1
 
 		ui, _, idx = np.unique(refs, return_index=True, return_inverse=True)
@@ -1198,7 +1199,7 @@ class iarray(np.ndarray):
 			
 			self[ arange(len(self)) , *args]
 
-		   Where any tuple in args will be converted to a
+		   where any tuples in args will be converted to a
 		   corresponding slice, while integers and numpy
 		   arrays will be passed in as-given. Any numpy array
 		   given as index must be of len(self).
@@ -1214,11 +1215,14 @@ class iarray(np.ndarray):
 		   and (x,) converts to [x::]
 		"""
 		# Note: numpy multidimensional indexing is mind numbing...
+		# The stuff below works for 1D arrays, I don't guarantee it for higher dimensions.
 		#       See: http://docs.scipy.org/doc/numpy/reference/arrays.indexing.html#advanced-indexing
-		idx = [(slice(*arg) if len(arg) > 1 else np.s_[arg[0]:]) if isinstance(arg, tuple) else arg for arg in args ]
-		idx = tuple([ np.arange(len(self)) ] + idx)
+		idx = [ (slice(*arg) if len(arg) > 1 else np.s_[arg[0]:]) if isinstance(arg, tuple) else arg for arg in args ]
 
-		return self[idx]
+		firstidx = np.arange(len(self)) if len(self) else np.s_[:]
+		idx = tuple([ firstidx ] + idx)
+
+		return self.__getitem__(idx)
 
 def _fitskw_dumb(hdrs, kw):
 	# Easy way
@@ -1227,6 +1231,45 @@ def _fitskw_dumb(hdrs, kw):
 		hdr = pyfits.Header( txtfile=StringIO(ahdr) )
 		res.append(hdr[kw])
 	return res
+
+def fits_quickparse(header):
+	""" An ultra-simple FITS header parser. Does not support
+	    CONTINUE statements, HIERARCH, or anything of the sort;
+	    just plain vanilla:
+	    	key = value / comment
+	    one-liners. The upshot is that it's fast.
+
+	    Assumes each 80-column line has a '\n' at the end
+	"""
+	res = {}
+	for line in header.split('\n'):
+		at = line.find('=')
+		if at == -1 or at > 8:
+			continue
+
+		# get key
+		key = line[0:at].strip()
+
+		# parse value (string vs number, remove comment)
+		val = line[at+1:].strip()
+		if val[0] == "'":
+			# string
+			val = val[1:val[1:].find("'")]
+		else:
+			# number or T/F
+			at = val.find('/')
+			if at == -1: at = len(val)
+			val = val[0:at].strip()
+			if val.lower() in ['t', 'f']:
+				# T/F
+				val = val.lower() == 't'
+			else:
+				# Number
+				val = float(val)
+				if int(val) == val:
+					val = int(val)
+		res[key] = val
+	return res;
 
 def fitskw(hdrs, kw):
 	""" Intelligently extract a keyword kw from an arbitrarely
@@ -1241,7 +1284,8 @@ def fitskw(hdrs, kw):
 		ident = id(ahdr)
 		if ident not in cache:
 			if ahdr is not None:
-				hdr = pyfits.Header( txtfile=StringIO(ahdr) )
+				#hdr = pyfits.Header( txtfile=StringIO(ahdr) )
+				hdr = fits_quickparse(ahdr)
 				cache[ident] = hdr[kw]
 			else:
 				cache[ident] = None

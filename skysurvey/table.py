@@ -6,7 +6,7 @@ from utils import full_dtype
 def make_record(dtype):
 	# Construct a numpy record corresponding to a row of this table
 	# There has to be a better way to construct a numpy.void of a given dtype, but I couldn't figure it out...
-	tmp = np.empty(1, dtype)
+	tmp = np.zeros(1, dtype)
 	return tmp[0].copy()
 
 class RowIter:
@@ -21,7 +21,8 @@ class RowIter:
 			# Cache some useful data
 			self.column_data = table.column_data
 			self.column_map = table.keys()
-			self.row = table.row.copy()
+#			self.row = table.row.copy()
+			self.row = make_record(table.dtype)
 
 	# Iterator protocol methods
 	def __iter__(self):
@@ -75,7 +76,8 @@ class Table(object):
 		if isinstance(key, slice):
 			return Table(ret)
 		else:
-			row = self.row.copy()
+			#row = self.row.copy()
+			row = make_record(self.dtype)
 			for name, val in ret:
 				# Special care for vector columns
 				if isinstance(val, np.ndarray):
@@ -124,7 +126,7 @@ class Table(object):
 		self.column_data = []
 		for (name, col) in cols:
 			self.add_column(name, col, supress_row_update=True)
-		self._mk_row()
+#		self._mk_row()
 
 	def add_column(self, name, col, supress_row_update=False):
 		# sanity check: require numpy arrays
@@ -138,12 +140,12 @@ class Table(object):
 		self.column_map[pos] = name
 		self.column_data.append(col)
 
-		if not supress_row_update:
-			self._mk_row()
+#		if not supress_row_update:
+#			self._mk_row()
 
-	def _mk_row(self):
-		if self.ncols() != 0:
-			self.row = make_record(self.dtype)
+#	def _mk_row(self):
+#		if self.ncols() != 0:
+#			self.row = make_record(self.dtype)
 
 	def resize(self, size):
 		for (pos, col) in enumerate(self.column_data):
