@@ -1329,7 +1329,7 @@ class ColDict:
 			ra, dec = rows2[raKey], rows2[decKey]
 
 			(x, y) = bhpix.proj_bhealpix(ra, dec)
-			in_ = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool)
+			in_ = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=len(x))
 
 			idx2  = idx2[in_]
 
@@ -1512,9 +1512,17 @@ class ColDict:
 			cat = v['cat']
 			for (table, schema) in cat.tables.iteritems():
 				columns = set(( name for name, _ in schema['columns'] ))
-				if colname in columns:
-					self[name] = self.load_column(colname, table, catname)
-					#print "Loaded column %s.%s.%s for %s (len=%s)" % (catname, table, colname, name, len(self.columns[name]))
+
+				# Special column names
+				colname2 = colname
+				if   colname == '_ID'   and 'primary_key'  in schema: colname2 = schema['primary_key']
+				elif colname == '_LON'  and 'spatial_keys' in schema: colname2 = schema['spatial_keys'][0]
+				elif colname == '_LAT'  and 'spatial_keys' in schema: colname2 = schema['spatial_keys'][1]
+				elif colname == '_TIME' and 'temporal_key' in schema: colname2 = schema['temporal_key']
+
+				if colname2 in columns:
+					self[name] = self.load_column(colname2, table, catname)
+					#print "Loaded column %s.%s.%s for %s (len=%s)" % (catname, table, colname2, name, len(self.columns[name]))
 					return self.columns[name]
 
 		# A name of a catalog? Return a proxy object
@@ -1608,7 +1616,7 @@ def _cache_maker_mapper(rows, margin_x):
 	# all neighbors.
 	(ra, dec) = rows.as_columns()
 	(x, y) = bhpix.proj_bhealpix(ra, dec)
-	in_ = np.fromiter( (not p.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool)
+	in_ = np.fromiter( (not p.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=len(x))
 
 	if not in_.any():
 		return Empty

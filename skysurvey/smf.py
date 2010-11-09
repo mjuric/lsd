@@ -514,3 +514,149 @@ def _exp_store_rows(kv, exp_cat):
 
 	# Return the number of new rows cached into this cell
 	return (cell_id, ncached)
+
+###############
+# object catalog creator
+
+def make_object_catalog(obj_catdir, det_catdir, create):
+	# Entry point for creation of image cache
+	det_cat = catalog.Catalog(det_catdir)
+
+	if create:
+		# Create the new object database
+		obj_cat = create_catalog(obj_catdir, 'ps1_det', obj_cat_def)
+	else:
+		obj_cat = catalog.Catalog(obj_catdir)
+
+	# Set up join relationship and table between the object and detections catalog
+	xmatch_table = 'xmatch_' + det_cat.name
+	cat_from.create_table(xmatch_table, { 'columns': [('obj_id', 'u8'), ('det_id', 'u8'), ('d1', 'f4')] }, ignore_if_exists=True, hidden=True)
+	cat_from.define_join(cat_to, xmatch_table, xmatch_table, 'obj_id', 'det_id')
+
+	# Fetch all non-empty cells with detections. This will be the
+	# list over which the first kernel will map.
+	det_cells = det_cat.get_cells()
+
+	pool = pool2.Pool()
+	for _ in pool.map_reduce_chain(det_cells,
+					      [
+						(_det_coord_gather, det_cat, obj_cat),
+						(_obj_match,        obj_cat),
+					      ]):
+		pass;
+
+# Single-pass detections->objects mapper.
+##def _xmatch_mapper(rows, cat_to, xmatch_radius, join_table):
+def _obj_det_match(obj_cell, obj_cat, det_cat, radius, join_table):
+	# This kernel assumes:
+	#   a) det_cat and obj_cat have equal partitioning (equally sized/enumerated spatial cells)
+	#   b) det_cat cells have neighbor caches
+	#   c) temporal det_cat cells within this spatial cell are stored local to this process
+
+	from scikits.ann import kdtree
+
+	# get a list of detection cells corresponding to this static sky cell
+	det_cells = det_cat.get_t_cells(obj_cell)
+	assert len(det_cells)
+
+	# locate cell center
+	(bounds, tbounds)  = obj_cat.cell_bounds(cell_id)
+	(clon, clat) = bhpix.deproj_bhealpix(*bounds.center())
+
+	# Fetch data and project to tangent plane around the center
+	# of the cell. We assume the cell is small enough for the
+	# distortions not to matter
+
+	# fetch existing catalog data, convert to gnomonic
+	raKey, decKey = obj_cat.get_spatial_keys()
+	idKey         = obj_cat.get_primary_key()
+	objects = obj_cat.query_cell(det_cell, '%s, %s, %s' % (idKey, raKey, decKey), include_cached=True)
+	(id1, ra1, dec1) = objects.as_columns()
+	xy1 = np.column_stack(gnomonic(ra1, dec1, clon, clat))
+
+	# prep detections query (we'll execute it repeatedly)
+	raKey2, decKey2 = det_cat.get_spatial_keys()
+	idKey2          = det_cat.get_primary_key()
+	det_query = '%s, %s, %s' % (idKey2, raKey2, decKey2)
+
+	# prep join table
+	jdtype = np.dtype(cat._get_schema(join_table)['columns'])
+	objKey, detKey, distKey = jdtype.names[0:3]			# Extract column names
+	joins = []
+	newobj = []
+
+	# Loop and xmatch
+	nobj = 0; njoins = 0;
+	for det_cell in det_cells:
+		# fetch detections, convert to gnomonic
+		rows2 = det_cat.query_cell(cell_id, det_query, include_cached=True)
+		id2, ra2, dec2 = rows2.as_columns()
+		xy2 = np.column_stack(gnomonic(ra2, dec2, clon, clat))
+
+		# Construct kD-tree and find the nearest to each object
+		# in this cell
+		tree = kdtree(xy1)
+		match_idx, match_d2 = tree.knn(xy2, 1)
+		del tree
+		match_idx = match_idx[:,0]		# First neighbor only
+
+		dist = gc_dist(ra1[match_idx], dec1[match_idx], ra2, dec2)
+		matched   = dist < radius
+		unmatched = matched == False
+
+		# Extract matches
+		rows = np.empty(len(match_idx), dtype=jdtype)
+		rows[objKey]  = match_idx[matched]
+		rows[detKey]  = id2[matched]
+		rows[distKey] = dist[matched]
+		joins.append(matches[matched])
+		njoins += len(joins[-1])
+
+		# Promote unmatched detections to objects
+		newobj.append((ra2[unmatched], dec2[unmatched]))
+		nobj += len(newobj[-1][0])
+
+		# Append the gnomonic coordinates of new objects
+		xy1 = np.resize(xy1, xy2[unmatched])
+
+	# Coalesce newobj and joins arrays into single tables
+	jrows = np.empty(njoins, dtype=jdtype)
+	at = 0
+	for rows in joins:
+		jrows[at:at+len(rows)] = rows
+		at += len(rows)
+	joins = jrows
+
+	ra  = np.empty(nobj, dtype=ra1.dtype)
+	dec = np.empty_like(ra)
+	at = 0
+	for (ra_, dec_) in newobj:
+		ra [at:at+len(ra_)]  = ra_
+		dec[at:at+len(dec_)] = dec_
+		at += len(ra_)
+	newobj = Table(cols=[(raKey, ra), (decKey, dec)])
+
+	# Drop new objects that fall past cell boundaries. These will
+	# be picked up by processing in their parent cells.
+	(x, y) = bhpix.proj_bhealpix(ra, dec)
+	in_ = np.fromiter( (not p.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=len(x))
+	idx = np.arange(len(in_))[in_]
+	joins  = joins[ np.in1d(joins[objKey], idx) ]
+	newobj = newobj[ in_ ]
+
+	# Append new objects to the object catalog, thus getting the obj_ids.
+	newids = obj_cat.append(newobj)
+
+	# Change the index to obj_id in join table
+	ids = np.append(id1, newids)
+	joins[objKey] = ids[joins[objKey]]
+
+	# Append the join table
+	if len(joins) != 0:
+		# Store the xmatch table
+		#obj_cat._drop_tablet(cell_id, join_table)
+		obj_cat._append_tablet(cell_id, join_table, joins)
+
+		return len(id1), len(id2), len(joins)
+	else:
+		return len(rows), 0, 0
