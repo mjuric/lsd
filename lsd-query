@@ -29,7 +29,7 @@ format = 'text'
 output = 'output.fits'
 for o, a in optlist:
 	if o in ('-b', '--bounds'):
-		foot = eval(a)
+		foot.append(eval(a))
 	if o in ('--format', '-f'):
 		if a not in ['text', 'fits']: usage(); exit(-1);
 		format = a

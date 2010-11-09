@@ -42,6 +42,14 @@ def veclen(x):
 		l[i] = len(x[i])
 	return l
 
+# TODO: should be moved to utils
+def inintervals(times, t):
+	# simple dumb O(n) search, for now
+	for (t0, t1) in times:
+		if t0 < t < t1:
+			return True
+	return False
+
 # Special return type used in _mapper() and Catalog.map_reduce
 # to denote that the returned value should not be yielded to
 # the user
@@ -350,7 +358,7 @@ class Catalog:
 		fp.close()
 
 	## Cell enumeration routines
-	def _get_cells_recursive(self, cells, foot, pix):
+	def _get_cells_recursive(self, cells, foot, times, pix):
 		""" Helper for get_cells(). See documentation of
 		    get_cells() for usage
 		"""
@@ -373,6 +381,11 @@ class Catalog:
 			# parse out the time, construct cell ID
 			(t, fname) = fn.split('/')[-2:]
 			t = self.t0 if t == 'static' else float(t[1:])
+
+			# Cut on time component
+			if len(times) and not inintervals(times, t):
+				continue;
+
 			cell_id = self._id_from_xy(pix[0], pix[1], t, self.level)
 
 			cellBounds = None if(foot.area() == box.area()) else foot
@@ -389,14 +402,14 @@ class Catalog:
 		# Recursively subdivide the four subpixels
 		dx = dx / 2
 		for d in np.array([(0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5), (0.5, -0.5)]):
-			self._get_cells_recursive(cells, foot & box, pix + dx*d)
+			self._get_cells_recursive(cells, foot & box, times, pix + dx*d)
 
-	def get_cells(self, foot = All, return_bounds=False):
+	def get_cells(self, foot=All, return_bounds=False):
 		""" Return a list of (cell_id, footprint) tuples completely
 		    covering the requested footprint.
 		    
 		    The footprint can either be a Polyon, a cell_id integer,
-		    or an array of the two.
+		    a (t0, t1) time tuple, or an array of these.
 		"""
 		# Handle all-sky requests, and scalars
 		if foot == All:
@@ -406,17 +419,26 @@ class Catalog:
 		else:
 			foots = foot
 
-		# Group together all Polygons, exclude inexisting cells
+		# Group together all Polygons, exclude nonexistent cells,
+		# extract time tuples
 		cells = []
 		foot = None
+		times = []
 		for v in foots:
 			if isinstance(v, Polygon.Polygon):
 				if foot is None:
 					foot = v
 				else:
 					foot += v
+			elif isinstance(v, tuple):
+				times.append(v)
 			elif self.tablet_exists(v):
 				cells.append( (v, None) )
+
+		# if no footprint is given, and no explicit cells are
+		# given, assume foot=ALLSKY
+		if len(cells) == 0 and foot == None:
+			foot = footprint.ALLSKY
 
 		# Handle the polygon
 		if foot is not None:
@@ -424,7 +446,7 @@ class Catalog:
 			foot = foot & footprint.ALLSKY
 
 			# Divide and conquer to find the cells covered by footprint
-			self._get_cells_recursive(cells, foot, (0., 0.))
+			self._get_cells_recursive(cells, foot, times, (0., 0.))
 
 		if not return_bounds:
 			return [ cell_id for cell_id, _ in cells ]
