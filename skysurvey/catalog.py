@@ -27,6 +27,7 @@ import utils
 import footprint
 from table import Table
 from utils import astype, gc_dist, unpack_callable, full_dtype, is_scalar_of_type, isiterable
+from StringIO import StringIO
 
 def vecmd5(x):
 	import hashlib
@@ -620,14 +621,18 @@ class Catalog:
 		if table in self.tables: return self.tables[table]
 		return self.hidden_tables[table]
 
-	def _smart_load_blobs(self, barray, indices):
-		""" Load an ndarray of BLOBs from a set of refs indices,
+	def _smart_load_blobs(self, barray, refs):
+		""" Load an ndarray of BLOBs from a set of refs refs,
 		    taking into account not to instantiate duplicate
-		    objects for the same BLOBs
+		    objects for the same BLOBs.
+		    
+		    The input array of refs must be one-dimensional.
+		    The output is a 1D array of blobs, corresponding to the refs.
 		"""
-		ui, _, idx = np.unique(indices, return_index=True, return_inverse=True)
-		idx = idx.reshape(indices.shape)
-		assert (ui >= 0).all()	# Negative indices are illegal. Index 0 means None
+		assert len(refs.shape) == 1
+
+		ui, _, idx = np.unique(refs, return_index=True, return_inverse=True)
+		assert (ui >= 0).all()	# Negative refs are illegal. Index 0 means None
 
 		objlist = barray[ui]
 		if len(ui) == 1 and tables.__version__ == '2.2':
@@ -637,14 +642,18 @@ class Catalog:
 		blobs = np.array(objlist, dtype=np.object_)
 		blobs = blobs[idx]
 
-		#print >> sys.stderr, 'Loaded %d unique objects for %d indices' % (len(objlist), len(idx))
+		#print >> sys.stderr, 'Loaded %d unique objects for %d refs' % (len(objlist), len(idx))
 
 		return blobs
 
-	def fetch_blobs(self, cell_id, table, column, indices, include_cached=False):
+	def fetch_blobs(self, cell_id, table, column, refs, include_cached=False):
 		# short-circuit if there's nothing to be loaded
-		if len(indices) == 0:
-			return np.empty(indices.shape, dtype=np.object_)
+		if len(refs) == 0:
+			return np.empty(refs.shape, dtype=np.object_)
+
+		# Flatten refs; we'll deflatten the blobs in the end
+		shape = refs.shape
+		refs = refs.reshape(refs.size)
 
 		# load the blobs arrays
 		with self.get_cell(cell_id) as cell:
@@ -655,13 +664,15 @@ class Catalog:
 					# from there as well. blob refs of cached objects are
 					# negative.
 					b2 = fp.root.cached.blobs.__getattr__(column)
-					blobs = np.append(
-							self._smart_load_blobs(b1,  indices[indices > 0]),
-							self._smart_load_blobs(b2, -indices[indices < 0])
-						)
-					assert False, 'Test this bit'
+
+					blobs = np.empty(len(refs), dtype=object)
+					blobs[refs >= 0] = self._smart_load_blobs(b1,   refs[refs >= 0]),
+					blobs[ refs < 0] = self._smart_load_blobs(b2,  -refs[ refs < 0]),
+					#assert False, 'Test this bit'
 				else:
-					blobs = self._smart_load_blobs(b1, indices)
+					blobs = self._smart_load_blobs(b1, refs)
+
+		blobs = blobs.reshape(shape)
 		return blobs
 
 	def fetch_tablet(self, cell_id, table=None, include_cached=False):
@@ -1185,7 +1196,39 @@ class iarray(np.ndarray):
 		idx = [(slice(*arg) if len(arg) > 1 else np.s_[arg[0]:]) if isinstance(arg, tuple) else arg for arg in args ]
 		idx = tuple([ np.arange(len(self)) ] + idx)
 
-		return self.__getitem__(idx)
+		return self[idx]
+
+def _fitskw_dumb(hdrs, kw):
+	# Easy way
+	res = []
+	for ahdr in hdrs:
+		hdr = pyfits.Header( txtfile=StringIO(ahdr) )
+		res.append(hdr[kw])
+	return res
+
+def fitskw(hdrs, kw):
+	""" Intelligently extract a keyword kw from an arbitrarely
+	    shaped object ndarray of FITS headers.
+	"""
+	shape = hdrs.shape
+	hdrs = hdrs.reshape(hdrs.size)
+
+	res = []
+	cache = dict()
+	for ahdr in hdrs:
+		ident = id(ahdr)
+		if ident not in cache:
+			if ahdr is not None:
+				hdr = pyfits.Header( txtfile=StringIO(ahdr) )
+				cache[ident] = hdr[kw]
+			else:
+				cache[ident] = None
+		res.append(cache[ident])
+
+	#assert res == _fitskw_dumb(hdrs, kw)
+
+	res = np.array(res).reshape(shape)
+	return res
 
 class ColDict:
 	catalogs = None		# Cache of loaded catalogs and tables
@@ -1378,7 +1421,9 @@ class ColDict:
 		schema = cat._get_schema(table)
 		if 'blobs' in schema and name in schema['blobs']:
 			assert col.dtype == np.int64, "Data structure error: blob reference columns must be of int64 type"
-			col = cat.fetch_blobs(cell_id=self.cell_id, table=table, column=name, indices=col, include_cached=include_cached)
+			refs = col
+			col = cat.fetch_blobs(cell_id=self.cell_id, table=table, column=name, refs=refs, include_cached=include_cached)
+			assert refs.shape == col.shape
 
 		# Return the resolved column
 		return col.view(iarray)

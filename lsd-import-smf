@@ -27,7 +27,7 @@ if len(args) < 3:
 (det_catdir, exp_catdir, files) = args[0], args[1], args[2:]
 
 create = False
-filelist = True
+filelist = False
 for (o, a) in optlist:
 	if o == '-c' or o == '--create':
 		create = True
