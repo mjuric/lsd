@@ -222,6 +222,7 @@ class Catalog:
 					"primary_key": "id",
 					"spatial_keys": ("ra", "dec"),
 					"cached_flag": "cached",
+					"exposure_key": "exp_id",
 					"blobs": dict()
 				}
 			}
@@ -303,6 +304,11 @@ class Catalog:
 
 		# Find the schema of the requested table
 		schema = self._get_schema(table)
+
+		# Create the cell directory if it doesn't exist
+		path = fn[:fn.rfind('/')];
+		if not os.path.exists(path):
+			utils.mkdir_p(path)
 
 		# Create the tablet
 		fp  = tables.openFile(fn, mode='w')
@@ -432,8 +438,9 @@ class Catalog:
 					foot += v
 			elif isinstance(v, tuple):
 				times.append(v)
-			elif self.tablet_exists(v):
-				cells.append( (v, None) )
+			#elif self.tablet_exists(v):
+			else:
+				cells.append( (int(v), None) )
 
 		# if no footprint is given, and no explicit cells are
 		# given, assume foot=ALLSKY
@@ -452,6 +459,21 @@ class Catalog:
 			return [ cell_id for cell_id, _ in cells ]
 		else:
 			return cells
+
+	def group_cells_by_spatial(self, cell_ids):
+		""" Split the array of cell_ids into subarrays,
+		    one per each static sky cell it belongs to
+		"""
+		cell_ids   = np.array(cell_ids)
+
+		x, y, t, _ = self.unpack_id(cell_ids)
+		cell_id_xy = self._id_from_xy(x, y, self.t0, self.level)
+
+		ret = {}
+		for cell_id in set(cell_id_xy):
+			ret[cell_id] = cell_ids[cell_id_xy == cell_id]
+
+		return ret
 
 	### Public methods
 	def __init__(self, path, mode='r', name=None, level=Automatic, t0=Automatic, dt=Automatic):
@@ -485,6 +507,18 @@ class Catalog:
 	def update(self, table, keys, rows):
 		raise Exception('Not implemented')
 
+	def resolve_alias(self, colname):
+		schema = self._get_schema(self.primary_table);
+
+		if colname == '_ID'     and 'primary_key'  in schema: return schema['primary_key']
+		if colname == '_LON'    and 'spatial_keys' in schema: return schema['spatial_keys'][0]
+		if colname == '_LAT'    and 'spatial_keys' in schema: return schema['spatial_keys'][1]
+		if colname == '_TIME'   and 'temporal_key' in schema: return schema['temporal_key']
+		if colname == '_EXP'    and 'exposure_key' in schema: return schema['exposure_key']
+		if colname == '_CACHED' and 'cached_flag'  in schema: return schema['cached_flag']
+
+		return colname
+
 	def append(self, cols):
 		""" Insert a set of rows into a table in the database. Protects against
 		    multiple writers simultaneously inserting into the same file.
@@ -502,6 +536,9 @@ class Catalog:
 		for _, col in cols.iteritems():
 			if n is None: n = len(col)
 			assert n == len(col), 'n=%d len(col)=%d' % (n, len(col))
+
+		# Resolve aliases
+		cols = dict(( (self.resolve_alias(name), col) for name, col in cols.iteritems()  ))
 
 		# Locate cells into which we're going to store the results
 		schema = self._get_schema(self.primary_table)
@@ -717,18 +754,18 @@ class Catalog:
 
 		return rows
 
-	def query_cell(self, cell_id, query='*'):
+	def query_cell(self, cell_id, query='*', include_cached=False):
 		""" Execute a query on a local cell.
 		"""
 		assert self.is_cell_local(cell_id)
 
-		return self.fetch(query, cell_id, progress_callback=pool2.progress_pass);
+		return self.fetch(query, cell_id, include_cached=include_cached, progress_callback=pool2.progress_pass);
 
 	def fetch(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None):
 		""" Return a table (numpy structured array) of all rows within a
 		    given footprint. Calls 'filter' callable (if given) to filter
-		    the returned rows.
-		    
+		    the returned rows. Returns None if there are no rows to return.
+
 		    The 'filter' callable should expect a single argument, rows,
 		    being the set of rows (numpy structured array) to filter. It
 		    must return the set of filtered rows (also as numpy structured
@@ -749,7 +786,7 @@ class Catalog:
 		filter, filter_args = unpack_callable(filter)
 
 		ret = None
-		for rows in self.map_reduce(query=query, mapper=(_iterate_mapper, filter, filter_args), foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
+		for rows in self.map_reduce(query=query, mapper=(_iterate_mapper, filter, filter_args), _pass_empty=True, foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
 			# ensure enough memory has been allocated (and do it
 			# intelligently if not)
 			if ret is None:
@@ -787,7 +824,7 @@ class Catalog:
 				for row in rows:
 					yield row
 
-	def map_reduce(self, query, mapper, reducer=None, foot=All, testbounds=True, include_cached=False, nworkers=None, progress_callback=None):
+	def map_reduce(self, query, mapper, reducer=None, foot=All, testbounds=True, include_cached=False, nworkers=None, progress_callback=None, _pass_empty=False):
 		""" A MapReduce implementation, where rows from individual cells
 		    get mapped by the mapper, with the result reduced by the reducer.
 		    
@@ -826,7 +863,7 @@ class Catalog:
 		if reducer is None:
 			for result in pool.imap_unordered(
 					partspecs, _mapper,
-					mapper_args = (mapper, self, query, include_cached, mapper_args),
+					mapper_args = (mapper, self, query, include_cached, mapper_args, _pass_empty),
 					progress_callback = progress_callback):
 
 				if type(result) != type(Empty):
@@ -834,7 +871,7 @@ class Catalog:
 		else:
 			for result in pool.imap_reduce(
 					partspecs, _mapper, _reducer,
-					mapper_args  = (mapper, self, query, include_cached, mapper_args),
+					mapper_args  = (mapper, self, query, include_cached, mapper_args, _pass_empty),
 					reducer_args = (reducer, self, reducer_args),
 					progress_callback = progress_callback):
 				yield result
@@ -877,15 +914,8 @@ class Catalog:
 			self._unlock_cell(lockfile)
 
 	def neighboring_cells(self, cell_id, include_self=False):
-		""" Returns the cell IDs for cells neighboring
-		    the requested one both in space and time.
-		    
-		    If the cell_id is for static sky (i.e., it's time
-		    bits are all zero), we return no temporal neighbors
-		    (as this would be an infinite set).
-		    
-		    We do not check if the returned neighbor cells 
-		    actually have any objects (exist).
+		""" Returns the cell IDs of cells spatially adjacent 
+		    to cell_id.
 		"""
 		x, y, t, _ = self.unpack_id(cell_id, self.level)
 
@@ -900,12 +930,6 @@ class Catalog:
 		# TODO: Remove once we're confident it works
 		rrr = set([ self.unpack_id(cid, self.level)[0:2] for cid in nhood ])
 		assert rrr == ncells
-
-
-		# Add the time component unless this is a static-sky catalog
-		if t != self.t0:
-			nhood += [ self._id_from_xy(x, y, t + self.dt, self.level) for (x, y) in ncells ]
-			nhood += [ self._id_from_xy(x, y, t - self.dt, self.level) for (x, y) in ncells ]
 
 		return nhood
 
@@ -1510,18 +1534,11 @@ class ColDict:
 			cats = { catname: self.catalogs[catname] }
 		for (catname, v) in cats.iteritems():
 			cat = v['cat']
+			colname = cat.resolve_alias(colname)
 			for (table, schema) in cat.tables.iteritems():
 				columns = set(( name for name, _ in schema['columns'] ))
-
-				# Special column names
-				colname2 = colname
-				if   colname == '_ID'   and 'primary_key'  in schema: colname2 = schema['primary_key']
-				elif colname == '_LON'  and 'spatial_keys' in schema: colname2 = schema['spatial_keys'][0]
-				elif colname == '_LAT'  and 'spatial_keys' in schema: colname2 = schema['spatial_keys'][1]
-				elif colname == '_TIME' and 'temporal_key' in schema: colname2 = schema['temporal_key']
-
-				if colname2 in columns:
-					self[name] = self.load_column(colname2, table, catname)
+				if colname in columns:
+					self[name] = self.load_column(colname, table, catname)
 					#print "Loaded column %s.%s.%s for %s (len=%s)" % (catname, table, colname2, name, len(self.columns[name]))
 					return self.columns[name]
 
@@ -1550,7 +1567,7 @@ class CatProxy:
 	def __getattr__(self, name):
 		return self.coldict[self.prefix + '.' + name]
 
-def _mapper(partspec, mapper, cat, query, include_cached, mapper_args):
+def _mapper(partspec, mapper, cat, query, include_cached, mapper_args, _pass_empty=False):
 	(cell_id, bounds) = partspec
 
 	# pass on some of the internals to the mapper
@@ -1562,7 +1579,7 @@ def _mapper(partspec, mapper, cat, query, include_cached, mapper_args):
 	rows = ColDict(query, cat, cell_id, bounds, include_cached).rows()
 
 	# Pass on to mapper, unless empty
-	if len(rows) != 0:
+	if len(rows) != 0 or _pass_empty:
 		result = mapper(rows, *mapper_args)
 	else:
 		# Catalog.map_reduce will not pass this back to the user (or to reduce)

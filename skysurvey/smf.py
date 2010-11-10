@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import catalog
 import pyfits
 import pool2
@@ -7,6 +9,10 @@ from slalib import sla_eqgal
 from itertools import imap, izip
 import copy
 import itertools as it
+import bhpix
+from utils import gnomonic, gc_dist
+import table
+import sys, os
 
 # ra, dec, g, r, i, exposure.mjd_obs, chip.T XMATCH chip, exposure
 # ra, dec, g, r, i, hdr.ctype1 XMATCH exposure
@@ -32,6 +38,7 @@ exp_cat_def = \
 			('cached',		'bool',	''	  ,	'Set to True if this is a row cached from a different cell'),
 		],
 		'primary_key' : 'exp_id',
+		'exposure_key': 'exp_id',
 		'temporal_key': 'mjd_obs',
 		'spatial_keys': ('ra', 'dec'),
 		"cached_flag" : "cached"
@@ -114,6 +121,7 @@ det_cat_def = \
 			('cached',		'bool', '',		''),
 		],
 		'primary_key': 'det_id',
+		'exposure_key': 'exp_id',
 		'temporal_key': 'mjd_obs',
 		'spatial_keys': ('ra', 'dec'),
 		"cached_flag": "cached"
@@ -181,6 +189,24 @@ det_cat_def = \
 			('kron_flux_outer',	'f4', 'kron_flux_outer',	''),
 		],
 	}
+}
+
+obj_cat_def = \
+{
+	#
+	#	 LSD column name      Type    FITS column      Description
+	#
+	'astrometry': {
+		'columns': [
+			('obj_id',		'u8', '',		'Unique LSD ID of this object'),
+			('ra',			'f8', 'ra_psf',		''),
+			('dec',			'f8', 'dec_psf',	''),
+			('cached',		'bool', '',		''),
+		],
+		'primary_key': 'obj_id',
+		'spatial_keys': ('ra', 'dec'),
+		"cached_flag": "cached"
+	},
 }
 
 def to_dtype(cols):
@@ -518,9 +544,16 @@ def _exp_store_rows(kv, exp_cat):
 ###############
 # object catalog creator
 
-def make_object_catalog(obj_catdir, det_catdir, create):
+def make_object_catalog(obj_catdir, det_catdir, radius=1./3600., create=True):
 	# Entry point for creation of image cache
 	det_cat = catalog.Catalog(det_catdir)
+
+	# For debugging -- a simple check to see if matching works is to rerun
+	# the match across a just matched catalog. In this case, we expect
+	# all detections to be matched to existing objects, and no new ones added.
+	_rematching = int(os.getenv('REMATCHING', False))
+	if _rematching:
+		create = False
 
 	if create:
 		# Create the new object database
@@ -529,134 +562,261 @@ def make_object_catalog(obj_catdir, det_catdir, create):
 		obj_cat = catalog.Catalog(obj_catdir)
 
 	# Set up join relationship and table between the object and detections catalog
-	xmatch_table = 'xmatch_' + det_cat.name
-	cat_from.create_table(xmatch_table, { 'columns': [('obj_id', 'u8'), ('det_id', 'u8'), ('d1', 'f4')] }, ignore_if_exists=True, hidden=True)
-	cat_from.define_join(cat_to, xmatch_table, xmatch_table, 'obj_id', 'det_id')
+	join_table = 'join:' + det_cat.name
+	obj_cat.create_table(join_table, { 'columns': [('obj_id', 'u8'), ('det_id', 'u8'), ('d1', 'f4')] }, ignore_if_exists=True, hidden=True)
+	obj_cat.define_join(det_cat, join_table, join_table, 'obj_id', 'det_id')
 
-	# Fetch all non-empty cells with detections. This will be the
-	# list over which the first kernel will map.
-	det_cells = det_cat.get_cells()
+	# Fetch all non-empty cells with detections. Group them by the same spatial
+	# cell ID. This will be the list over which the first kernel will map.
+	det_cells = det_cat.group_cells_by_spatial(det_cat.get_cells()).items()
 
+	t0 = time.time()
 	pool = pool2.Pool()
-	for _ in pool.map_reduce_chain(det_cells,
+	ntot = 0
+	ntotobj = 0
+	at = 0
+	for result in pool.map_reduce_chain(det_cells,
 					      [
-						(_det_coord_gather, det_cat, obj_cat),
-						(_obj_match,        obj_cat),
-					      ]):
-		pass;
+						(_obj_det_match, obj_cat, det_cat, radius, join_table, _rematching),
+					      ],
+					      progress_callback=pool2.progress_pass):
+		at += 1
+		t1 = time.time()
+		time_pass = (t1 - t0) / 60
+		time_tot = time_pass / at * len(det_cells)
+		for (nexp, nobj, ndet, nnew, nmatch, ndetnc) in result:
+			ntot += nmatch
+			ntotobj += nnew
+			nobjnew = nobj + nnew
+			pctnew   = 100. * nnew / nobjnew  if nobjnew else 0.
+			pctmatch = 100. * nmatch / ndetnc if ndetnc else 0.
+			print "  match %7d det to %7d obj (%3d exps): %7d new (%6.2f%%), %7d matched (%6.2f%%)  [%.0f/%.0f min.]" % (ndet, nobj, nexp, nnew, pctnew, nmatch, pctmatch, time_pass, time_tot)
+			assert not _rematching or nmatch >= ndetnc
+
+	print >> sys.stderr, "Building neighbor cache for static sky: ",
+	obj_cat.build_neighbor_cache()
+
+	# Compute summary stats for both catalogs
+	print >> sys.stderr, "Computing summary statistics for static sky: ",
+	obj_cat.compute_summary_stats()
+
+	print "Matched a total of %d sources." % (ntot)
+	print "Total of %d objects added." % (ntotobj)
+	print "Objects in the object catalog: %d." % (obj_cat.nrows())
+	print "Objects in the detection catalog: %d." % (det_cat.nrows())
+	assert not _rematching or det_cat.nrows() == ntot
+
+def reserve_space(arr, minsize):
+	l = len(arr)
+	if l == 0: l = l + 1
+	while l < minsize:
+		l = 2*l
+	arr.resize(l, refcheck=False)
 
 # Single-pass detections->objects mapper.
-##def _xmatch_mapper(rows, cat_to, xmatch_radius, join_table):
-def _obj_det_match(obj_cell, obj_cat, det_cat, radius, join_table):
-	# This kernel assumes:
-	#   a) det_cat and obj_cat have equal partitioning (equally sized/enumerated spatial cells)
-	#   b) det_cat cells have neighbor caches
-	#   c) temporal det_cat cells within this spatial cell are stored local to this process
+def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=False):
+	"""
+	This kernel assumes:
+	   a) det_cat and obj_cat have equal partitioning (equally sized/enumerated spatial cells)
+	   b) both det_cat and obj_cat have up-to-date neighbor caches
+	   c) temporal det_cat cells within this spatial cell are stored local to this process (relevant for shared-nothing setups)
+	   d) exposures don't stretch across temporal cells
+
+	Algorithm:
+	   - fetch all existing static sky objects, including the cached ones (*)
+	   - project them to tangent plane around the center of the cell
+	     (we assume the cell is small enough for the distortions not to matter)
+	   - construct a kD tree in (x, y) tangent space
+	   - for each temporal cell:
+	   	1.) Fetch the detections, including the cached ones (+)
+	   	2.) Project to tangent plane
+
+	   	3.) for each exposure:
+		    a.) Match agains the kD tree of objects
+		    b.) Add those that didn't match to the list of objects 
+
+		4.) For newly added objects: store to disk only those that
+		    fall within this cell (the others will be matched and
+		    stored in their parent cells)
+
+		5.) For matched detections: Drop detections matched to cached
+		    objects (these will be matched and stored in the objects'
+		    parent cell). Store the rest.
+
+
+	   (+) It is allowed (and necessary to allow) for a cached detection
+		    to be matched against an object within our cell.  This
+		    correctly matches cases when the object is right inside
+		    the cell boundary, but the detection is just to the
+		    outside.
+	   (*) Cached objects must be loaded and matched against to guard against
+	       the case where an object is just outside the edge, while a detection
+	       is just inside. If the cached object was not loaded, the detection
+	       would not match and be proclamed to be a new object. However, in the
+	       cached object's parent cell, the detection would match to the object
+	       and be stored there as well.
+	       
+	       The algorithm above ensures that such a detection will matched to
+	       the cached object in this cell (and be dropped in step 5), preventing
+	       it from being promoted into a new object.
+
+	   TODO: The above algorithm ensures no detection is assigned to more than
+	   	one object. Implement a consistency check to verify that.
+	"""
 
 	from scikits.ann import kdtree
 
-	# get a list of detection cells corresponding to this static sky cell
-	det_cells = det_cat.get_t_cells(obj_cell)
+	# Input is a tuple of obj_cell, and det_cells falling under that obj_cell
+	obj_cell, det_cells = cells
+	det_cells.sort()
 	assert len(det_cells)
 
-	# locate cell center
-	(bounds, tbounds)  = obj_cat.cell_bounds(cell_id)
+	## Debugging: verify temporal cells all fall into the same static sky cell
+	x, y, t, _ = det_cat.unpack_id(det_cells)
+	assert (x == x[0]).all()
+	assert (y == y[0]).all()
+	assert (len(np.unique(t)) == len(t))
+	######
+
+	# locate cell center (for gnomonic projection)
+	(bounds, tbounds)  = obj_cat.cell_bounds(obj_cell)
 	(clon, clat) = bhpix.deproj_bhealpix(*bounds.center())
 
-	# Fetch data and project to tangent plane around the center
-	# of the cell. We assume the cell is small enough for the
-	# distortions not to matter
+	# fetch existing static sky, convert to gnomonic
+	objs  = obj_cat.query_cell(obj_cell, '_ID, _LON, _LAT', include_cached=True)
+	xyobj = np.column_stack(gnomonic(objs['_LON'], objs['_LAT'], clon, clat))
+	nobj = len(objs)	# Total number of static sky objects
 
-	# fetch existing catalog data, convert to gnomonic
-	raKey, decKey = obj_cat.get_spatial_keys()
-	idKey         = obj_cat.get_primary_key()
-	objects = obj_cat.query_cell(det_cell, '%s, %s, %s' % (idKey, raKey, decKey), include_cached=True)
-	(id1, ra1, dec1) = objects.as_columns()
-	xy1 = np.column_stack(gnomonic(ra1, dec1, clon, clat))
-
-	# prep detections query (we'll execute it repeatedly)
-	raKey2, decKey2 = det_cat.get_spatial_keys()
-	idKey2          = det_cat.get_primary_key()
-	det_query = '%s, %s, %s' % (idKey2, raKey2, decKey2)
-
-	# prep join table
-	jdtype = np.dtype(cat._get_schema(join_table)['columns'])
+	# get join table metadata
+	jdtype = np.dtype(obj_cat._get_schema(join_table)['columns'])
 	objKey, detKey, distKey = jdtype.names[0:3]			# Extract column names
-	joins = []
-	newobj = []
 
-	# Loop and xmatch
-	nobj = 0; njoins = 0;
+	# for sanity checks/debugging (see below)
+	expseen = set()
+
+	# Loop, xmatch, and store
+	ret = []
+	assert (np.unique(sorted(det_cells)) == sorted(det_cells)).all()
+	##print "Det cells: ", det_cells
 	for det_cell in det_cells:
-		# fetch detections, convert to gnomonic
-		rows2 = det_cat.query_cell(cell_id, det_query, include_cached=True)
-		id2, ra2, dec2 = rows2.as_columns()
-		xy2 = np.column_stack(gnomonic(ra2, dec2, clon, clat))
+		# fetch detections in this cell, convert to gnomonic coordinates
+		detections = det_cat.query_cell(det_cell, '_ID, _LON, _LAT, _EXP, _CACHED', include_cached=True)
+		_, ra2, dec2, exposures, cached = detections.as_columns()
+		detections.add_column('xy', np.column_stack(gnomonic(ra2, dec2, clon, clat)))
 
-		# Construct kD-tree and find the nearest to each object
-		# in this cell
-		tree = kdtree(xy1)
-		match_idx, match_d2 = tree.knn(xy2, 1)
-		del tree
-		match_idx = match_idx[:,0]		# First neighbor only
+		# if there are no preexisting static sky objects, and all detections in this cell are cached,
+		# there's no way we'll get a match that will be kept in the end. Just continue to the
+		# next one if this is the case.
+		cachedonly = len(objs) == 0 and cached.all()
+		if cachedonly:
+			##print "Skipping cached-only"
+			continue;
 
-		dist = gc_dist(ra1[match_idx], dec1[match_idx], ra2, dec2)
-		matched   = dist < radius
-		unmatched = matched == False
+		# prep join table
+		join  = np.empty(0, dtype=jdtype)
+		njoin = 0;
+		nobj0 = nobj;
 
-		# Extract matches
-		rows = np.empty(len(match_idx), dtype=jdtype)
-		rows[objKey]  = match_idx[matched]
-		rows[detKey]  = id2[matched]
-		rows[distKey] = dist[matched]
-		joins.append(matches[matched])
-		njoins += len(joins[-1])
+		##print "Cell", det_cell, " - Unique exposures: ", set(exposures)
 
-		# Promote unmatched detections to objects
-		newobj.append((ra2[unmatched], dec2[unmatched]))
-		nobj += len(newobj[-1][0])
+		# Process detections exposure-by-exposure, as detections from
+		# different exposures within a same temporal cell are allowed
+		# to belong to the same object
+		uexposures = set(exposures)
+		for exposure in uexposures:
+			# Sanity check: a consistent catalog cannot have two
+			# exposures stretching over more than one cell
+			assert exposure not in expseen
+			expseen.add(exposure);
 
-		# Append the gnomonic coordinates of new objects
-		xy1 = np.resize(xy1, xy2[unmatched])
+			# Extract objects belonging to this exposure only
+			detections2 = detections[exposures == exposure]
+			id2, ra2, dec2, _, _, xydet = detections2.as_columns()
 
-	# Coalesce newobj and joins arrays into single tables
-	jrows = np.empty(njoins, dtype=jdtype)
-	at = 0
-	for rows in joins:
-		jrows[at:at+len(rows)] = rows
-		at += len(rows)
-	joins = jrows
+			if len(xyobj) != 0:
+				# Construct kD-tree and find the object nearest to each
+				# detection from this cell
+				tree = kdtree(xyobj)
+				match_idx, match_d2 = tree.knn(xydet, 1)
+				del tree
+				match_idx = match_idx[:,0]		# First neighbor only
 
-	ra  = np.empty(nobj, dtype=ra1.dtype)
-	dec = np.empty_like(ra)
-	at = 0
-	for (ra_, dec_) in newobj:
-		ra [at:at+len(ra_)]  = ra_
-		dec[at:at+len(dec_)] = dec_
-		at += len(ra_)
-	newobj = Table(cols=[(raKey, ra), (decKey, dec)])
+				# Compute accurate distances, and accept/reject matches
+				dist = gc_dist(objs['_LON'][match_idx], objs['_LAT'][match_idx], ra2, dec2)
+				matched   = dist < radius
+				unmatched = matched == False
+				nmatched   = matched.sum()
+				nunmatched = len(matched) - nmatched
 
-	# Drop new objects that fall past cell boundaries. These will
-	# be picked up by processing in their parent cells.
-	(x, y) = bhpix.proj_bhealpix(ra, dec)
-	in_ = np.fromiter( (not p.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=len(x))
-	idx = np.arange(len(in_))[in_]
-	joins  = joins[ np.in1d(joins[objKey], idx) ]
-	newobj = newobj[ in_ ]
+				# Extract matches and store them to joins array
+				reserve_space(join, njoin + nmatched)
+				join[objKey][njoin:njoin+nmatched]  = match_idx[matched]
+				join[detKey][njoin:njoin+nmatched]  =       id2[matched]
+				join[distKey][njoin:njoin+nmatched] =      dist[matched]
+				njoin += nmatched
+			else:
+				# All detections are new objects
+				unmatched = np.ones(len(xydet), dtype=bool)
+				nmatched  = 0
+				nunmatched = len(xydet)
 
-	# Append new objects to the object catalog, thus getting the obj_ids.
-	newids = obj_cat.append(newobj)
+			x, y, t, _ = det_cat.unpack_id(det_cell)
+			##print "DC %s, MJD%s, Exposure %s: %d detections, %d objects, %d matched, %d unmatched" % (det_cell, t, exposure, len(detections2), nobj, nmatched, nunmatched)
 
-	# Change the index to obj_id in join table
-	ids = np.append(id1, newids)
-	joins[objKey] = ids[joins[objKey]]
+			# Promote unmatched detections to objects
+			_, newra, newdec, _, _, newxy = detections2[unmatched].as_columns()
 
-	# Append the join table
-	if len(joins) != 0:
-		# Store the xmatch table
-		#obj_cat._drop_tablet(cell_id, join_table)
-		obj_cat._append_tablet(cell_id, join_table, joins)
+			reserve_space(objs, nobj+nunmatched)
+			objs['_LON'][nobj:nobj+nunmatched] = newra
+			objs['_LAT'][nobj:nobj+nunmatched] = newdec
+			nobj  += nunmatched
 
-		return len(id1), len(id2), len(joins)
-	else:
-		return len(rows), 0, 0
+			xyobj  = np.append(xyobj, newxy, axis=0)
+
+		# Truncate output tables to their actual number of elements
+		objs = objs[0:nobj]
+		join = join[0:njoin]
+		assert len(objs) >= nobj0
+
+		# Find the objects that fall outside of cell boundaries. These will
+		# be processed and stored by their parent cells. Also leave out the objects
+		# that are already stored in the database
+		(x, y) = bhpix.proj_bhealpix(objs['_LON'], objs['_LAT'])
+		in_    = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=nobj)	# Objects in cell selector
+		innew  = in_.copy();
+		innew[:nobj0] = False											# New objects in cell selector
+
+		ids = objs['_ID']
+		nobjadded = innew.sum()
+		if nobjadded:
+			# Append the new objects to the object catalog, obtaining their IDs.
+			##print len(ids), ids
+			assert not _rematching
+			ids[innew] = obj_cat.append(objs[('_LON', '_LAT')][innew])
+			##print len(ids), ids
+
+		# Change the relative index to true obj_id in the join table
+		join[objKey] = ids[join[objKey]]
+
+		# Keep only the joins to objects inside the cell
+		join = join[ np.in1d(join[objKey], ids[in_]) ]
+
+		# Append to the join table, in *dec_cell* of obj_cat (!important!)
+		if len(join) != 0:
+			# Store the xmatch table
+			#obj_cat._drop_tablet(obj_cell, join_table)
+			obj_cat._append_tablet(det_cell, join_table, join)
+
+		assert not cachedonly or (nobjadded == 0 and len(join) == 0)
+		# return: Number of exposures, number of objects before processing this cell, number of detections processed (incl. cached),
+		#         number of newly added objects, number of detections xmatched, number of detection processed that weren't cached
+		# Note: some of the xmatches may be to newly added objects (e.g., if there are two 
+		#       overlapping exposures within a cell; first one will add new objects, second one will match agains them)
+		ret.append( (len(uexposures), nobj0, len(detections), nobjadded, len(join), (cached == False).sum()) )
+
+		##print 'XXX:', len(join), ids, objs['_ID']
+
+	return ret
+
+if __name__ == '__main__':
+	make_object_catalog('ps1_obj', 'ps1_det')

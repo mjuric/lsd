@@ -71,9 +71,9 @@ class Table(object):
 		# Compute the slice
 		ret = [ (self.column_map[pos], col[key])   for (pos, col) in enumerate(self.column_data) ]
 
-		# Return a Table if the key was an instance of a slice,
-		# or numpy.void structure otherwise
-		if isinstance(key, slice):
+		# Return a Table if the key was an instance of a slice or ndarray,
+		# and numpy.void structure otherwise
+		if isinstance(key, slice) or isinstance(key, np.ndarray):
 			return Table(ret)
 		else:
 			#row = self.row.copy()
@@ -121,11 +121,19 @@ class Table(object):
 		# Return the dtype this column set would have if it was a numpy structured array
 		return np.dtype([ (self.column_map[pos], full_dtype(col)) for (pos, col) in enumerate(self.column_data) ])
 
-	def __init__(self, cols=[]):
+	def __init__(self, cols=[], dtype=None):
 		self.column_map = dict()
 		self.column_data = []
+
+		if dtype is not None:
+			# construct cols from structured array dtype
+			assert cols is None or len(cols) == 0
+			template = np.empty(0, dtype=dtype)
+			cols = [ (name, template[name]) for name in template.dtype.names ]
+
 		for (name, col) in cols:
 			self.add_column(name, col, supress_row_update=True)
+
 #		self._mk_row()
 
 	def add_column(self, name, col, supress_row_update=False):
@@ -147,7 +155,7 @@ class Table(object):
 #		if self.ncols() != 0:
 #			self.row = make_record(self.dtype)
 
-	def resize(self, size):
+	def resize(self, size, refcheck=True):
 		for (pos, col) in enumerate(self.column_data):
 			self.column_data[pos] = np.resize(self.column_data[pos], size)
 
@@ -205,6 +213,9 @@ class Table(object):
 
 	def as_columns(self):
 		return iter(self.column_data)
+	
+	def column_at(self, idx):
+		return self.column_data[idx]
 
 	def as_ndarray(self):
 		rows = np.empty(self.nrows(), dtype=self.dtype)

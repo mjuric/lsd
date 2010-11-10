@@ -10,7 +10,7 @@ from skysurvey.utils import make_printf_string, as_tuple
 import pyfits
 
 def usage():
-	print "Usage: %s --bounds=[All] --resolution=[2arcmin] --query=['ra, dec'] <catalog> <output.fits>" % sys.argv[0]
+	print "Usage: %s --bounds=[All] --resolution=[2arcmin] --query=['_LON, _LAT'] <catalog> <output.fits>" % sys.argv[0]
 
 try:
 	optlist, args = getopt.getopt(sys.argv[1:], 'b:r:q:', ['bounds=', 'resolution=', 'query='])
@@ -26,7 +26,7 @@ if len(args) != 2:
 
 foot = []
 output = 'footprint.fits'
-query = 'ra, dec'
+query = '_LON, _LAT'
 dx = 2.
 for o, a in optlist:
 	if o in ('-b', '--bounds'):
