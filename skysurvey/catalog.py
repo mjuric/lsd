@@ -737,8 +737,14 @@ class Catalog:
 		if len(ui) == 1 and tables.__version__ == '2.2':
 			# bug workaround -- PyTables 2.2 returns a scalar for length-1 arrays
 			objlist = [ objlist ]
-		
-		blobs = np.array(objlist, dtype=np.object_)
+
+		# Note: using np.empty followed by [:] = ... (as opposed to
+		#       np.array) ensures a 1D array will be created, even
+		#       if objlist[0] is an array (in which case np.array
+		#       misinterprets it as a request to create a 2D numpy
+		#       array)
+		blobs    = np.empty(len(objlist), dtype=object)
+		blobs[:] = objlist
 		blobs = blobs[idx]
 
 		#print >> sys.stderr, 'Loaded %d unique objects for %d refs' % (len(objlist), len(idx))
