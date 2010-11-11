@@ -475,9 +475,9 @@ class Catalog:
 		if len(cells) == 0 and foot == None:
 			foot = footprint.ALLSKY
 
-		if len(tables) == 0:
-			tables = [ self.primary_table ]
-			###tables = [ self.primary_table, 'join:ps1_det' ]
+		# ensure the primary table is always searched for
+		tables = set(tables)
+		tables.add(self.primary_table)
 
 		# Handle the polygon
 		if foot is not None:
@@ -938,8 +938,13 @@ class Catalog:
 		reducer, reducer_args = unpack_callable(reducer)
 
 		# Parse the query to obtain a list of catalogs we're going to be JOINing against
+		# Then construct a list of join tables that get_cells() will look for
 		(select_clause, where_clause, join_clause) = qp.parse(query, TableColsProxy(self))
-		tables = [ 'join:' + catname for catname, _ in join_clause if catname != self.name ]
+		tables = set()
+		for catname, _ in join_clause:
+			if catname == self.name: continue
+			v = self.joined_catalogs[catname]
+			tables.update((v['table_from'], v['table_to']))
 
 		# slice up the job down to individual cells
 		partspecs = self.get_cells(foot, return_bounds=True, tables=tables)
