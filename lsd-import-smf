@@ -10,10 +10,10 @@ import skysurvey as lsd
 from   skysurvey.utils import *
 
 def usage():
-	print "Usage: %s [-c|--create] [-f|--file-list] <det_cat_dir> <exp_cat_dir> <smf_file(s)>" % sys.argv[0]
+	print "Usage: %s [-c|--create] [-f|--file-list] [-m|--mode] [-o|--offset] [-s|--stride] <det_cat_dir> <exp_cat_dir> <smf_file(s)>" % sys.argv[0]
 
 try:
-	optlist, args = getopt.getopt(sys.argv[1:], 'cf', ['create', 'file-list'])
+	optlist, args = getopt.getopt(sys.argv[1:], 'cfm:s:o:', ['create', 'file-list', 'mode=', 'stride=', 'offset='])
 except getopt.GetoptError, err:
 	print str(err)
 	usage()
@@ -28,44 +28,59 @@ if len(args) < 3:
 
 create = False
 filelist = False
+mode = None
+stride = 1
+offset = 0
 for (o, a) in optlist:
 	if o == '-c' or o == '--create':
 		create = True
 	if o == '-f' or o == '--file-list':
 		filelist = True
+	if o == '-m' or o == '--mode':
+		mode = str(a)
+	if o == '-s' or o == '--stride':
+		stride = int(a)
+	if o == '-o' or o == '--offset':
+		offset = int(a)
 
 if filelist:
-	files = open(files[0]).readlines()
+	files = open(files[0]).read().splitlines()
+
+files = files[offset::stride]
 
 #
 # Actual work
 #
 
 # SMF file import
-print >> sys.stderr, "Importing SMF files:"
-smf.import_from_smf(det_catdir, exp_catdir, files, create)
-print >> sys.stderr, "done."
+if not mode or mode == 'import':
+	print >> sys.stderr, "Importing SMF files:"
+	smf.import_from_smf(det_catdir, exp_catdir, files, create)
+	print >> sys.stderr, "done."
 
-# Build neighbor caches for images tables
-print >> sys.stderr, "Building neighbor cache (exposures): ",
-smf.make_image_cache(det_catdir, exp_catdir)
+if not mode or mode == 'postprocess':
+	# Build neighbor caches for images tables
+	print >> sys.stderr, "Building neighbor cache (exposures): ",
+	smf.make_image_cache(det_catdir, exp_catdir)
 
-# Sanity check: all queries linking to images must resolve within cell
-print >> sys.stderr, "Consistency check: ",
-det_cat = lsd.Catalog(det_catdir)
-for row in det_cat.iterate('det_id, ra, dec, exp_id, equinox JOIN ps1_exp(outer) WHERE equinox == 0'):
-	raise Exception("Inconsistency detected: (det_id, ra, dec, exp_id, equinox) = " + str(row))
+	# Sanity check: all queries linking to images must resolve within cell
+	print >> sys.stderr, "Consistency check: ",
+	det_cat = lsd.Catalog(det_catdir)
+	for row in det_cat.iterate('det_id, ra, dec, exp_id, equinox JOIN ps1_exp(outer) WHERE equinox == 0'):
+		raise Exception("Inconsistency detected: (det_id, ra, dec, exp_id, equinox) = " + str(row))
 
-# Build neighbor caches for detections
-print >> sys.stderr, "Building neighbor cache (detections): ",
-det_cat.build_neighbor_cache()
+	# Build neighbor caches for detections
+	print >> sys.stderr, "Building neighbor cache (detections): ",
+	det_cat.build_neighbor_cache()
 
-# Compute summary stats for both catalogs
-print >> sys.stderr, "Computing summary statistics (detections): ",
-det_cat.compute_summary_stats()
-exp_cat = lsd.Catalog(exp_catdir)
-print >> sys.stderr, "Computing summary statistics (exposures): ",
-exp_cat.compute_summary_stats()
+	# Compute summary stats for both catalogs
+	print >> sys.stderr, "Computing summary statistics (detections): ",
+	det_cat.compute_summary_stats()
+	exp_cat = lsd.Catalog(exp_catdir)
+	print >> sys.stderr, "Computing summary statistics (exposures): ",
+	exp_cat.compute_summary_stats()
 
 # Done
+det_cat = lsd.Catalog(det_catdir)
+exp_cat = lsd.Catalog(exp_catdir)
 print "Import done.", det_cat.nrows(), "detections in", exp_cat.nrows() , "exposures."
