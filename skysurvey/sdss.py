@@ -4,6 +4,7 @@ import pool2
 import numpy as np
 from slalib import sla_eqgal
 from itertools import imap, izip
+import time
 
 def initialize_column_definitions():
 	# Astrometry table
@@ -68,13 +69,18 @@ def import_from_sweeps(catdir, sweep_files, create=False):
 	else:
 		cat = catalog.Catalog(catdir)
 
+	t0 = time.time()
 	at = 0; ntot = 0
 	pool = pool2.Pool()
-	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (cat,)):
+	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (cat,), progress_callback=pool2.progress_pass):
 	#for (file, nloaded, nin) in imap(lambda file: import_from_sweeps_aux(file, cat), sweep_files):
 		at = at + 1
 		ntot = ntot + nloaded
-		print('  ===> Imported ' + file + ('[%d/%d, %5.2f%%] +%-6d %9d' % (at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot)))
+		t1 = time.time()
+		time_pass = (t1 - t0) / 60
+		time_tot = time_pass / at * len(sweep_files)
+		sfile = "..." + file[-67:] if len(file) > 70 else file
+		print('  ===> Imported %-70s [%d/%d, %5.2f%%] +%-6d %9d (%.0f/%.0f min.)' % (sfile, at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot, time_pass, time_tot))
 
 def import_from_sweeps_aux(file, cat):
 	# import an SDSS run
