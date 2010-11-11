@@ -557,7 +557,7 @@ def make_object_catalog(obj_catdir, det_catdir, radius=1./3600., create=True):
 
 	if create:
 		# Create the new object database
-		obj_cat = create_catalog(obj_catdir, 'ps1_det', obj_cat_def)
+		obj_cat = create_catalog(obj_catdir, 'ps1_obj', obj_cat_def)
 	else:
 		obj_cat = catalog.Catalog(obj_catdir)
 

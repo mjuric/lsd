@@ -364,58 +364,86 @@ class Catalog:
 		fp.close()
 
 	## Cell enumeration routines
-	def _get_cells_recursive(self, cells, foot, times, pix):
+	def _get_subcells(self, static_cell, table, lev):
+		x, y, t, _ = self.unpack_id(static_cell)
+		assert t == self.t0	# Must be a static cell
+
+		prefix = self.path + '/' + bhpix.get_path(x, y, lev)
+		pattern = "%s/*/*.%s.h5" % (prefix, table)
+		
+		cells = []
+		for fn in glob.iglob(pattern):
+			# parse out the time, construct cell ID
+			(kind, fname) = fn.split('/')[-2:]
+			t = self.t0 if kind == 'static' else float(kind[1:])
+
+			cell_id = self._id_from_xy(x, y, t, self.level)
+
+			cells.append(cell_id)
+
+		return cells
+
+	def _get_cells_recursive(self, outcells, foot, times, tables, pix):
 		""" Helper for get_cells(). See documentation of
 		    get_cells() for usage
 		"""
 		# Check for nonzero overlap
-		lev = bhpix.get_pixel_level(pix[0], pix[1])
-		dx = bhpix.pix_size(lev)
-		#box = Polygon.Shapes.Rectangle(dx)
-		#box.shift(pix[0] - 0.5*dx, pix[1] - 0.5*dx);
-		box = self._cell_bounds_xy(pix[0], pix[1], dx)
+		lev  = bhpix.get_pixel_level(pix[0], pix[1])
+		dx   = bhpix.pix_size(lev)
+		box  = self._cell_bounds_xy(pix[0], pix[1], dx)
 		foot = foot & box
 		if not foot:
 			return
 
-		# Check for existence of leaf file(s). There can be
-		# more than one file in catalogs with a time component
+
+		# Check if the cell directory exists (give up if it doesn't)
 		prefix = self.path + '/' + bhpix.get_path(pix[0], pix[1], lev)
-		fn = None
-		pattern = "%s/*/*.%s.h5" % (prefix, self.primary_table)
-		for fn in glob.iglob(pattern):
-			# parse out the time, construct cell ID
-			(t, fname) = fn.split('/')[-2:]
-			t = self.t0 if t == 'static' else float(t[1:])
-
-			# Cut on time component
-			if len(times) and not inintervals(times, t):
-				continue;
-
-			cell_id = self._id_from_xy(pix[0], pix[1], t, self.level)
-
-			cellBounds = None if(foot.area() == box.area()) else foot
-			cells += [ (cell_id, cellBounds) ]
-			#print fname, t, cell_id, cellBounds
-
-		if fn != None:
+		if not os.path.isdir(prefix):
 			return
 
-		# Check if the directory node exists (and stop subdividing if it doesn't)
-		if not os.path.isdir(prefix):
+		# Get the cell_ids of existing leaf tablets for the given
+		# tables. There can be more than one, if one of the tables
+		# has a time dimension
+		static_cell = self._id_from_xy(pix[0], pix[1], self.t0, self.level)
+		cells = set(( cell for table in tables for cell in self._get_subcells(static_cell, table, lev) ))
+
+		found = False
+		if len(cells):
+			# remove the static cell if any temporal ones exist. The static
+			# cell will be implicitly be taken into account when resolving
+			# joins.
+			if len(cells) > 1 and static_cell in cells:
+				cells.remove(static_cell)
+
+			# Filter on time, add bounds
+			cellBounds = None if(foot.area() == box.area()) else foot
+			for cell_id in cells:
+				x, y, t, _ = self.unpack_id(cell_id)
+
+				# Cut on the time component
+				if len(times) and not inintervals(times, t):
+					continue;
+
+				# Add to output
+				outcells += [ (cell_id, cellBounds) ]
+
+				found = True
+
+		if found:
 			return
 
 		# Recursively subdivide the four subpixels
 		dx = dx / 2
 		for d in np.array([(0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5), (0.5, -0.5)]):
-			self._get_cells_recursive(cells, foot & box, times, pix + dx*d)
+			self._get_cells_recursive(outcells, foot & box, times, tables, pix + dx*d)
 
-	def get_cells(self, foot=All, return_bounds=False):
+	def get_cells(self, foot=All, return_bounds=False, tables=[]):
 		""" Return a list of (cell_id, footprint) tuples completely
 		    covering the requested footprint.
 		    
-		    The footprint can either be a Polyon, a cell_id integer,
-		    a (t0, t1) time tuple, or an array of these.
+		    The footprint can either be a Polyon, a specific 
+		    cell_id integer, a (t0, t1) time tuple, or an array
+		    of these.
 		"""
 		# Handle all-sky requests, and scalars
 		if foot == All:
@@ -447,13 +475,21 @@ class Catalog:
 		if len(cells) == 0 and foot == None:
 			foot = footprint.ALLSKY
 
+		if len(tables) == 0:
+			tables = [ self.primary_table ]
+			###tables = [ self.primary_table, 'join:ps1_det' ]
+
 		# Handle the polygon
 		if foot is not None:
 			# Restrict to valid sky
 			foot = foot & footprint.ALLSKY
 
 			# Divide and conquer to find the cells covered by footprint
-			self._get_cells_recursive(cells, foot, times, (0., 0.))
+			self._get_cells_recursive(cells, foot, times, tables, (0., 0.))
+
+		#print cells
+		#print len(cells)
+		#exit()
 
 		if not return_bounds:
 			return [ cell_id for cell_id, _ in cells ]
@@ -508,6 +544,9 @@ class Catalog:
 		raise Exception('Not implemented')
 
 	def resolve_alias(self, colname):
+		""" Return the real column name for special column
+		    aliases.
+		"""
 		schema = self._get_schema(self.primary_table);
 
 		if colname == '_ID'     and 'primary_key'  in schema: return schema['primary_key']
@@ -706,10 +745,39 @@ class Catalog:
 
 		return blobs
 
+	def static_if_no_temporal(self, cell_id, table):
+		""" Try to locate tablet 'table' in cell_id. If there's
+		    no such tablet, return a corresponding static sky
+		    cell_id
+		"""
+		x, y, t, _ = self.unpack_id(cell_id)
+
+		if t == self.t0:
+			return cell_id
+		
+		if self.tablet_exists(cell_id, table):
+			##print "Temporal cell found!", self._cell_prefix(cell_id)
+			return cell_id
+
+		# return corresponding static-sky cell
+		cell_id = self._id_from_xy(x, y, self.t0, self.level)
+		#print "Reverting to static sky", self._cell_prefix(cell_id)
+		return cell_id
+
 	def fetch_blobs(self, cell_id, table, column, refs, include_cached=False):
+		""" Fetch blobs from column 'column' in a tablet 'table'
+		    of cell cell_id, given a vector of references 'refs'
+
+		    If the cell_id has a temporal component, and there's no
+		    tablet in that cell, a static sky cell corresponding
+		    to it is tried next.
+		"""
 		# short-circuit if there's nothing to be loaded
 		if len(refs) == 0:
 			return np.empty(refs.shape, dtype=np.object_)
+
+		# revert to static sky cell if cell_id is temporal, but there's no such tablet
+		cell_id = self.static_if_no_temporal(cell_id, table)
 
 		# Flatten refs; we'll deflatten the blobs in the end
 		shape = refs.shape
@@ -736,10 +804,18 @@ class Catalog:
 		return blobs
 
 	def fetch_tablet(self, cell_id, table=None, include_cached=False):
-		""" Load and return all rows from a given tablet
+		""" Load and return all rows from a given tablet in
+		    a given cell_id.
+
+		    If the cell_id has a temporal component, and there's no
+		    tablet in that cell, a static sky cell corresponding
+		    to it is tried next.
 		"""
 		if table is None:
 			table = self.primary_table
+
+		# revert to static sky cell if cell_id is temporal, but there's no such tablet
+		cell_id = self.static_if_no_temporal(cell_id, table)
 
 		if self.tablet_exists(cell_id, table):
 			with self.get_cell(cell_id) as cell:
@@ -756,6 +832,10 @@ class Catalog:
 
 	def query_cell(self, cell_id, query='*', include_cached=False):
 		""" Execute a query on a local cell.
+
+		    If the cell_id has a temporal component, and there are no
+		    tablets in that cell, a static sky cell corresponding
+		    to it will be tried.
 		"""
 		assert self.is_cell_local(cell_id)
 
@@ -851,8 +931,12 @@ class Catalog:
 		mapper,   mapper_args = unpack_callable(mapper)
 		reducer, reducer_args = unpack_callable(reducer)
 
+		# Parse the query to obtain a list of catalogs we're going to be JOINing against
+		(select_clause, where_clause, join_clause) = qp.parse(query, TableColsProxy(self))
+		tables = [ 'join:' + catname for catname, _ in join_clause if catname != self.name ]
+
 		# slice up the job down to individual cells
-		partspecs = self.get_cells(foot, return_bounds=True)
+		partspecs = self.get_cells(foot, return_bounds=True, tables=tables)
 
 		# tell _mapper not to test polygon boundaries if the user requested so
 		if not testbounds:
@@ -980,36 +1064,45 @@ class Catalog:
 		# Find out which columns are our spatial keys
 		return self._get_schema(self.primary_table)["primary_key"]
 
-	def _fetch_joins(self, cell_id, ids, cat_to_name, fetch_tablet=None):
+	def fetch_joins(self, cell_id, ids, cat_to_name, fetch_tablet=None):
 		"""
 			Return a list of crossmatches corresponding to ids
 		"""
 		if fetch_tablet is None:
-			fetch_tabled = self.fetch_tablet
-		
-		table_from = self.joined_catalogs[cat_to_name]['table_from']
-		table_to   = self.joined_catalogs[cat_to_name]['table_to']
+			fetch_tablet = self.fetch_tablet
+
+		table_from  = self.joined_catalogs[cat_to_name]['table_from']
+		table_to    = self.joined_catalogs[cat_to_name]['table_to']
 		column_to   = self.joined_catalogs[cat_to_name]['column_to']
 		column_from = self.joined_catalogs[cat_to_name]['column_from']
 
+		# This allows joins from static to temporal catalogs where
+		# the join table is in a static cell (not implemented yet). 
+		# However, it also support an (implemented) case of tripple
+		# joins of the form static-static-temporal, where the cell_id
+		# will be temporal even when fetching the static-static join
+		# table for the two other catalogs.
+		cell_id_from = self.static_if_no_temporal(cell_id, table_from)
+		cell_id_to   = self.static_if_no_temporal(cell_id, table_to)
+
 		if len(ids) == 0 \
-		   or not self.tablet_exists(cell_id, table_from) \
-		   or not self.tablet_exists(cell_id, table_to):
+		   or not self.tablet_exists(cell_id_from, table_from) \
+		   or not self.tablet_exists(cell_id_to,   table_to):
 			return ([], [])
 
 		if table_from == table_to:
 			# Both the primary and foreign key maps are in the same table
 			#  - this must be the case for many-to-many or one-to-many joins
 			#  - it can be the case for one-to-one joins
-			rows    = fetch_tablet(self, cell_id, table_from)
+			rows    = fetch_tablet(self, cell_id_from, table_from)
 		else:
 			# The primary and foreign key columns are in the same table
 			#  - this can only be a one-to-one or many-to-one join
 			#  - the number of rows in the two tables must be the same
-			colFrom = fetch_tablet(self, cell_id, table_from)[column_from]
+			colFrom = fetch_tablet(self, cell_id_from, table_from)[column_from]
 			rows  = np.empty(len(colFrom), dtype=[(column_from, 'u8'), (column_to, 'u8')])
 			rows[column_from] = colFrom
-			rows[column_to]   = fetch_tablet(self, cell_id, table_to)[column_to]
+			rows[column_to]   = fetch_tablet(self, cell_id_to, table_to)[column_to]
 
 		# drop all links where id1 is not in ids
 		sids = np.sort(ids)
@@ -1338,8 +1431,8 @@ class ColDict:
 		self.include_cached = include_cached
 
 		# parse query
-		(select_clause, where_clause, from_clause) = qp.parse(query, TableColsProxy(cat))
-		#print (query, select_clause, where_clause, from_clause)
+		(select_clause, where_clause, join_clause) = qp.parse(query, TableColsProxy(cat))
+		#print (query, select_clause, where_clause, join_clause)
 		#exit()
 
 		# Fetch all rows of the base table, including the cached ones (if requested)
@@ -1377,7 +1470,7 @@ class ColDict:
 			    from cache (if loaded), or call cat.fetch_tablet
 			    otherwise.
 			    
-			    Used as a parameter to cat._fetch_joins
+			    Used as a parameter to cat.fetch_joins
 			"""
 			if cat.name in self.catalogs and table in self.catalogs[cat.name]['tables']:
 				return self.catalogs[cat.name]['tables'][table]
@@ -1388,7 +1481,7 @@ class ColDict:
 			return cat.fetch_tablet(cell_id, table)
 
 		# Load catalog indices to be joined
-		for (catname, join_type) in from_clause:
+		for (catname, join_type) in join_clause:
 			if cat.name == catname:
 				continue
 			assert catname not in self.catalogs, "Same catalog, '%s', listed twice in XMATCH clause" % catname;
@@ -1396,7 +1489,7 @@ class ColDict:
 			assert include_cached == False, "include_cached=True in JOINs is a recipe for disaster. Don't do it"
 
 			# load the xmatch table and instantiate the second catalog object
-			(m1, m2) = cat._fetch_joins(cell_id, self.keys, catname, fetch_tablet=fetch_cached_tablet)
+			(m1, m2) = cat.fetch_joins(cell_id, self.keys, catname, fetch_tablet=fetch_cached_tablet)
 			cat2     = cat.get_joined_catalog(catname)
 			rows2    = cat2.fetch_tablet(cell_id=cell_id, table=cat2.primary_table, include_cached=True)
 			id2      = rows2[cat2.tables[cat2.primary_table]["primary_key"]]
@@ -1523,16 +1616,25 @@ class ColDict:
 		if name in self.columns:
 			return self.columns[name]
 
-		# A yet unloaded column? Try to find it in tables of joined catalogs
-		# May be prefixed by catalog name, in which case we force lookup of only
-		#     that catalog
+		# A yet unloaded column from one of the joined catalogs
+		# (including the primary)? Try to find it in tables of
+		# joined catalogs. It may be prefixed by catalog name, in
+		# which case we force the lookup of that catalog only.
 		if name.find('.') == -1:
-			cats = self.catalogs
+			# Do this to ensure the primary catalog is the first
+			# to get looked up when resolving column names.
+			#
+			# FIXME: We could achieve the same effect by storing
+			# self.catalogs in OrderedDict; alas, this would
+			# break Python 2.6 compatibility.
+			cats = [ (self.primary_catalog, self.catalogs[self.primary_catalog]) ]
+			cats.extend(( v for v in self.catalogs.iteritems() if v[0] != self.primary_catalog ))
 			colname = name
 		else:
+			# Force lookup of a specific catalog
 			(catname, colname) = name.split('.')
-			cats = { catname: self.catalogs[catname] }
-		for (catname, v) in cats.iteritems():
+			cats = [ (catname, self.catalogs[catname]) ]
+		for (catname, v) in cats:
 			cat = v['cat']
 			colname = cat.resolve_alias(colname)
 			for (table, schema) in cat.tables.iteritems():
