@@ -96,7 +96,7 @@ class Pool:
 	ps = []
 	DEBUG = int(os.getenv('DEBUG', False))
 	min_tasks_for_parallel = 3
-	nworkers = cpu_count()
+	nworkers = int(os.getenv('NWORKERS', cpu_count()))
 
 	def _create_workers(self):
 		""" Lazily create workers, when needed. This routine
@@ -134,7 +134,7 @@ class Pool:
 		except TypeError:
 			parallel = True
 
-		parallel = parallel and not self.DEBUG
+		parallel = parallel and self.nworkers > 1 and not self.DEBUG
 
 		# Dispatch/execute
 		if parallel:
