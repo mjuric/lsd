@@ -25,13 +25,33 @@ if len(args) != 2:
 	usage()
 	exit(-1)
 
+def T(*args):
+	""" User friendly specification of time:
+		T([a,b], [b, c], [d, e]) --> intervalset([a,b], [b, c], [d, e])
+		T([a], [b]) --> intervalset([a], [b])
+		T(a) or T([a])--> intervalset([a])
+
+		but, the often used case of:
+
+		T(a, b) --> intervalset[a, b]
+	"""
+	from skysurvey.intervalset import intervalset
+
+	hastuple = sum([ isinstance(a, tuple) or isinstance(a, list) for a in args ]) != 0
+
+	if len(args) != 2 or hastuple:
+		return intervalset(*args)
+	else:
+		return intervalset(tuple(args))
+
 foot = []
 format = 'text'
 output = 'output.fits'
 progress_callback = None
 for o, a in optlist:
 	if o in ('-b', '--bounds'):
-		foot.append(eval(a))
+		foot.extend(eval('[' + a + ']'))
+		#print foot; exit()
 	if o in ('--format', '-f'):
 		if a not in ['text', 'fits']: usage(); exit(-1);
 		format = a

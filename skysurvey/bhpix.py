@@ -1,40 +1,28 @@
 #!/usr/bin/env python
 
-from math import *
+#from math import *
 import numpy as np
+from numpy import sin, cos, radians, fmod, sqrt, pi, arcsin, degrees, abs, floor
 
-def autovectorized(f):
-	"""Function decorator to do vectorization only as necessary.
-	vectorized functions fail for scalar inputs.
-	Taken from http://mail.scipy.org/pipermail/numpy-discussion/2006-July/009480.html
-	"""
-	def wrapper(l, b):
-		if isinstance(l, np.ndarray) or isinstance(b, np.ndarray):
-			return np.vectorize(f)(l, b)
-		return f(l, b)
-	return wrapper
-
-@autovectorized
 def proj_healpix(l, b):
 	z   = cos(radians(90.-b))
 	phi = radians(fmod(fmod(l, 360.)+360, 360)) # wrap to [0,360)
 
 	phit = fmod(phi, .5*pi)
-	sigz = (2 - sqrt(3*(1-z))) if z > 0 else -(2 - sqrt(3*(1+z)))
+	sigz = np.where(z > 0, 2 - sqrt(3*(1-z)), -(2 - sqrt(3*(1+z))) )
 
-	x = phi		if abs(z) < 2./3 else phi - (abs(sigz) - 1) * (phit - 0.25 * pi)
-	y = 3./8*pi*z	if abs(z) < 2./3 else 0.25 * pi * sigz
+	x = np.where(abs(z) < 2./3, 	phi, 		phi - (abs(sigz) - 1) * (phit - 0.25 * pi))
+	y = np.where(abs(z) < 2./3, 	3./8*pi*z,	0.25 * pi * sigz)
 
 	return (x, y)
 
-_c = [-1, -1,  1, 1]
-_s = [ 1, -1, -1, 1]
+_c = np.array([-1., -1.,  1., 1.])
+_s = np.array([ 1., -1., -1., 1.])
 
-@autovectorized
 def proj_bhealpix(l, b):
 	(hxx, hyy) = proj_healpix(l, b)
 
-	l = int(hxx / (0.5*pi))
+	l = (hxx / (0.5*pi)).astype(int)
 	h1x = (hxx - pi/2*(0.5 + l))
 	h1y = hyy - pi/2
 
@@ -43,34 +31,37 @@ def proj_bhealpix(l, b):
 
 	return (h1, h2)
 
-@autovectorized
 def deproj_healpix(x, y):
+	l = np.empty_like(x)
+	b = np.empty_like(x)
+
 	# Equations from Calabretta and Roukema, MNRAS, 381, 865
 	K = 3; H = 4;
 
-	if abs(y) <= 0.5*pi * (K-1)/H:
-		# Equatorial regions
-		l = x
-		b = asin(y*H / (0.5*pi*K))
-	else:
-		# Polar regions
-		w = 1 if fmod(K, 2) == 1 else 0
-		s = 0.5*(K+1) - abs(y*H)/pi
-		xc = -pi + (2.*floor( (x + pi)*H/(2*pi) + 0.5*(1-w)) + w)*pi/H
-		l = xc + (x - xc) / s
-		b = asin(1 - s*s/K) * (1 if y > 0 else -1)
+	equ = np.fabs(y) <= 0.5*pi * (K-1)/H
+
+	# Equatorial regions
+	l[equ] = x[equ]
+	b[equ] = arcsin(y[equ]*H / (0.5*pi*K))
+
+	# Polar regions
+	pol = ~equ
+	w = 1 if fmod(K, 2) == 1 else 0
+	s = 0.5*(K+1) - abs(y[pol]*H)/pi
+	xc = -pi + (2.*floor( (x[pol] + pi)*H/(2*pi) + 0.5*(1-w)) + w)*pi/H
+	l[pol] = xc + (x[pol] - xc) / s
+	b[pol] = arcsin(1 - s*s/K) * np.where(y[pol] > 0, 1, -1)
 
 	return degrees(l), degrees(b)
 
-@autovectorized
 def deproj_bhealpix(x, y):
 	""" Deproject from butterfly-HealPix to lon, lat
 	"""
 	# Compute to which of the four healpix slices
 	# this point belongs to
-	l = atan2(y, x)*180/pi
-	l = l if l > 0 else l + 360
-	l = int(l // 90)
+	l = degrees(np.arctan2(y, x))
+	l = np.where(l > 0, l, l + 360)
+	l = (l / 90).astype(int)
 
 	h1x = pi/2. * (_c[l]*x + _s[l]*y)
 	h1y = pi/2. * (_c[l]*y - _s[l]*x)
@@ -255,6 +246,12 @@ def neighbors(x, y, level, include_self=False):
 #from matplotlib.pyplot import *
 #import random as ran
 #testpix()
+
+if __name__ == '__main__':
+	print proj_bhealpix(np.array([10, 10]), np.array([10, 80]))
+	print proj_bhealpix(10, 80)
+	print deproj_bhealpix(*proj_bhealpix(np.array([10, 10]), np.array([10, 80])))
+	exit()
 
 if __name__ == '__main__':
 	clon = 212; clat = 12;

@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import query_parser as qp
 from collections import defaultdict
 from contextlib import contextmanager
@@ -27,6 +29,7 @@ import utils
 import footprint
 from table import Table
 from utils import astype, gc_dist, unpack_callable, full_dtype, is_scalar_of_type, isiterable
+from intervalset import intervalset
 from StringIO import StringIO
 
 def vecmd5(x):
@@ -41,14 +44,6 @@ def veclen(x):
 	for i in xrange(len(x)):
 		l[i] = len(x[i])
 	return l
-
-# TODO: should be moved to utils
-def inintervals(times, t):
-	# simple dumb O(n) search, for now
-	for (t0, t1) in times:
-		if t0 < t < t1:
-			return True
-	return False
 
 # Special return type used in _mapper() and Catalog.map_reduce
 # to denote that the returned value should not be yielded to
@@ -416,16 +411,31 @@ class Catalog:
 				cells.remove(static_cell)
 
 			# Filter on time, add bounds
-			cellBounds = None if(foot.area() == box.area()) else foot
+			xybounds = None if(foot.area() == box.area()) else foot
 			for cell_id in cells:
 				x, y, t, _ = self.unpack_id(cell_id)
 
 				# Cut on the time component
-				if len(times) and not inintervals(times, t):
+				tival = intervalset((t, t+self.dt))
+				tolap = times & tival
+				if len(tolap):
+					(l, r) = tolap[-1]				# Get the right-most interval component
+					if l == r == t+self.dt:				# Is it a single point?
+						tolap = intervalset(*tolap[:-1])	# Since objects in this cell have time in [t, t+dt), remove the t+dt point
+
+				if len(tolap) == 0:					# No overlap between the intervals -- skip this cell
 					continue;
 
+				# Return None if the cell is fully contained in the requested interval
+				tbounds = None if tival == tolap else tolap
+
 				# Add to output
-				outcells += [ (cell_id, cellBounds) ]
+				if tival == tolap:
+					outcells[cell_id][xybounds] = None
+				elif xybounds not in outcells[cell_id]:
+					outcells[cell_id][xybounds] = tbounds
+				elif outcells[cell_id][xybounds] is not None:
+					outcells[cell_id][xybounds] |= tbounds
 
 				found = True
 
@@ -437,13 +447,36 @@ class Catalog:
 		for d in np.array([(0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5), (0.5, -0.5)]):
 			self._get_cells_recursive(outcells, foot & box, times, tables, pix + dx*d)
 
+	def __part_to_xy_t(self, part):
+		foot = Polygon.Polygon()
+		times = intervalset()
+		for v in part:
+			if   isinstance(v, Polygon.Polygon):
+			  	foot |= v
+			elif isinstance(v, intervalset):
+				times |= v
+			else:
+				raise Exception('Incorrect part specification')
+
+		if not foot:		foot =  footprint.ALLSKY
+		if len(times) == 0:	times = intervalset((-np.inf, np.inf))
+
+		# Restrict to valid sky
+		foot = foot & footprint.ALLSKY
+
+		return (foot, times)
+
 	def get_cells(self, foot=All, return_bounds=False, tables=[]):
 		""" Return a list of (cell_id, footprint) tuples completely
 		    covering the requested footprint.
-		    
+
 		    The footprint can either be a Polyon, a specific 
 		    cell_id integer, a (t0, t1) time tuple, or an array
 		    of these.
+
+		    Output is a list of (cell_id, xybounds, tbounds) tuples,
+		    unless return_bounds=False when the output is just a
+		    list of cell_ids.
 		"""
 		# Handle all-sky requests, and scalars
 		if foot == All:
@@ -453,46 +486,66 @@ class Catalog:
 		else:
 			foots = foot
 
-		# Group together all Polygons, exclude nonexistent cells,
-		# extract time tuples
-		cells = []
-		foot = None
-		times = []
-		for v in foots:
-			if isinstance(v, Polygon.Polygon):
-				if foot is None:
-					foot = v
-				else:
-					foot += v
-			elif isinstance(v, tuple):
-				times.append(v)
-			#elif self.tablet_exists(v):
-			else:
-				cells.append( (int(v), None) )
-
-		# if no footprint is given, and no explicit cells are
-		# given, assume foot=ALLSKY
-		if len(cells) == 0 and foot == None:
-			foot = footprint.ALLSKY
-
 		# ensure the primary table is always searched for
 		tables = set(tables)
 		tables.add(self.primary_table)
 
-		# Handle the polygon
-		if foot is not None:
-			# Restrict to valid sky
-			foot = foot & footprint.ALLSKY
+		# Now our input is a list that consists of one or more of:
+		# a) Polygon instances
+		# b) interval instances
+		# c) tuples or lists of (Polygon, interval, Polygon, interval, ...)
+		# e) cell_ids (integers)
+		#
+		# Do the following:
+		# - extract a) and b) and form a single ([Polygon], interval), add it to the list
+		# - append e) to the output list
+		# - for each tuple:
+		#	form a single ([Polygon], interval)
+		# 	call _get_cell_recursive to obtain cell_ids, append them to output
 
-			# Divide and conquer to find the cells covered by footprint
-			self._get_cells_recursive(cells, foot, times, tables, (0., 0.))
+		#print "***INPUT:", foots;
 
-		#print cells
-		#print len(cells)
-		#exit()
+		# cell->foot->times
+		cells = defaultdict(dict)
+		part0 = []
+		parts = []
+		for v in foots:
+			if   isinstance(v, Polygon.Polygon) or isinstance(v, intervalset):
+				part0.append(v)
+			elif isinstance(v, tuple) or isinstance(v, list):
+				parts.append(v)
+			else:
+				cells[int(v)][None] = intervalset()
+
+		#print "****A1:", cells, part0, parts;
+		if part0:
+			parts.append(part0)
+
+		#print "****PARTS:", parts
+
+		# Find cells overlapping the requested spacetime
+		if len(parts):
+			for part in parts:
+				foot, times = self.__part_to_xy_t(part)
+				#print "HERE:", foot.area(), times;
+
+				# Divide and conquer to find the cells covered by footprint
+				self._get_cells_recursive(cells, foot, times, tables, (0., 0.))
+
+		# Reorder cells to be an array of (cell, [(poly, time), (poly, time)] ...) tuples
+		cells = dict(( (k, v.items()) for k, v in cells.iteritems() ))
+
+		if False:
+			for k, bounds in cells.iteritems():
+				print k, ':', str(self.unpack_id(k)),
+				for xy, t in bounds:
+					print (xy.area() if xy is not None else None, t),
+				print ''
+			print len(cells)
+			exit()
 
 		if not return_bounds:
-			return [ cell_id for cell_id, _ in cells ]
+			return cells.keys()
 		else:
 			return cells
 
@@ -802,7 +855,6 @@ class Catalog:
 					blobs = np.empty(len(refs), dtype=object)
 					blobs[refs >= 0] = self._smart_load_blobs(b1,   refs[refs >= 0]),
 					blobs[ refs < 0] = self._smart_load_blobs(b2,  -refs[ refs < 0]),
-					#assert False, 'Test this bit'
 				else:
 					blobs = self._smart_load_blobs(b1, refs)
 
@@ -947,11 +999,11 @@ class Catalog:
 			tables.update((v['table_from'], v['table_to']))
 
 		# slice up the job down to individual cells
-		partspecs = self.get_cells(foot, return_bounds=True, tables=tables)
+		partspecs = self.get_cells(foot, return_bounds=True, tables=tables).items()
 
-		# tell _mapper not to test polygon boundaries if the user requested so
+		# tell _mapper not to test spacetime boundaries if the user requested so
 		if not testbounds:
-			partspecs = [ (part_id, None) for (part_id, bounds) in partspecs ]
+			partspecs = [ (part_id, None) for (part_id, _) in partspecs ]
 
 		# start and run the workers
 		pool = pool2.Pool(nworkers)
@@ -1120,9 +1172,8 @@ class Catalog:
 		res = np.searchsorted(sids, rows[column_from])
 		res[res == len(sids)] = 0
 		ok = sids[res] == rows[column_from]
-		rows = rows[ok]
 
-		return (rows[column_from], rows[column_to])
+		return (rows[column_from][ok], rows[column_to][ok])
 
 	def define_join(self, cat, table_from, table_to, column_from, column_to):
 		# Schema:
@@ -1451,15 +1502,44 @@ class ColDict:
 		idx2  = np.arange(len(rows2))
 		self.orig_rows = { cat.name: len(rows2) }
 
-		# Reject objects out of bounds
-		if bounds != None and len(rows2):
-			raKey, decKey = cat.tables[cat.primary_table]["spatial_keys"]
-			ra, dec = rows2[raKey], rows2[decKey]
+#		print >> sys.stderr, "CELL:", cell_id
+		# Reject objects out of bounds, in space and time (the latter only if applicable)
+		have_bounds_t = False
+		if len(rows2) and bounds is not None:
+			schema = cat._get_schema(cat.primary_table)
+			raKey, decKey = schema["spatial_keys"]
+			tKey          = schema["temporal_key"] if "temporal_key" in schema else None
 
-			(x, y) = bhpix.proj_bhealpix(ra, dec)
-			in_ = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=len(x))
+			# inbounds[j, i] is true if the object in row j falls within bounds[i]
+			inbounds = np.ones((len(rows2), len(bounds)), dtype=np.bool)
+			x, y = None, None
 
-			idx2  = idx2[in_]
+			for (i, (bounds_xy, bounds_t)) in enumerate(bounds):
+				if bounds_xy is not None:
+					if x is None:
+#						print "IN", len(rows2)
+						(x, y) = bhpix.proj_bhealpix(rows2[raKey], rows2[decKey]) 
+#						print "OUT"
+
+#					print "INp", len(rows2)
+					inbounds[:, i] &= bounds_xy.isInsideV(x, y)
+#					print "OUTp"
+
+				if bounds_t is not None:
+					have_bounds_t = True
+					if tKey is not None:
+#						print "INt", len(rows2)
+						inbounds[:, i] &= bounds_t.isInside(rows2[tKey])
+#						print "OUTt"
+
+			# Remove all objects that don't fall inside _any_ of the bounds
+			in_  = np.any(inbounds, axis=1)
+
+#			print >> sys.stderr, "Primary table filter: (all), (kept by each)", len(inbounds), np.sum(inbounds, axis=0)
+#			exit();
+
+			idx2 = idx2[in_]
+			inbounds = inbounds[in_]
 
 		# Initialize catalogs and table lists, plus the array of primary keys
 		self.catalogs = \
@@ -1474,7 +1554,8 @@ class ColDict:
 				}
 			}
 		}
-		self.keys     = rows2[idx2][cat.tables[cat.primary_table]["primary_key"]]
+#		self.keys     = rows2[idx2][cat.tables[cat.primary_table]["primary_key"]]
+		self.keys     = rows2[cat.tables[cat.primary_table]["primary_key"]][idx2]
 
 		def fetch_cached_tablet(cat, cell_id, table):
 			""" A nested function designed to return the tablet
@@ -1495,26 +1576,54 @@ class ColDict:
 		for (catname, join_type) in join_clause:
 			if cat.name == catname:
 				continue
-			assert catname not in self.catalogs, "Same catalog, '%s', listed twice in XMATCH clause" % catname;
 
+			assert catname not in self.catalogs, "Same catalog, '%s', listed twice in XMATCH clause" % catname;
 			assert include_cached == False, "include_cached=True in JOINs is a recipe for disaster. Don't do it"
 
 			# load the xmatch table and instantiate the second catalog object
 			(m1, m2) = cat.fetch_joins(cell_id, self.keys, catname, fetch_tablet=fetch_cached_tablet)
 			cat2     = cat.get_joined_catalog(catname)
 			rows2    = cat2.fetch_tablet(cell_id=cell_id, table=cat2.primary_table, include_cached=True)
-			id2      = rows2[cat2.tables[cat2.primary_table]["primary_key"]]
+			schema   = cat2._get_schema(cat2.primary_table)
+			id2      = rows2[schema["primary_key"]]
 			self.orig_rows[cat2.name] = len(rows2)
 
-			#print len(m1), len(m2)
-			#print len(self.keys), len(rows2)
-
 			# Join the tables (jmap and rows2), using (m1, m2) linkage information
-			table_join.cell_id = cell_id	# debugging
-			table_join.cat = cat		# debugging
+			table_join.cell_id = cell_id	# debugging (remove once happy)
+			table_join.cat = cat		# debugging (remove once happy)
 			(idx1, idx2, isnull) = table_join(self.keys, id2, m1, m2, join_type=join_type)
 
-			# update the keys and index maps for already joined catalogs
+			# Reject rows that are out of the time interval in this table.
+			# We have to do this here as well, to support filtering on time in static_sky->temporal_sky joins
+			if len(rows2) and have_bounds_t and "temporal_key" in schema:
+				tKey = schema["temporal_key"]
+				t    = rows2[tKey][idx2]
+				in_  = np.zeros(len(idx2), dtype=bool)
+
+				# This essentially looks for at least one bound specification that contains a given row
+				for (i, (_, bounds_t)) in enumerate(bounds):
+					if bounds_t is not None:
+						in_t = bounds_t.isInside(t)
+						in_ |= inbounds[idx1, i] & in_t
+					else:
+						in_ |= inbounds[idx1, i]
+
+#				print >> sys.stderr, "Time join (all, kept): ", len(in_), in_.sum()
+				#if len(in_) !=  in_.sum():
+				#	print "T[~in]    =",    t[~in_]
+				#	print "idx1[~in] =", idx1[~in_]
+				#	print "idx1[in ] =", idx1[in_][0:10]
+				#	print "idx1      =", idx1[0:20]
+				#	print "idx2      =", idx2[0:20]
+				#	assert 0, "Test this codepath"
+
+				if not in_.all():
+					# Keep only the rows that were found to be within at least one bound
+					idx1   =   idx1[in_]
+					idx2   =   idx2[in_]
+					isnull = isnull[in_]
+
+			# update the keys and index maps for the already joined catalogs
 			self.keys = self.keys[idx1]
 			for (catname, v) in self.catalogs.iteritems():
 				(idx, isnull_) = v['join']
@@ -1523,10 +1632,13 @@ class ColDict:
 			#print "XX:", len(self.keys), len(rows2), idx1, idx2, isnull
 
 			# add the newly joined catalog
+			rownums  = np.arange(max(len(rows2), 1)) # The max(..,1) is for outer joins where len(rows2) = 0,
+								 # but table_join (below) returns idx2=0 (with isnull=True).
+								 # Otherwise, line (*) will fail
 			self.catalogs[cat2.name] = \
 			{
 				'cat': 		cat2,
-				'join':		(np.arange(len(rows2)+1)[idx2], isnull),	# The +1 is for outer joins where len(rows2) = 0, but table_join returns idx2=0 (with isnull=True)
+				'join':		(rownums[idx2], isnull),	# (*) -- see above
 				'tables':
 				{
 					cat2.primary_table: rows2
@@ -1534,7 +1646,7 @@ class ColDict:
 			}
 			assert len(self.catalogs[cat2.name]['join'][0]) == len(self.keys)
 
-		# Filter out only the rows remaining after the JOIN in the cached tables
+		# In the cached tables, keep only the rows that remain after the JOIN has been performed
 		for catname in self.catalogs:
 			tables = self.catalogs[catname]['tables']
 			for table, rows in tables.iteritems():
@@ -1746,7 +1858,8 @@ def _cache_maker_mapper(rows, margin_x):
 	# all neighbors.
 	(ra, dec) = rows.as_columns()
 	(x, y) = bhpix.proj_bhealpix(ra, dec)
-	in_ = np.fromiter( (not p.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=len(x))
+	#in_ = np.fromiter( (not p.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=len(x))
+	in_ = ~p.isInsideV(x, y)
 
 	if not in_.any():
 		return Empty
