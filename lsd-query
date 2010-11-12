@@ -8,12 +8,13 @@ import skysurvey as ss
 from skysurvey.footprint import rectangle
 from skysurvey.utils import make_printf_string, as_tuple
 import pyfits
+import skysurvey.pool2 as pool2
 
 def usage():
-	print "Usage: %s --bounds=bounds --format=[fits|text] --output=[outputfile] <catalog> <query>" % sys.argv[0]
+	print "Usage: %s --bounds=bounds --format=[fits|text] --output=[outputfile] --quiet <catalog> <query>" % sys.argv[0]
 
 try:
-	optlist, args = getopt.getopt(sys.argv[1:], 'b:f:o:', ['bounds=', 'format=', 'output='])
+	optlist, args = getopt.getopt(sys.argv[1:], 'b:f:o:q', ['bounds=', 'format=', 'output=', 'quiet'])
 except getopt.GetoptError, err:
 	print str(err)
 	usage()
@@ -27,6 +28,7 @@ if len(args) != 2:
 foot = []
 format = 'text'
 output = 'output.fits'
+progress_callback = None
 for o, a in optlist:
 	if o in ('-b', '--bounds'):
 		foot.append(eval(a))
@@ -35,6 +37,8 @@ for o, a in optlist:
 		format = a
 	if o in ('--output', '-o'):
 		output = a
+	if o in ('--quiet', '-q'):
+		progress_callback = pool2.progress_pass
 catname, query = args
 
 
@@ -46,7 +50,7 @@ if format == 'text':
 	# Text output
 	fmt = None
 	##rprev = None
-	for row in cat.iterate(query, foot):
+	for row in cat.iterate(query, foot, progress_callback=progress_callback):
 		if fmt == None:
 			fmt = make_printf_string(row)
 			print '# ' + ' '.join(row.dtype.names)
@@ -57,7 +61,7 @@ if format == 'text':
 		##rprev = row.copy()
 else:
 	# FITS output
-	rows = cat.fetch(query, foot)
+	rows = cat.fetch(query, foot, progress_callback=progress_callback)
 
 	if 'cksumok' in rows.dtype.names:
 		# Do ./lsd-query --format=fits ps1 'vecmd5(hdr) == cksum as cksumok'
