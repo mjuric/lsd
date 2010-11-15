@@ -596,7 +596,7 @@ def make_object_catalog(obj_catdir, det_catdir, radius=1./3600., create=True):
 	print >> sys.stderr, "Building neighbor cache for static sky: ",
 	obj_cat.build_neighbor_cache()
 
-	# Compute summary stats for both catalogs
+	# Compute summary stats for object catalog
 	print >> sys.stderr, "Computing summary statistics for static sky: ",
 	obj_cat.compute_summary_stats()
 
@@ -709,7 +709,7 @@ def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=Fals
 		# next one if this is the case.
 		cachedonly = len(objs) == 0 and cached.all()
 		if cachedonly:
-			##print "Skipping cached-only"
+			##print "Skipping cached-only", len(cached)
 			continue;
 
 		# prep join table
@@ -732,6 +732,7 @@ def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=Fals
 			# Extract objects belonging to this exposure only
 			detections2 = detections[exposures == exposure]
 			id2, ra2, dec2, _, _, xydet = detections2.as_columns()
+			ndet = len(xydet)
 
 			if len(xyobj) != 0:
 				# Construct kD-tree and find the object nearest to each
@@ -741,37 +742,41 @@ def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=Fals
 				del tree
 				match_idx = match_idx[:,0]		# First neighbor only
 
-				# Compute accurate distances, and accept/reject matches
-				dist = gc_dist(objs['_LON'][match_idx], objs['_LAT'][match_idx], ra2, dec2)
-				matched   = dist < radius
-				unmatched = matched == False
-				nmatched   = matched.sum()
-				nunmatched = len(matched) - nmatched
-
-				# Extract matches and store them to joins array
-				reserve_space(join, njoin + nmatched)
-				join[objKey][njoin:njoin+nmatched]  = match_idx[matched]
-				join[detKey][njoin:njoin+nmatched]  =       id2[matched]
-				join[distKey][njoin:njoin+nmatched] =      dist[matched]
-				njoin += nmatched
+				# Compute accurate distances, and select detections not matched to existing objects
+				dist       = gc_dist(objs['_LON'][match_idx], objs['_LAT'][match_idx], ra2, dec2)
+				unmatched  = dist >= radius
 			else:
-				# All detections are new objects
-				unmatched = np.ones(len(xydet), dtype=bool)
-				nmatched  = 0
-				nunmatched = len(xydet)
+				# All detections will become new objects (and therefore, dist=0)
+				dist       = np.zeros(ndet, dtype='f4')
+				unmatched  = np.ones(ndet, dtype=bool)
+				match_idx  = np.empty(ndet, dtype='i4')
 
-			x, y, t, _ = det_cat.unpack_id(det_cell)
+			##x, y, t, _ = det_cat.unpack_id(det_cell)
 			##print "DC %s, MJD%s, Exposure %s: %d detections, %d objects, %d matched, %d unmatched" % (det_cell, t, exposure, len(detections2), nobj, nmatched, nunmatched)
 
-			# Promote unmatched detections to objects
+			# Promote unmatched detections to new objects
 			_, newra, newdec, _, _, newxy = detections2[unmatched].as_columns()
-
+			nunmatched = unmatched.sum()
 			reserve_space(objs, nobj+nunmatched)
 			objs['_LON'][nobj:nobj+nunmatched] = newra
 			objs['_LAT'][nobj:nobj+nunmatched] = newdec
-			nobj  += nunmatched
+			match_idx[unmatched] = np.arange(nobj, nobj+nunmatched, dtype='i4')	# Set the indices of unmatched detections to newly created objects
 
+			# Join objects to their detections
+			reserve_space(join, njoin+ndet)
+			join[objKey][njoin:njoin+ndet]  = match_idx
+			join[detKey][njoin:njoin+ndet]  =       id2
+			join[distKey][njoin:njoin+ndet] =      dist
+			njoin += ndet
+
+			# Prep for next loop
+			nobj  += nunmatched
 			xyobj  = np.append(xyobj, newxy, axis=0)
+
+			# Debugging: Final consistency check (remove when happy with the code)
+			dist = gc_dist( objs['_LON'][  join[objKey][njoin-ndet:njoin]  ],
+					objs['_LAT'][  join[objKey][njoin-ndet:njoin]  ], ra2, dec2)
+			assert (dist < radius).all()
 
 		# Truncate output tables to their actual number of elements
 		objs = objs[0:nobj]

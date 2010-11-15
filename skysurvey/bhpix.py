@@ -2,7 +2,7 @@
 
 #from math import *
 import numpy as np
-from numpy import sin, cos, radians, fmod, sqrt, pi, arcsin, degrees, abs, floor
+from numpy import sin, cos, radians, fmod, sqrt, pi, arcsin, degrees, abs, floor, fabs
 
 def proj_healpix(l, b):
 	z   = cos(radians(90.-b))
@@ -38,7 +38,7 @@ def deproj_healpix(x, y):
 	# Equations from Calabretta and Roukema, MNRAS, 381, 865
 	K = 3; H = 4;
 
-	equ = np.fabs(y) <= 0.5*pi * (K-1)/H
+	equ = fabs(y) <= 0.5*pi * (K-1)/H
 
 	# Equatorial regions
 	l[equ] = x[equ]

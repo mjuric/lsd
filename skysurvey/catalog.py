@@ -515,7 +515,7 @@ class Catalog:
 			elif isinstance(v, tuple) or isinstance(v, list):
 				parts.append(v)
 			else:
-				cells[int(v)][None] = intervalset()
+				cells[int(v)][None] = None	# Fetch entire cell (space and time)
 
 		#print "****A1:", cells, part0, parts;
 		if part0:
