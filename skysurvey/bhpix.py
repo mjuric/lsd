@@ -54,9 +54,16 @@ def deproj_healpix(x, y):
 
 	return degrees(l), degrees(b)
 
+def deproj_bhealpix_scalar(x, y):
+	(l, b) = deproj_bhealpix(np.array([x]), np.array([y]))
+	return l[0], b[0]
+
 def deproj_bhealpix(x, y):
 	""" Deproject from butterfly-HealPix to lon, lat
 	"""
+	if not isinstance(x, np.ndarray) and not isinstance(y, np.ndarray):
+		return deproj_bhealpix_scalar(x, y)
+
 	# Compute to which of the four healpix slices
 	# this point belongs to
 	l = degrees(np.arctan2(y, x))
