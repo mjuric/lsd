@@ -5,7 +5,7 @@ import os.path
 import numpy as np
 import getopt
 import skysurvey as ss
-from skysurvey.footprint import rectangle
+from skysurvey.footprint import rectangle, beam
 from skysurvey.utils import make_printf_string, as_tuple
 import pyfits
 import skysurvey.pool2 as pool2
