@@ -6,4 +6,9 @@
 *.tgz
 *.h5
 *.png
+*.bak
+*.so
+.smhist
+EGG-INFO
+build
 DEADJOE

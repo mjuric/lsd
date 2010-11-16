@@ -1229,7 +1229,7 @@ def extract_columns(rows, cols=All):
 
 	return ret
 
-def table_join(id1, id2, m1, m2, join_type='outer'):
+def table_join_py(id1, id2, m1, m2, join_type):
 	# The algorithm assumes id1 and id2 have no
 	# duplicated elements
 	if False:
@@ -1319,6 +1319,9 @@ def table_join(id1, id2, m1, m2, join_type='outer'):
 #	print isnull
 
 	return (idx1, idx2, isnull)
+
+from native import table_join
+#table_join = table_join_py
 
 def in_array(needles, haystack):
 	""" Return a boolean array of len(needles) set to 
@@ -1589,9 +1592,9 @@ class ColDict:
 			self.orig_rows[cat2.name] = len(rows2)
 
 			# Join the tables (jmap and rows2), using (m1, m2) linkage information
-			table_join.cell_id = cell_id	# debugging (remove once happy)
-			table_join.cat = cat		# debugging (remove once happy)
-			(idx1, idx2, isnull) = table_join(self.keys, id2, m1, m2, join_type=join_type)
+			#table_join.cell_id = cell_id	# debugging (remove once happy)
+			#table_join.cat = cat		# debugging (remove once happy)
+			(idx1, idx2, isnull) = table_join(self.keys, id2, m1, m2, join_type)
 
 			# Reject rows that are out of the time interval in this table.
 			# We have to do this here as well, to support filtering on time in static_sky->temporal_sky joins
