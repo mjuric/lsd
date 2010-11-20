@@ -26,7 +26,7 @@ from distutils.core import setup, Extension
 from sys import platform
 
 import numpy
-inc = ['src', numpy_include]
+inc = [numpy_include]
 
 longdesc = """Large Survey Database"""
 
@@ -54,8 +54,12 @@ args = {
 					'Topic :: Database',
 					'Topic :: Scientific/Engineering :: Astronomy'
 	],
+	'scripts'	: ['src/lsd-footprint', 'src/lsd-import-sdss', 'src/lsd-make-object-catalog',
+	 			'src/lsd-import-dvo', 'src/lsd-import-smf',
+	 			'src/lsd-query', 'src/lsd-xmatch'],
 	'packages'	: ['skysurvey'],
-	'ext_modules'	: [Extension('skysurvey.native', ['src/native.cpp'], include_dirs=inc)]
+	'package_dir'	: {'': 'src'},
+	'ext_modules'	: [Extension('skysurvey.native', ['src/native/main.cpp'], include_dirs=inc)]
 }
 
 setup(**args)

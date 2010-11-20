@@ -77,7 +77,7 @@ def ls_mapper(rows):
 def compute_counts(cat, include_cached=False):
 	ntotal = 0
 	primary_key = cat._get_schema(cat.primary_table)['primary_key']
-	for (cell_id, nobjects) in cat.map_reduce(primary_key, ls_mapper, include_cached=include_cached):
+	for (_, nobjects) in cat.map_reduce(primary_key, ls_mapper, include_cached=include_cached):
 		ntotal = ntotal + nobjects
 	return ntotal
 ###################################################################

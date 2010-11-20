@@ -50,6 +50,24 @@ class intervalset:
 
 		return in_
 
+def xy_to_cell_id(x, y, t = None):
+	if t is None:
+		t = 0., 0., 1.
+	t, t0, dt = t
+
+	ct = astype((t - t0) / dt, np.uint64)
+	ct = np.where(ct < np.uint64(0), np.uint64(0), ct)
+
+	# construct the 32bit ID prefix from the above
+	# Prefix format: 10bit x + 10bit y + 12bit time
+	ix   = astype((1 + x) / 2. * 2**10, np.uint64)
+	iy   = astype((1 + y) / 2. * 2**10, np.uint64)
+	id   = ix << 22
+	id  |= iy << 12
+	id  |= ct & 0xFFF
+	id <<= 32
+
+	return id
 
 def isiterable(x):
 	try:

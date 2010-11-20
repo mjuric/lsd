@@ -130,3 +130,76 @@ def rectangle(lon0, lat0, lon1, lat1, coordsys='equ'):
 		raise Exception('Unknown coordinate system')
 
 	return make_healpix_poly(lon, lat)
+
+from intervalset import intervalset
+
+def __part_to_xy_t(part):
+	""" Used by canonicize_bounds """
+	bounds_xy = Polygon.Polygon()
+	bounds_t = intervalset()
+	for v in part:
+		if   isinstance(v, Polygon.Polygon):
+			bounds_xy |= v
+		elif isinstance(v, intervalset):
+			bounds_t |= v
+		else:
+			raise Exception('Incorrect part specification')
+
+	if not bounds_xy:		bounds_xy =  ALLSKY
+	if len(bounds_t) == 0:	bounds_t = intervalset((-np.inf, np.inf))
+
+	return (bounds_xy, bounds_t)
+
+def make_canonical(foot):
+	"""
+	    The footprint can either be a Polyon, a specific 
+	    cell_id integer, a (t0, t1) time tuple, or an array
+	    of these.
+
+		Returns a list of (Polygon, intervalset) tuples.
+	"""
+	from collections import defaultdict
+
+	# Handle all-sky requests, and scalars
+	if foot == []:
+		#foots = [ ALLSKY ]
+		return None
+	elif not isinstance(foot, list):
+		foots = [ foot ]
+	else:
+		foots = foot
+
+	# Now our input is a list that consists of one or more of:
+	# a) Polygon instances
+	# b) interval instances
+	# c) tuples or lists of (Polygon, interval, Polygon, interval, ...)
+	# e) cell_ids (integers)
+	#
+	# Do the following:
+	# - extract a) and b) and form a single ([Polygon], interval), add it to the list
+	# - append e) to the output list
+	# - for each tuple:
+	#	form a single ([Polygon], interval)
+	# 	call _get_cell_recursive to obtain cell_ids, append them to output
+
+	#print "***INPUT:", foots;
+
+	# cell->foot->times
+	cells = defaultdict(dict)
+	part0 = []
+	parts = []
+	for v in foots:
+		if   isinstance(v, Polygon.Polygon) or isinstance(v, intervalset):
+			part0.append(v)
+		elif isinstance(v, tuple) or isinstance(v, list):
+			parts.append(v)
+		else:
+			cells[int(v)][None] = None	# Fetch entire cell (space and time)
+
+	#print "****A1:", cells, part0, parts;
+	if part0:
+		parts.insert(0, part0)
+
+	bounds = [ __part_to_xy_t(part) for part in parts]
+
+	return bounds

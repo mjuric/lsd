@@ -5,13 +5,13 @@ import os.path
 import numpy as np
 import getopt
 import skysurvey as ss
-from skysurvey.footprint import rectangle, beam
+from skysurvey.footprint import rectangle, beam, make_canonical
 from skysurvey.utils import make_printf_string, as_tuple
 import pyfits
 import skysurvey.pool2 as pool2
 
 def usage():
-	print "Usage: %s --bounds=bounds --format=[fits|text] --output=[outputfile] --quiet <catalog> <query>" % sys.argv[0]
+	print "Usage: %s --bounds=bounds --format=[fits|text] --output=[outputfile] --quiet <database> <query>" % sys.argv[0]
 
 try:
 	optlist, args = getopt.getopt(sys.argv[1:], 'b:f:o:q', ['bounds=', 'format=', 'output=', 'quiet'])
@@ -44,14 +44,14 @@ def T(*args):
 	else:
 		return intervalset(tuple(args))
 
-foot = []
+bounds = []
 format = 'text'
 output = 'output.fits'
 progress_callback = None
 for o, a in optlist:
 	if o in ('-b', '--bounds'):
-		foot.extend(eval('[' + a + ']'))
-		#print foot; exit()
+		bounds.extend(eval('[' + a + ']'))
+		#print bounds; exit()
 	if o in ('--format', '-f'):
 		if a not in ['text', 'fits']: usage(); exit(-1);
 		format = a
@@ -59,18 +59,21 @@ for o, a in optlist:
 		output = a
 	if o in ('--quiet', '-q'):
 		progress_callback = pool2.progress_pass
-catname, query = args
+dbdir, query = args
 
-
+#dbdir = '../../ps1'
+#query = '_ID, ps1_det._ID, ps1_exp._ID, sdss._ID FROM sdss(outer), ps1_obj, ps1_det, ps1_exp(outer)'
 
 ######### Actual work
 
-cat = ss.Catalog(catname)
+bounds = make_canonical(bounds)
+
+q = ss.Query(dbdir, query)
 if format == 'text':
 	# Text output
 	fmt = None
 	##rprev = None
-	for row in cat.iterate(query, foot, progress_callback=progress_callback):
+	for row in q.iterate(bounds, progress_callback=progress_callback):
 		if fmt == None:
 			fmt = make_printf_string(row)
 			print '# ' + ' '.join(row.dtype.names)
@@ -81,7 +84,7 @@ if format == 'text':
 		##rprev = row.copy()
 else:
 	# FITS output
-	rows = cat.fetch(query, foot, progress_callback=progress_callback)
+	rows = q.fetch(bounds, progress_callback=progress_callback)
 
 	if 'cksumok' in rows.dtype.names:
 		# Do ./lsd-query --format=fits ps1 'vecmd5(hdr) == cksum as cksumok'

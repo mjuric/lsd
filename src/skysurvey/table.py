@@ -55,7 +55,7 @@ class Table(object):
 	##
 	def keys(self):
 		# Return the list of columns, in order of appearance
-		return [ self.column_map[pos] for (pos, col) in enumerate(self.column_data) ]
+		return [ self.column_map[pos] for (pos, _) in enumerate(self.column_data) ]
 
 	def items(self):
 		# Return a list of (name, column) tuples
@@ -69,6 +69,10 @@ class Table(object):
 			return self.subtable(key)
 
 		# Compute the slice
+		if len(self) == 0:
+				# Otherwise multidimensional arrays will throw an IndexError
+				# (I personally think that's an annoying inconsistency in numpy)
+				key = np.s_[:]
 		ret = [ (self.column_map[pos], col[key])   for (pos, col) in enumerate(self.column_data) ]
 
 		# Return a Table if the key was an instance of a slice or ndarray,
@@ -86,6 +90,16 @@ class Table(object):
 					row[name] = val
 			return row
 
+	def drop_column(self, key):
+		pos  = self.column_map[key] if     isinstance(key, str) else key
+		cols = self.items()
+
+		del self.column_data[pos]
+		del cols[pos]
+
+		self.column_map = dict(( (colname, pos)    for (pos, (colname, _)) in enumerate(cols) ))
+		self.column_map.update(( (pos, colname)    for (pos, (colname, _)) in enumerate(cols) ))
+
 	def __setitem__(self, key, value):
 		# Append a column to the table, or replace data
 		# in an existing column or entire table slice
@@ -98,7 +112,7 @@ class Table(object):
 			if isinstance(value, Table):
 				# fast but specialized
 				assert value.keys() == self.keys()
-				for (pos, col) in enumerate(self.column_data):
+				for (pos, _) in enumerate(self.column_data):
 					self.column_data[pos][key] = value.column_data[pos]
 			else:
 				# slow but generic
@@ -136,6 +150,10 @@ class Table(object):
 
 #		self._mk_row()
 
+	def add_columns(self, cols):
+		for name, col in cols:
+			self.add_column(name, col)
+
 	def add_column(self, name, col, supress_row_update=False):
 		# sanity check: require numpy arrays
 		assert isinstance(col, np.ndarray)
@@ -156,7 +174,7 @@ class Table(object):
 #			self.row = make_record(self.dtype)
 
 	def resize(self, size, refcheck=True):
-		for (pos, col) in enumerate(self.column_data):
+		for (pos, _) in enumerate(self.column_data):
 			self.column_data[pos] = np.resize(self.column_data[pos], size)
 
 #	def append_rows(self, other):

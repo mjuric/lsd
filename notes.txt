@@ -1,6 +1,0 @@
-# Plotting an image in pylab
-
-img = getdata('foot.0.05.fits')
-subplot(111, axisbg='black')
-imshow(img[::-1,::-1], cmap=cm.gray, norm=matplotlib.colors.LogNorm())
-savefig('test.png', dpi=1200)

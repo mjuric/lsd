@@ -2,7 +2,7 @@
 
 #from math import *
 import numpy as np
-from numpy import sin, cos, radians, fmod, sqrt, pi, arcsin, degrees, abs, floor, fabs
+from numpy import cos, radians, fmod, sqrt, pi, arcsin, degrees, abs, floor, fabs
 
 def proj_healpix(l, b):
 	z   = cos(radians(90.-b))
@@ -93,20 +93,23 @@ def xy_center(x, y, level):
 def pix_size(level):
 	return 2.**(1-level)
 
+def NSIDE(level):
+	""" The HealPix NSIDE parameter corresponding to our level """
+	return width(level) / 4
+
+def pix_area(lev):
+	""" The area (in degrees) of a pixel at level lev """
+	return (129600. / np.pi) / (3./4. * width(lev)**2)
+
 def pix_idx(x, y, level):
 	i, j = xy_to_ij(x, y, level)
-	wh = nside(level)
+	wh = width(level)
 	i = i + wh/2; j = j + wh/2;
 	return j * wh + i
 
-def nside(level):
+def width(level):
 	''' Return the number of pixels on the side for a given split level. '''
 	return 2**level
-
-def get_subpath(x, y, level):
-	(cx, cy) = xy_center(x, y, level)
-	#return "%+g%+g%+g" % (cx, cy, pix_size(level))
-	return "%+g%+g" % (cx, cy)
 
 def get_pixel_level(x, y):
 	# deduce the level, assuming (x,y) are the center of a pixel
@@ -123,16 +126,6 @@ def get_pixel_level(x, y):
 
 	return levx
 
-def get_path(x, y, level = None):
-	if level == None:
-		level = get_pixel_level(x, y)
-
-	path = '';
-	for lev in xrange(1, level+1):
-		(i, j) = xy_center(x, y, level)
-		path = path + get_subpath(x, y, lev) + '/'
-	return path[:-1]
-
 def testview():
 	vl = np.arange(0., 360., 5.)
 	vb = np.arange(-90., 90., 5.)
@@ -147,7 +140,7 @@ def testpix():
 	for ctr in xrange(100000):
 		(x, y) = ran.uniform(-1, 1), ran.uniform(-1, 1)
 		i, j = xy_center(x, y, k)
-		ns   = nside(k)
+		ns   = width(k)
 		dx   = pix_size(k)
 		if not (i-dx/2 <= x < i+dx/2) or not (j-dx/2 <= y < j+dx/2):
 			print x, y, '->', i, j, ns, dx, get_path(x, y, k)

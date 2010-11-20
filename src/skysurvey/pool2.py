@@ -10,9 +10,12 @@ import time
 from utils import unpack_callable
 
 def _worker(qin, qout):
-	# Just dispatch the call to the target function
+	# Dispatch the call to the target function, collecting
+	# back yielded results and returning them as a list
 	for mapper, i, args in iter(qin.get, 'EXIT'):
-		qout.put((i, mapper(*args)))
+		for result in mapper(*args):
+			qout.put((i, result))
+		qout.put("DONE")
 
 def _reduce_from_pickled(kw, pkl, reducer, args):
 	# open the piclke jar, load the objects, pass them on to the
@@ -108,7 +111,7 @@ class Pool:
 
 		self.qin = Queue()
 		self.qout = Queue(self.nworkers*2)
-		self.ps = [ Process(target=_worker, args=(self.qin, self.qout)) for i in xrange(self.nworkers) ]
+		self.ps = [ Process(target=_worker, args=(self.qin, self.qout)) for _ in xrange(self.nworkers) ]
 
 		for p in self.ps:
 			p.daemon = True
@@ -147,9 +150,15 @@ class Pool:
 			n = i + 1
 
 			# yield the outputs
-			for val in xrange(n):
-				(i, result) = self.qout.get()
-				progress_callback(progress_callback_stage, 'step', input, i, result)
+			k = 0
+			while k != n:
+				ret = self.qout.get()
+				if isinstance(ret, str) and ret == 'DONE':
+					k += 1
+					progress_callback(progress_callback_stage, 'step', input, k, None)
+					continue
+
+				(i, result) = ret
 				if return_index:
 					yield (i, result)
 				else:
@@ -157,12 +166,12 @@ class Pool:
 		else:
 			# Execute in-thread, without external workers
 			for (i, val) in enumerate(input):
-				result = mapper(val, *mapper_args)
+				for result in mapper(val, *mapper_args):
+					if return_index:
+						yield (i, result)
+					else:
+						yield result
 				progress_callback(progress_callback_stage, 'step', input, i, result)
-				if return_index:
-					yield (i, result)
-				else:
-					yield result
 
 		progress_callback(progress_callback_stage, 'end', input, None, None)
 
@@ -273,8 +282,8 @@ class Pool:
 					yield r
 				else:
 					# Prepare for next reduction
-					for (k, v) in r:
-						mresult[k].append(v)
+					(k, v) = r
+					mresult[k].append(v)
 
 			input = mresult.items()
 
