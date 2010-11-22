@@ -113,8 +113,8 @@ def rectangle(lon0, lat0, lon1, lat1, coordsys='equ'):
 	#lat = [lat0] * nsplit + [lat1]*nsplit
 
 	# Generate a well sampled CCW rectangle
-	nlon = int(round((lon1 - lon0) / 0.1) + 1)
-	nlat = int(round((lat1 - lat0) / 0.1) + 1)
+	nlon = max(int(round((lon1 - lon0) / 0.1) + 1), 10)
+	nlat = max(int(round((lat1 - lat0) / 0.1) + 1), 10)
 	vlon0 = np.linspace(lon0, lon1, nlon); vlon1 = vlon0[::-1]
 	vlat0 = np.linspace(lat0, lat1, nlat); vlat1 = vlat0[::-1]
 	lon = np.concatenate((vlon0, [lon1]*nlat, list(vlon1), [lon0]*nlat))

@@ -1,49 +1,20 @@
 #!/usr/bin/env python
 
-import query_parser as qp
-from collections import defaultdict
-from contextlib import contextmanager
 import subprocess
-import pickle
 import tables
-import numpy.random as ran
 import numpy as np
 import pyfits
-from math import *
 import bhpix
-import Polygon.Shapes
-import itertools as it
-from itertools import izip, imap
-from multiprocessing import Pool
-import multiprocessing as mp
 import time
 import sys
-import pool2
-import os, errno, glob
+import os
 import json
-import fcntl
-import Polygon.IO
 import utils
-import footprint
-from table import Table
-from utils import astype, gc_dist, unpack_callable, full_dtype, is_scalar_of_type, isiterable
-from intervalset import intervalset
+from utils import is_scalar_of_type
 from StringIO import StringIO
 from pixelization import Pixelization
-from native import table_join
-
-def vecmd5(x):
-	import hashlib
-	l = np.empty(len(x), dtype='a32')
-	for i in xrange(len(x)):
-		l[i] = hashlib.md5(x[i]).hexdigest()
-	return l
-
-def veclen(x):
-	l = np.empty(len(x), dtype=int)
-	for i in xrange(len(x)):
-		l[i] = len(x[i])
-	return l
+from collections import OrderedDict
+from contextlib import contextmanager
 
 # Special return type used in _mapper() and Catalog.map_reduce
 # to denote that the returned value should not be yielded to
@@ -62,12 +33,28 @@ Automatic = None
 Default = None
 All = []
 
+class ColumnType(object):
+	""" A simple record representing columns. Built at runtime
+	    from _tables entries, and stored in Catalog.columns
+	"""
+	name    = None
+	table   = None
+	dtype   = None
+	is_blob = False
+
 class Catalog:
 	""" A spatially and temporally partitioned object catalog.
 	
 	    The usual workhorses are Catalog.fetch, Catalog.iterate
 	    and Catalog.map_reduce methods.
 	"""
+
+#	class TableSchema(object):
+#		""" A simple record representing column groups.
+#		"""
+#		name    = None
+#		columns = None
+
 	path = '.'
 	pix  = Pixelization(level=6, t0=54335, dt=1)
 				# t0: default starting epoch (== 2pm HST, Aug 22 2007 (night of GPC1 first light))
@@ -76,25 +63,16 @@ class Catalog:
 
 	NULL = 0		# The value for NULL in JOINed rows that had no matches
 
-	tables  = None		# Tables in catalog ( dict of lists of (tablename, schema, primary_key) tuples)
-	hidden_tables = None	# Tables in catalog that do not participate in direct joins/fetches (e.g., xmatch tables)
+	_tables  = None		# Tables in catalog ( dict of lists of (tablename, schema, primary_key) tuples)
+
+	columns       = None
 	primary_table = None	# Primary table of this catalog ( the one holding the IDs and spatial/temporal keys)
-
-	joined_catalogs = None	# External, cross-matched catalogs (see add_joined_catalog for schema of this dict)
-
-	def all_columns(self):
-		# Return the list of all columns in all tables of the catalog
-		# Return the primary table's columns first, followed by other tables in alphabetical order
-		cols = list(self.tables[self.primary_table]['columns'])	# Note: wrapped in list() to get a copy
-		for name in sorted(self.tables.keys()):
-			if name == self.primary_table:
-				continue
-			cols += self.tables[name]['columns']
-		# Extract just the names
-		return [ name for name, _ in cols ]
+	primary_key   = None
+	spatial_keys  = None
+	temporal_key  = None
 
 	### File name/path related methods
-	def get_table_data_path(self, table):
+	def _get_table_data_path(self, table):
 		""" Allow individual tables to override where they're placed
 		    This comes in handy for direct JOINs.
 		"""
@@ -105,31 +83,31 @@ class Catalog:
 		""" The filename of a tablet in a cell """
 		return '%s.%s.h5' % (self.name, table)
 
-	def _cell_prefix(self, cell_id):
-		return '%s/%s/%s' % (self.get_table_data_path(self.primary_table), self.pix.path_to_cell(cell_id), self.name)
-
 	def _tablet_file(self, cell_id, table):
-		return '%s/%s/%s' % (self.get_table_data_path(table), self.pix.path_to_cell(cell_id), self._tablet_filename(table))
+		return '%s/%s/%s' % (self._get_table_data_path(table), self.pix.path_to_cell(cell_id), self._tablet_filename(table))
 
 	def tablet_exists(self, cell_id, table=None):
 		""" Return True if the given tablet exists in cell_id """
 		if table is None:
 			table = self.primary_table
 
-		assert (table in self.tables) or (table in self.hidden_tables)
+		assert table in self._tables
 
 		fn = self._tablet_file(cell_id, table)
 		return os.access(fn, os.R_OK)
 
-	def static_if_no_temporal(self, cell_id, table):
-		""" Try to locate tablet 'table' in cell_id. If there's
-		    no such tablet, return a corresponding static sky
-		    cell_id
+	def _cell_prefix(self, cell_id):
+		return '%s/%s/%s' % (self._get_table_data_path(self.primary_table), self.pix.path_to_cell(cell_id), self.name)
+
+	def static_if_no_temporal(self, cell_id):
+		""" See if we have data in cell_id. If not, return a
+		    corresponding static sky cell_id. Useful when evaluating
+		    static-temporal JOINs
 		"""
 		if not self.pix.is_temporal_cell(cell_id):
 			return cell_id
 
-		if self.tablet_exists(cell_id, table):
+		if self.tablet_exists(cell_id):
 			##print "Temporal cell found!", self._cell_prefix(cell_id)
 			return cell_id
 
@@ -141,7 +119,7 @@ class Catalog:
 	def get_cells(self, bounds, return_bounds=False):
 		""" Return a list of cells
 		"""
-		data_path = self.get_table_data_path(self.primary_table)
+		data_path = self._get_table_data_path(self.primary_table)
 		pattern   = self._tablet_filename(self.primary_table)
 
 		return self.pix.get_cells(data_path, pattern, bounds, return_bounds=return_bounds)
@@ -155,79 +133,92 @@ class Catalog:
 
 	#############
 
-	def _load_dbinfo(self):
-		data = json.loads(file(self.path + '/dbinfo.json').read())
+	def _load_schema(self):
+		data = json.loads(file(self.path + '/schema.cfg').read(), object_pairs_hook=OrderedDict)
 
 		self.name = data["name"]
-		self.__nrows = data["nrows"]
+		self.__nrows = data.get("nrows", None)
 
 		######################
 		# Backwards compatibility
 		level, t0, dt = data["level"], data["t0"], data["dt"]
 		self.pix = Pixelization(level, t0, dt)
 
-		#################################### Remove at some point
-		# Backwards compatibility
-		if "columns" in data:
-			data["tables"] = \
-			{
-				"catalog":
-				{
-					"columns":   data["columns"],
-					"primary_key": "id",
-					"spatial_keys": ("ra", "dec"),
-					"cached_flag": "cached",
-					"exposure_key": "exp_id",
-					"blobs": dict()
-				}
-			}
-			data["primary_table"] = 'catalog'
-		if "hidden_tables" not in data: data["hidden_tables"] = {}
-		if "joined_catalogs" not in data: data["joined_catalogs"] = {}
-		###############################
-
 		# Load table definitions
-		self.tables = data["tables"]
-		self.hidden_tables = data["hidden_tables"]
-		self.primary_table = data["primary_table"]
-		self.joined_catalogs = data["joined_catalogs"]
+		if isinstance(data['tables'], dict):
+			# Backwards compatibility, keeps ordering because of objecct_pairs_hook=OrderedDict above
+			self._tables = data["tables"]
+		else:
+			self._tables = OrderedDict(data['tables'])
 
 		# Postprocessing: fix cases where JSON restores arrays instead
 		# of tuples, and tuples are required
-		for _, schema in self.tables.iteritems():
-			schema['columns'] = [ tuple(val) for val in schema['columns'] ]
-		for _, schema in self.hidden_tables.iteritems():
+		for _, schema in self._tables.iteritems():
 			schema['columns'] = [ tuple(val) for val in schema['columns'] ]
 
-	def _store_dbinfo(self):
+		self._rebuild_internal_schema()
+
+	def _rebuild_internal_schema(self):
+		# Rebuild internal representation of the schema from self._tables
+		# OrderedDict
+		self.columns = OrderedDict()
+		self.primary_table = None
+
+		for table, schema in self._tables.iteritems():
+			for colname, dtype in schema['columns']:
+				assert colname not in self.columns
+				self.columns[colname] = ColumnType()
+				self.columns[colname].name  = colname
+				self.columns[colname].dtype = np.dtype(dtype)
+				self.columns[colname].table = table
+
+			if self.primary_table is None:
+				self.primary_table = table
+				if 'primary_key'  in schema:
+					self.primary_key  = self.columns[schema['primary_key']]
+				if 'temporal_key' in schema:
+					self.temporal_key = self.columns[schema['temporal_key']]
+				if 'spatial_keys' in schema:
+					(lon, lat) = schema['spatial_keys']
+					self.spatial_keys = (self.columns[lon], self.columns[lat])
+			else:
+				# If any of these are defined, they must be defined in the
+				# primary table
+				assert 'primary_key'  not in schema
+				assert 'spatial_keys' not in schema
+				assert 'temporak_key' not in schema
+
+			if 'blobs' in schema:
+				for colname in schema['blobs']:
+					assert self.columns[colname].dtype.base == np.int64, "Data structure error: blob reference columns must be of int64 type"
+					self.columns[colname].is_blob = True
+
+	def _store_schema(self):
 		data = dict()
 		data["level"], data["t0"], data["dt"] = self.pix.level, self.pix.t0, self.pix.dt
 		data["nrows"] = self.__nrows
-		data["tables"] = self.tables
-		data["hidden_tables"] = self.hidden_tables
-		data["primary_table"] = self.primary_table
+		data["tables"] = self._tables.items()
 		data["name"] = self.name
-		data["joined_catalogs"] = self.joined_catalogs
 
-		f = open(self.path + '/dbinfo.json', 'w')
+		f = open(self.path + '/schema.cfg', 'w')
 		f.write(json.dumps(data, indent=4, sort_keys=True))
 		f.close()
 
-	def create_table(self, table, schema, ignore_if_exists=False, hidden=False):
+	###############
+
+	def create_table(self, table, schema, ignore_if_exists=False):
 		# Create a new table and set it as primary if it
 		# has a primary_key
-		if ((table in self.tables) or (table in self.hidden_tables)) and not ignore_if_exists:
+		if table in self._tables and not ignore_if_exists:
 			raise Exception('Trying to create a table that already exists!')
 
-		tables = self.tables if not hidden else self.hidden_tables
-		tables[table] = schema
+		self._tables[table] = schema
 
 		if 'primary_key' in schema:
-			assert not hidden
 			if 'spatial_keys' not in schema:
 				raise Exception('Trying to create a primary table with no spatial keys!')
 			if self.primary_table is not None:
-				raise Exception('Trying to create a primary table while one already exists!')
+				raise Exception('Trying to create a primary table ("%s") while one ("%s") already exists!' % (table, self.primary_table))
 			self.primary_table = table
 
 		if 'blobs' in schema:
@@ -235,7 +226,8 @@ class Catalog:
 			for blobcol in schema['blobs']:
 				assert is_scalar_of_type(cols[blobcol], np.int64)
 
-		self._store_dbinfo()
+		self._rebuild_internal_schema()
+		self._store_schema()
 
 	### Cell locking routines
 	def _lock_cell(self, cell_id, retries=-1):
@@ -325,7 +317,9 @@ class Catalog:
 			self.create_catalog(name, path, level, t0, dt)
 		else:
 			self.path = path
-			self._load_dbinfo()
+			if not os.path.isdir(self.path):
+				raise Exception('Cannot access table: "%s" is inexistant or not readable.' % (path))
+			self._load_schema()
 
 	def create_catalog(self, name, path, level, t0, dt):
 		""" Create a new catalog and store its definition.
@@ -336,9 +330,8 @@ class Catalog:
 		if os.path.isfile(self.path + '/dbinfo.json'):
 			raise Exception("Creating a new catalog in '%s' would overwrite an existing one." % self.path)
 
-		self.tables = {}
-		self.hidden_tables = {}
-		self.joined_catalogs = {}
+		self._tables = OrderedDict()
+		self.columns = OrderedDict()
 		self.name = name
 
 		if level == Automatic: level = self.pix.level
@@ -346,7 +339,7 @@ class Catalog:
 		if    dt == Automatic: dt = self.pix.dt
 		self.pix = Pixelization(level, t0, dt)
 
-		self._store_dbinfo()
+		self._store_schema()
 
 	def update(self, table, keys, rows):
 		raise Exception('Not implemented')
@@ -399,8 +392,14 @@ class Catalog:
 			t = cols[schema["temporal_key"]]
 		else:
 			t = None
-		cells     = self.cell_for_pos(ra, dec, t)
-		cols[key] = self.id_from_pos(ra, dec, t)
+		cells     = self.pix.cell_id_for_pos(ra, dec, t)
+		cols[key] = self.pix.obj_id_from_pos(ra, dec, t)
+
+		# TODO: Debugging, remove when confident
+		tmp = self.pix.cell_for_id(cols[key])
+		#print self.pix.str_id(cells)
+		#print self.pix.str_id(cols[key][:10])
+		assert np.all(tmp == cells)
 
 		ntot = 0
 		unique_cells = list(set(cells))
@@ -431,7 +430,7 @@ class Catalog:
 				cols2[name] = col[incell]
 
 			# Store them in their tablets
-			for table, schema in self.tables.iteritems():
+			for table, schema in self._tables.iteritems():
 				fp    = self._open_tablet(cell_id, mode='w', table=table)
 				t     = fp.root.main.table
 				blobs = schema['blobs'] if 'blobs' in schema else dict()
@@ -509,11 +508,10 @@ class Catalog:
 		i = i + 'Partitioning:  level=%d\n' % (self.pix.level)
 		i = i + '(t0, dt):      %f, %f \n' % (self.pix.t0, self.pix.dt)
 		i = i + 'Objects:       %d\n' % (self.nrows())
-		i = i + 'Tables:        %s' % str(self.tables.keys())
-		i = i + 'Hidden tables: %s' % str(self.hidden_tables.keys())
+		i = i + 'Tables:        %s' % str(self._tables.keys())
 		i = i + '\n'
 		s = ''
-		for table, schema in dict(self.tables, *self.hidden_tables).iteritems():
+		for table, schema in dict(self._tables).iteritems():
 			s = s + '-'*31 + '\n'
 			s = s + 'Table \'' + table + '\':\n'
 			s = s + "%20s %10s\n" % ('Column', 'Type')
@@ -524,8 +522,7 @@ class Catalog:
 		return i + s
 
 	def _get_schema(self, table):
-		if table in self.tables: return self.tables[table]
-		return self.hidden_tables[table]
+		return self._tables[table]
 
 	def _smart_load_blobs(self, barray, refs):
 		""" Load an ndarray of BLOBs from a set of refs refs,
@@ -559,9 +556,9 @@ class Catalog:
 
 		return blobs
 
-	def fetch_blobs(self, cell_id, table, column, refs, include_cached=False):
-		""" Fetch blobs from column 'column' in a tablet 'table'
-		    of cell cell_id, given a vector of references 'refs'
+	def fetch_blobs(self, cell_id, column, refs, include_cached=False):
+		""" Fetch blobs from column 'column'
+		    in cell cell_id, given a vector of references 'refs'
 
 		    If the cell_id has a temporal component, and there's no
 		    tablet in that cell, a static sky cell corresponding
@@ -571,8 +568,12 @@ class Catalog:
 		if len(refs) == 0:
 			return np.empty(refs.shape, dtype=np.object_)
 
-		# revert to static sky cell if cell_id is temporal, but there's no such tablet
-		cell_id = self.static_if_no_temporal(cell_id, table)
+		# Get the table for this column
+		table = self.columns[column].table
+
+		# revert to static sky cell if cell_id is temporal but
+		# unpopulated (happens in static-temporal JOINs)
+		cell_id = self.static_if_no_temporal(cell_id)
 
 		# Flatten refs; we'll deflatten the blobs in the end
 		shape = refs.shape
@@ -608,8 +609,9 @@ class Catalog:
 		if table is None:
 			table = self.primary_table
 
-		# revert to static sky cell if cell_id is temporal, but there's no such tablet
-		cell_id = self.static_if_no_temporal(cell_id, table)
+		# revert to static sky cell if cell_id is temporal but
+		# unpopulated (happens in static-temporal JOINs)
+		cell_id = self.static_if_no_temporal(cell_id)
 
 		if self.tablet_exists(cell_id, table):
 			with self.get_cell(cell_id) as cell:
@@ -635,68 +637,6 @@ class Catalog:
 #
 #		return self.fetch(query, cell_id, include_cached=include_cached, progress_callback=pool2.progress_pass);
 #
-#	def fetch(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None):
-#		""" Return a table (numpy structured array) of all rows within a
-#		    given footprint. Calls 'filter' callable (if given) to filter
-#		    the returned rows. Returns None if there are no rows to return.
-#
-#		    The 'filter' callable should expect a single argument, rows,
-#		    being the set of rows (numpy structured array) to filter. It
-#		    must return the set of filtered rows (also as numpy structured
-#		    array). E.g., identity filter function would be:
-#		    
-#		    	def identity(rows):
-#		    		return rows
-#
-#		    while a function filtering on column 'r' may look like:
-#		    
-#		    	def r_filter(rows):
-#		    		return rows[rows['r'] < 21.5]
-#		   
-#		    The filter callable must be piclkeable. Extra arguments to
-#		    filter may be given in 'filter_args'
-#		"""
-#
-#		filter, filter_args = unpack_callable(filter)
-#
-#		ret = None
-#		for rows in self.map_reduce(query=query, mapper=(_iterate_mapper, filter, filter_args), _pass_empty=True, foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
-#			# ensure enough memory has been allocated (and do it
-#			# intelligently if not)
-#			if ret is None:
-#				ret = rows
-#				nret = 0
-#
-#			while len(ret) < nret + len(rows):
-#				ret.resize(2*(len(ret)+1))
-#				#print "Resizing to", len(ret)
-#
-#			# append
-#			ret[nret:nret+len(rows)] = rows
-#			nret = nret + len(rows)
-#
-#		ret.resize(nret)
-#		#print "Resizing to", len(ret)
-#		return ret
-#
-#	def iterate(self, query='*', foot=All, include_cached=False, testbounds=True, nworkers=None, progress_callback=None, filter=None, return_blocks=False):
-#		""" Yield rows (either on a row-by-row basis if return_blocks==False
-#		    or in chunks (numpy structured array)) within a
-#		    given footprint. Calls 'filter' callable (if given) to filter
-#		    the returned rows.
-#
-#		    See the documentation for Catalog.fetch for discussion of
-#		    'filter' callable.
-#		"""
-#
-#		filter, filter_args = unpack_callable(filter)
-#
-#		for rows in self.map_reduce(query, (_iterate_mapper, filter, filter_args), foot=foot, testbounds=testbounds, include_cached=include_cached, nworkers=nworkers, progress_callback=progress_callback):
-#			if return_blocks:
-#				yield rows
-#			else:
-#				for row in rows:
-#					yield row
 
 	class CellProxy:
 		cat     = None
@@ -743,7 +683,7 @@ class Catalog:
 		    This routine works in tandem with _cache_maker_mapper
 		    and _cache_maker_reducer auxilliary routines.
 		"""
-		margin_x = sqrt(2.) / 180. * (margin_x_arcsec/3600.)
+		margin_x = np.sqrt(2.) / 180. * (margin_x_arcsec/3600.)
 
 		# Find out which columns are our spatial keys
 		schema = self._get_schema(self.primary_table)
@@ -752,7 +692,7 @@ class Catalog:
 
 		ntotal = 0
 		ncells = 0
-		for (cell_id, ncached) in self.map_reduce(query, (_cache_maker_mapper, margin_x), _cache_maker_reducer):
+		for (_, ncached) in self.map_reduce(query, (_cache_maker_mapper, margin_x), _cache_maker_reducer):
 			ntotal = ntotal + ncached
 			ncells = ncells + 1
 			#print self._cell_prefix(cell_id), ": ", ncached, " cached objects"
@@ -765,41 +705,18 @@ class Catalog:
 		"""
 		from tasks import compute_counts
 		self.__nrows = compute_counts(self)
-		self._store_dbinfo()
+		self._store_schema()
 
 	def get_spatial_keys(self):
 		# Find out which columns are our spatial keys
-		return self._get_schema(self.primary_table).get("spatial_keys", (None, None))
+		return (self.spatial_keys[0].name, self.spatial_keys[1].name) if self.spatial_keys is not None else (None, None)
 
 	def get_primary_key(self):
 		# Find out which columns are our spatial keys
-		return self._get_schema(self.primary_table)["primary_key"]
+		return self.primary_key.name
 
 	def get_temporal_key(self):
-		return self._get_schema(self.primary_table).get("temporal_key", None)
-
-	def define_join(self, cat, table_from, table_to, column_from, column_to):
-		# Schema:
-		#	catalog_name: {
-		#		'path': path,
-		#		'table_from': table_name
-		#		'table_to':   table_name
-		#		'column_from':  'id1'
-		#		'column_to':    'id2'
-		#	}
-		#
-		# A simple case is where table_from = table_to, with only column_from and
-		# column_to as their columns.
-		self.joined_catalogs[cat.name] = \
-		{
-			'path':			cat.path,	# The path to the foreign catalog
-
-			'table_from':		table_from,	# The table in _this_ catalog with the 'column_from' column
-			'table_to':		table_to,	# The table in _this_ catalog with the 'column_to' column
-			'column_from':		column_from,	# The primary keys of rows in this catalog, to be joined with the other catalog
-			'column_to':		column_to	# The primary keys of corresponding rows in the foreign catalog
-		}
-		self._store_dbinfo()
+		return self.temporal_key.name if self.temporal_key else None
 
 ###############################################################
 # Aux functions implementing Catalog.iterate and Catalog.fetch

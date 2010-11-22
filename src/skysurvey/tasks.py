@@ -11,56 +11,48 @@ from utils import as_columns, gnomonic, gc_dist, unpack_callable
 
 ###################################################################
 ## Sky-coverage computation
-def _coverage_mapper(rows, dx = 1., filter=None, filter_args=()):
-	self = _coverage_mapper
+def _coverage_mapper(qresult, dx, filter):
+	filter, filter_args = unpack_callable(filter)
 
-	if filter is not None:
-		rows = filter(rows, *filter_args)
+	for rows in qresult:
+		if filter is not None:
+			rows = filter(rows, *filter_args)
 
-	if len(rows) == 0:
-		return (None, None, None, None)
+		lon, lat = rows.as_columns()
+	
+		i = (lon / dx).astype(int)
+		j = ((90 - lat) / dx).astype(int)
+	
+		(imin, imax, jmin, jmax) = (i.min(), i.max(), j.min(), j.max())
+		w = imax - imin + 1
+		h = jmax - jmin + 1
+		i -= imin; j -= jmin
+	
+		if False:
+			# Binning (method #1, straightforward but slow)
+			sky = np.zeros((w, h))
+			for (ii, jj) in izip(i, j):
+				sky[ii, jj] += 1
+		else:
+			# Binning (method #2, fast)
+			sky2 = np.zeros(w*h)
+			idx = np.bincount(j + i*h)
+			sky2[0:len(idx)] = idx
+			sky = sky2.reshape((w, h))
 
-	lon, lat = as_columns(rows, 2)
+		yield (sky, imin, jmin)
 
-	i = (lon / dx).astype(int)
-	j = ((90 - lat) / dx).astype(int)
-
-	(imin, imax, jmin, jmax) = (i.min(), i.max(), j.min(), j.max())
-	w = imax - imin + 1
-	h = jmax - jmin + 1
-	i -= imin; j -= jmin
-
-	if False:
-		# Binning (method #1, straightforward but slow)
-		sky = np.zeros((w, h))
-		for (ii, jj) in izip(i, j):
-			sky[ii, jj] += 1
-	else:
-		# Binning (method #2, fast)
-		sky2 = np.zeros(w*h)
-		idx = np.bincount(j + i*h)
-		sky2[0:len(idx)] = idx
-		sky = sky2.reshape((w, h))
-
-	#assert not (sky-sky2).any()
-
-	return (sky, imin, jmin)
-
-def compute_coverage(cat, dx = 0.5, include_cached=False, filter=None, foot=catalog.All, query='ra, dec'):
+def compute_coverage(db, query, dx = 0.5, bounds=None, include_cached=False, filter=None):
 	""" compute_coverage - produce a sky map of coverage, using
 	    a filter function if given. The output is a starcount
 	    array in (ra, dec) binned to <dx> resolution.
 	"""
-	filter, filter_args = unpack_callable(filter)
-
 	width  = int(round(360/dx))
 	height = int(round(180/dx))
 
 	sky = np.zeros((width, height))
 
-	for (patch, imin, jmin) in cat.map_reduce(query, (_coverage_mapper, dx, filter, filter_args), foot=foot, include_cached=include_cached):
-		if patch is None:
-			continue
+	for (patch, imin, jmin) in db.query(query).execute([(_coverage_mapper, dx, filter)], bounds=bounds, include_cached=include_cached):
 		sky[imin:imin + patch.shape[0], jmin:jmin + patch.shape[1]] += patch
 
 	print "Objects:", sky.sum()

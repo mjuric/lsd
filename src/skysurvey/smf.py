@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import catalog
+from join_ops import DB
 import pyfits
 import pool2
 import time
@@ -212,20 +212,6 @@ obj_cat_def = \
 def to_dtype(cols):
 	return list(( (name, dtype) for (name, dtype, _) in cols ))
 
-def create_catalog(catdir, name, catdef):
-	"""
-		Creates the catalog given the extended schema description.
-
-	"""
-	cat = catalog.Catalog(catdir, name=name, mode='c')
-
-	for tname, schema in catdef.iteritems():
-		schema = copy.deepcopy(schema)
-		schema['columns'] = [ (name, type) for (name, type, _, _) in schema['columns'] ]
-		cat.create_table(tname, schema)
-
-	return cat
-
 def gen_cat2fits(catdef):
 	""" Returns a mapping from catalog columns to
 	    FITS columns:
@@ -249,22 +235,28 @@ def gen_cat2type(catdef):
 		
 	return cat2type
 
-def import_from_smf(det_catdir, exp_catdir, smf_files, create=False):
+def import_from_smf(dbdir, det_catname, exp_catname, smf_files, create=False):
 	""" Import a PS1 catalog from DVO
 
 	    Note: Assumes underlying shared storage for all catalog
 	          cells (i.e., any worker is able to write to any cell).
 	"""
+	db = DB(dbdir)
+
 	if create:
 		# Create the new database
-		det_cat = create_catalog(det_catdir, 'ps1_det', det_cat_def)
-		exp_cat = create_catalog(exp_catdir, 'ps1_exp', exp_cat_def)
+		det_cat  = db.create_catalog(det_catname, det_cat_def)
+		exp_cat  = db.create_catalog(exp_catname, exp_cat_def)
 
 		# Set up a one-to-X join relationship between the two catalogs (join det_cat:exp_id->exp_cat:exp_id)
-		det_cat.define_join(exp_cat, 'astrometry', 'astrometry', 'det_id', 'exp_id')
+		db.define_join('%s:%s' % (det_catname, exp_catname),
+			type = 'indirect',
+			m1   = ("ps1_det", "det_id"),
+			m2   = ("ps1_det", "exp_id")
+			)
 	else:
-		det_cat = catalog.Catalog(det_catdir)
-		exp_cat = catalog.Catalog(exp_catdir)
+		det_cat = db.catalog(det_catname)
+		exp_cat = db.catalog(exp_catname)
 
 	det_c2f = gen_cat2fits(det_cat_def)
 	exp_c2f = gen_cat2fits(exp_cat_def)
@@ -430,7 +422,7 @@ def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
 
 	ids = det_cat.append(det_cols_all)
 
-	return (file, len(ids), len(ids))
+	yield (file, len(ids), len(ids))
 
 #########
 
@@ -442,10 +434,12 @@ def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
 #    cells.
 # 3) store the copies into the cache of each cell.
 
-def make_image_cache(det_cat_path, exp_cat_path):
+def make_image_cache(dbdir, det_cat_path, exp_cat_path):
 	# Entry point for creation of image cache
-	det_cat = catalog.Catalog(det_cat_path)
-	exp_cat = catalog.Catalog(exp_cat_path)
+
+	db = DB(dbdir)
+	det_cat = db.catalog(det_cat_path)
+	exp_cat = db.catalog(exp_cat_path)
 
 	# Fetch all non-empty cells with detections. This will be the
 	# list over which the first kernel will map.

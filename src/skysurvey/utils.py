@@ -1,73 +1,54 @@
 import subprocess, os, errno
 import numpy as np
 
-class intervalset:
-	""" A simple class representing a set of closed intervals.
-	    Has two methods: add(i) to add a new interval i, and
-	    isInside(x) to test whether each point in a NumPy
-	    array x is inside the interval set.
-	"""
-	def __init__(self, *ivals):
-		self.data = []
-		for i in ivals:
-			self.add(i)
-
-	def add(self, i):
-		# Add an interval to this interval set.
-		assert len(i) == 2
-
-		# Find intervals overlaping this one
-		il = bisect_left(self.data, i[0])
-		ir =  bisect_right(self.data, i[1])
-
-		# Cut out all the points in the middle
-		del self.data[il:ir]
-
-		if il % 2 == 0:	# Left edge is outside an existing interval. Insert it
-			self.data.insert(il, i[0])
-			il += 1
-		if ir %2 == 0: # Right edge is outside an existing interval. Insert it
-			self.data.insert(il, i[1])
-
-		assert len(self.data) % 2 == 0
-
-	def isInside(self, x):
-		""" Element-wise test if numpy array x is in the
-		    interval set. Returns a bool NumPy array.
-		    
-		    Scales like O(len(Nivals)*len(Npts)) but since numpy
-		    arrays are used, and for small interval sets, it's
-		    usually fast enough (note that a Python-only "optimal"
-		    O(log(Nivals)*len(Npts)) implementation would be many
-		    times slower because of interpreter overhead)
-		"""
-		x = np.array(x, copy=False)
-		ivals = np.array(self.data, copy=False)
-
-		in_ = np.zeros(len(x), dtype=bool)
-		for i in xrange(0, len(ivals), 2):
-			in_ |= (ivals[i] <= x) & (x <= ivals[i+1])
-
-		return in_
-
-def xy_to_cell_id(x, y, t = None):
-	if t is None:
-		t = 0., 0., 1.
-	t, t0, dt = t
-
-	ct = astype((t - t0) / dt, np.uint64)
-	ct = np.where(ct < np.uint64(0), np.uint64(0), ct)
-
-	# construct the 32bit ID prefix from the above
-	# Prefix format: 10bit x + 10bit y + 12bit time
-	ix   = astype((1 + x) / 2. * 2**10, np.uint64)
-	iy   = astype((1 + y) / 2. * 2**10, np.uint64)
-	id   = ix << 22
-	id  |= iy << 12
-	id  |= ct & 0xFFF
-	id <<= 32
-
-	return id
+#class intervalset:
+#	""" A simple class representing a set of closed intervals.
+#	    Has two methods: add(i) to add a new interval i, and
+#	    isInside(x) to test whether each point in a NumPy
+#	    array x is inside the interval set.
+#	"""
+#	def __init__(self, *ivals):
+#		self.data = []
+#		for i in ivals:
+#			self.add(i)
+#
+#	def add(self, i):
+#		# Add an interval to this interval set.
+#		assert len(i) == 2
+#
+#		# Find intervals overlaping this one
+#		il = bisect_left(self.data, i[0])
+#		ir =  bisect_right(self.data, i[1])
+#
+#		# Cut out all the points in the middle
+#		del self.data[il:ir]
+#
+#		if il % 2 == 0:	# Left edge is outside an existing interval. Insert it
+#			self.data.insert(il, i[0])
+#			il += 1
+#		if ir %2 == 0: # Right edge is outside an existing interval. Insert it
+#			self.data.insert(il, i[1])
+#
+#		assert len(self.data) % 2 == 0
+#
+#	def isInside(self, x):
+#		""" Element-wise test if numpy array x is in the
+#		    interval set. Returns a bool NumPy array.
+#		    
+#		    Scales like O(len(Nivals)*len(Npts)) but since numpy
+#		    arrays are used, and for small interval sets, it's
+#		    usually fast enough (note that a Python-only "optimal"
+#		    O(log(Nivals)*len(Npts)) implementation would be many
+#		    times slower because of interpreter overhead)
+#		"""
+#		x = np.array(x, copy=False)
+#		ivals = np.array(self.data, copy=False)
+#
+#		in_ = np.zeros(len(x), dtype=bool)
+#		for i in xrange(0, len(ivals), 2):
+#			in_ |= (ivals[i] <= x) & (x <= ivals[i+1])
+#
+#		return in_
 
 def isiterable(x):
 	try:

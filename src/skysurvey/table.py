@@ -69,10 +69,11 @@ class Table(object):
 			return self.subtable(key)
 
 		# Compute the slice
-		if len(self) == 0:
-				# Otherwise multidimensional arrays will throw an IndexError
-				# (I personally think that's an annoying inconsistency in numpy)
-				key = np.s_[:]
+		if len(self) == 0 and isinstance(key, np.ndarray):
+			# Otherwise multidimensional arrays will throw an IndexError even if len(key) = 0
+			# (I personally think that's an annoying inconsistency in numpy)
+			assert len(key) == 0
+			key = np.s_[:]
 		ret = [ (self.column_map[pos], col[key])   for (pos, col) in enumerate(self.column_data) ]
 
 		# Return a Table if the key was an instance of a slice or ndarray,
@@ -135,14 +136,14 @@ class Table(object):
 		# Return the dtype this column set would have if it was a numpy structured array
 		return np.dtype([ (self.column_map[pos], full_dtype(col)) for (pos, col) in enumerate(self.column_data) ])
 
-	def __init__(self, cols=[], dtype=None):
+	def __init__(self, cols=[], dtype=None, size=0):
 		self.column_map = dict()
 		self.column_data = []
 
 		if dtype is not None:
 			# construct cols from structured array dtype
 			assert cols is None or len(cols) == 0
-			template = np.empty(0, dtype=dtype)
+			template = np.zeros(size, dtype=dtype)
 			cols = [ (name, template[name]) for name in template.dtype.names ]
 
 		for (name, col) in cols:
@@ -157,7 +158,7 @@ class Table(object):
 	def add_column(self, name, col, supress_row_update=False):
 		# sanity check: require numpy arrays
 		assert isinstance(col, np.ndarray)
-		assert self.ncols() == 0 or (len(col) == self.nrows())
+		assert self.ncols() == 0 or (len(col) == self.nrows()), str(len(col)) + " != " + str(self.nrows())
 		assert name not in self.column_map
 
 		# Add a column to the end

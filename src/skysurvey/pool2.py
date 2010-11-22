@@ -171,7 +171,7 @@ class Pool:
 						yield (i, result)
 					else:
 						yield result
-				progress_callback(progress_callback_stage, 'step', input, i, result)
+				progress_callback(progress_callback_stage, 'step', input, i, None)
 
 		progress_callback(progress_callback_stage, 'end', input, None, None)
 

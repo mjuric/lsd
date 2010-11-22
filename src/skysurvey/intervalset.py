@@ -135,6 +135,8 @@ class intervalset:
 		return self.astuples_
 
 	def __eq__(self, b):
+		if not isinstance(b, intervalset):
+			return False
 		return self.astuples() == b.astuples()
 
 	def __str__(self):

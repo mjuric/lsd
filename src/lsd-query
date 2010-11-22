@@ -61,14 +61,12 @@ for o, a in optlist:
 		progress_callback = pool2.progress_pass
 dbdir, query = args
 
-#dbdir = '../../ps1'
-#query = '_ID, ps1_det._ID, ps1_exp._ID, sdss._ID FROM sdss(outer), ps1_obj, ps1_det, ps1_exp(outer)'
-
 ######### Actual work
 
 bounds = make_canonical(bounds)
 
-q = ss.Query(dbdir, query)
+db = ss.DB(dbdir)
+q = db.query(query)
 if format == 'text':
 	# Text output
 	fmt = None

@@ -43,7 +43,7 @@ int main(int argc, char **argv)
 	uint64_t m2[] = {7, 1, 2, 3, 2, 321, 6, 42};
 	uint64_t t2[] = {2, 7, 1, 3, 1, 578, 422};
 
-	table_join(o,
+	table_join_hashjoin(o,
 		t1, sizeof(t1)/sizeof(t1[0]),
 		t2, sizeof(t2)/sizeof(t2[0]),
 		m1, m2, sizeof(m2)/sizeof(m2[0]),

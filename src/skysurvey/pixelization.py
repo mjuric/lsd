@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import bhpix
 import numpy as np
-import Polygon
+import Polygon.Shapes
 from intervalset import intervalset
 from numpy import fabs
 import footprint
@@ -34,10 +34,17 @@ class Pixelization(object):
 		self.dt = dt
 
 		# Compute object_id -> cell_id mask (used by cell_for_id())
-		xymask = ~(2**(self.xybits - self.level)-1)	# 0b111
-		mask = (xymask << (self.tbits + self.xybits)) + (xymask << self.tbits)
-		mask = ~(mask << 32)	# 0b1111111000 1111111000 111111111111 0000...0000
+		xymask = 2**(self.xybits - self.level)-1	# 0b111
+		mask = (~(
+					xymask << (self.xybits+self.tbits) | 
+					xymask << (self.tbits)
+				) << 32) | 0xFFFFFFFF
 		self.id2cell_mask = mask
+#		print bin(xymask)
+#		print mask
+#		print bin(mask)
+#		print bin(np.uint64(mask))
+#		exit()
 
 		# Temporal cell -> static cell_id mask (used by static_cell_for_cell())
 		mask = (2**self.tbits-1)<< 32
@@ -63,16 +70,9 @@ class Pixelization(object):
 			t = np.array(self.t0)
 		ct = np.array((t - self.t0) / self.dt, np.uint64)
 
-		if np.any(i == 0xFFFFFFFF):
-			# If we're computing cell IDs, make sure to round x,y to the
-			# pixelization leven (otherwise there'd be multiple IDs for
-			# the same cell, depending on where in the cell x,y are)
-			assert np.all(i == 0xFFFFFFFF)
-			(x, y) = bhpix.xy_center(x, y, self.level)
-
-		# Round to closest pixel
-		# TODO: This shouldn't strictly be necessary
-		(x, y) = bhpix.xy_center(x, y, self.xybits)
+#		# Round to closest pixel
+#		# TODO: This shouldn't strictly be necessary
+#		(x, y) = bhpix.xy_center(x, y, self.xybits)
 
 		# construct the 32bit ID prefix from the above
 		# Prefix format: 10bit x + 10bit y + 12bit time
@@ -86,6 +86,27 @@ class Pixelization(object):
 		id  |= ct & (2**self.tbits - 1)
 		id <<= 32
 		id  |= i & 0xFFFFFFFF
+
+		if np.any(i == 0xFFFFFFFF):
+			# If we're computing cell IDs, make sure to wipe out the
+			# sub-pixel bits for the given level (otherwise we'd get
+			# multiple cell_ids for the same cell, depending on where
+			# in the cell the x,y were)
+			id &= self.id2cell_mask
+
+		# TODO: Transformation verification, remove when debugged
+		if np.any(i == 0xFFFFFFFF):
+			ux, uy, ut = self._xyt_from_cell_id(id)
+			ui = 0xFFFFFFFF
+			(cx, cy) = bhpix.xy_center(x, y, self.level)
+		else:
+			ux, uy, ut, ui = self._xyti_from_id(id)
+			(cx, cy) = bhpix.xy_center(x, y, self.xybits)
+		ct = ct * self.dt + self.t0
+		ci = i
+		if np.any(cx != ux) or np.any(cy != uy) or np.any(ct != ut) or np.any(ci != ui):
+			print cc, "==", cu, ct, "==", ut
+			raise Exception("**** Bug detected ****")			
 
 		# NOTE: Test tranformation correctness (comment this out for production code)
 		#(ux, uy, ut, ui) = self._xyti_from_id(id)
@@ -132,13 +153,13 @@ class Pixelization(object):
 
 	def cell_for_id(self, id):
 		""" Return a cell id corresponding to a given object ID """
-		cell_id    = id & self.id2cell_mask | 0xFFFFFFFF
+		cell_id    = (id & np.uint64(self.id2cell_mask)) | 0xFFFFFFFF
 		assert np.all(self.is_cell_id(cell_id))
 
 		# TODO: Debugging (remove when happy)
 		x, y, t, _ = self._xyti_from_id(id)
-		cell_id2    = self._id_from_xyti(x, y, t)
-		assert np.all(cell_id2 == cell_id)
+		cell_id2    = self._cell_id_for_xyt(x, y, t)
+		assert np.all(cell_id2 == cell_id), 'cell_id2=%s cell_id=%s %s x=%s y=%s t=%s' % (cell_id2, cell_id, bin(cell_id), x, y, t)
 
 		return cell_id
 
@@ -156,6 +177,21 @@ class Pixelization(object):
 		""" Return True if the cell_id points to a temporal cell """
 		assert np.all(self.is_cell_id(cell_id))
 		return cell_id & self.tmask
+
+	def str_id(self, cell_id):
+		""" Binary pretty-print a cell_id """
+		s = bin(cell_id)
+		s = '0'*64 + s[2:]
+		idbits = 64 - (2*self.xybits+self.tbits)
+		ret = []
+		nover = self.xybits - self.level
+		for l, k in [(0, idbits), (0, self.tbits), (nover, self.xybits), (nover, self.xybits)]:
+			c = s[-k:]
+			s = s[:-k]
+			if l:
+				c = c[:-l] + '[' + c[-l:] + ']'
+			ret.insert(0, c)
+		return ' '.join(ret)
 
 	#############
 
@@ -265,26 +301,32 @@ class Pixelization(object):
 		if self._is_valid_cell_xy(x, y):
 			# Get the cell_ids for leaf cells matching pattern
 			xybounds = None if(bounds_xy.area() == box.area()) else bounds_xy
-			for cell_id in self._get_temporal_siblings(x, y, path, pattern):
+			sibling_cells = list(self._get_temporal_siblings(x, y, path, pattern))
+			for cell_id in sibling_cells:
 				# Filter on time, add bounds
-				x, y, t, _ = self._xyti_from_id(cell_id)
+				x, y, t = self._xyt_from_cell_id(cell_id)
 
-				# Cut on the time component
-				tival = intervalset((t, t+self.dt))
-				tolap = bounds_t & tival
-				if len(tolap):
-					(l, r) = tolap[-1]				# Get the right-most interval component
-					if l == r == t+self.dt:				# Is it a single point?
-						tolap = intervalset(*tolap[:-1])	# Since objects in this cell have time in [t, t+dt), remove the t+dt point
-
-				if len(tolap) == 0:					# No overlap between the intervals -- skip this cell
-					continue;
-
-				# Return None if the cell is fully contained in the requested interval
-				tbounds = None if tival == tolap else tolap
+				if t != self.t0:
+					# Cut on the time component
+					tival = intervalset((t, t+self.dt))
+					tolap = bounds_t & tival
+					if len(tolap):
+						(l, r) = tolap[-1]				# Get the right-most interval component
+						if l == r == t+self.dt:				# Is it a single point?
+							tolap = intervalset(*tolap[:-1])	# Since objects in this cell have time in [t, t+dt), remove the t+dt point
+	
+					if len(tolap) == 0:					# No overlap between the intervals -- skip this cell
+						continue;
+	
+					# Return None if the cell is fully contained in the requested interval
+					tbounds = None if tival == tolap else tolap
+				else:
+					# Static cell
+					tbounds = bounds_t
+					assert len(sibling_cells) == 1, "There can be only one static cell (cell_id=%s)" % cell_id
 
 				# Add to output
-				if tival == tolap:
+				if tbounds is None:
 					outcells[cell_id][xybounds] = None
 				elif xybounds not in outcells[cell_id]:
 					outcells[cell_id][xybounds] = tbounds
