@@ -6,8 +6,8 @@
 import sys
 import getopt
 import skysurvey.smf as smf
-import skysurvey as lsd
 from   skysurvey.utils import *
+from   skysurvey import DB
 
 def usage():
 	print "Usage: %s [-c|--create] [-f|--file-list] [-m|--mode] [-o|--offset] [-s|--stride] <db> <det_table> <exp_table> <smf_file(s)>" % sys.argv[0]
@@ -52,35 +52,37 @@ files = files[offset::stride]
 # Actual work
 #
 
+db = DB(dbdir)
+
 # SMF file import
 if not mode or mode == 'import':
 	print >> sys.stderr, "Importing SMF files:"
-	smf.import_from_smf(dbdir, det_catdir, exp_catdir, files, create)
+	smf.import_from_smf(db, det_catdir, exp_catdir, files, create)
 	print >> sys.stderr, "done."
 
 if not mode or mode == 'postprocess':
+	# Build neighbor caches for detections
+#	print >> sys.stderr, "Building neighbor cache (detections): ",
+#	db.build_neighbor_cache(det_catdir)
+
 	# Build neighbor caches for images tables
 	print >> sys.stderr, "Building neighbor cache (exposures): ",
-	smf.make_image_cache(dbdir, det_catdir, exp_catdir)
+	smf.make_image_cache(db, det_catdir, exp_catdir)
+	exit()
 
 	# Sanity check: all queries linking to images must resolve within cell
 	print >> sys.stderr, "Consistency check: ",
-	det_cat = lsd.Catalog(det_catdir)
-	for row in det_cat.iterate('det_id, ra, dec, exp_id, equinox JOIN ps1_exp(outer) WHERE equinox == 0'):
+	q = db.query('det_id, ra, dec, exp_id, equinox FROM "%s", "%s"(outer) WHERE equinox == 0' % (det_catdir, exp_catdir))
+	for row in q.iterate():
 		raise Exception("Inconsistency detected: (det_id, ra, dec, exp_id, equinox) = " + str(row))
-
-	# Build neighbor caches for detections
-	print >> sys.stderr, "Building neighbor cache (detections): ",
-	det_cat.build_neighbor_cache()
 
 	# Compute summary stats for both catalogs
 	print >> sys.stderr, "Computing summary statistics (detections): ",
-	det_cat.compute_summary_stats()
-	exp_cat = lsd.Catalog(exp_catdir)
+	db.compute_summary_stats(det_catdir)
 	print >> sys.stderr, "Computing summary statistics (exposures): ",
-	exp_cat.compute_summary_stats()
+	db.compute_summary_stats(exp_catdir)
 
 # Done
-det_cat = lsd.Catalog(det_catdir)
-exp_cat = lsd.Catalog(exp_catdir)
+det_cat = db.catalog(det_catdir)
+exp_cat = db.catalog(exp_catdir)
 print "Import done.", det_cat.nrows(), "detections in", exp_cat.nrows() , "exposures."

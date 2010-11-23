@@ -17,6 +17,12 @@ def _worker(qin, qout):
 			qout.put((i, result))
 		qout.put("DONE")
 
+def _decoder(message):
+	# Decode a message encoded by the _worker and yield
+	# back the results
+	for (i, result) in message:
+		return (i, result)
+
 def _reduce_from_pickled(kw, pkl, reducer, args):
 	# open the piclke jar, load the objects, pass them on to the
 	# actual reducer

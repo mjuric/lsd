@@ -10,11 +10,13 @@ import sys
 import os
 import json
 import utils
+import cPickle
 from utils import is_scalar_of_type
 from StringIO import StringIO
 from pixelization import Pixelization
 from collections import OrderedDict
 from contextlib import contextmanager
+from table import Table
 
 # Special return type used in _mapper() and Catalog.map_reduce
 # to denote that the returned value should not be yielded to
@@ -32,6 +34,14 @@ Empty = EmptySpecial()	# Marker for mapreduce
 Automatic = None
 Default = None
 All = []
+
+class BLOBAtom(tables.ObjectAtom):
+    """
+    Sema as tables.ObjectAtom, except that it uses the highest available
+    pickle protocol to serialize the objects.
+    """
+    def _tobuffer(self, object_):
+        return cPickle.dumps(object_, -1)
 
 class ColumnType(object):
 	""" A simple record representing columns. Built at runtime
@@ -59,7 +69,7 @@ class Catalog:
 	pix  = Pixelization(level=6, t0=54335, dt=1)
 				# t0: default starting epoch (== 2pm HST, Aug 22 2007 (night of GPC1 first light))
 				# t1: default temporal resolution (in days)
-	__nrows = 0
+	_nrows = 0
 
 	NULL = 0		# The value for NULL in JOINed rows that had no matches
 
@@ -137,7 +147,7 @@ class Catalog:
 		data = json.loads(file(self.path + '/schema.cfg').read(), object_pairs_hook=OrderedDict)
 
 		self.name = data["name"]
-		self.__nrows = data.get("nrows", None)
+		self._nrows = data.get("nrows", None)
 
 		######################
 		# Backwards compatibility
@@ -196,7 +206,7 @@ class Catalog:
 	def _store_schema(self):
 		data = dict()
 		data["level"], data["t0"], data["dt"] = self.pix.level, self.pix.t0, self.pix.dt
-		data["nrows"] = self.__nrows
+		data["nrows"] = self._nrows
 		data["tables"] = self._tables.items()
 		data["name"] = self.name
 
@@ -245,12 +255,47 @@ class Catalog:
 		os.unlink(lockfile)
 
 	#### Low level tablet creation/access routines. These employ no locking
+	def _get_row_group(self, fp, group, table):
+		""" Obtain a handle to the given HDF5 node, autocreating
+		    it if necessary.
+		"""
+		assert group in ['main', 'cached']
+
+		g = getattr(fp.root, group, None)
+
+		if g is None:
+			schema = self._get_schema(table)
+
+			# Table
+			fp.createTable('/' + group, 'table', np.dtype(schema["columns"]), expectedrows=20*1000*1000, createparents=True)
+			g = getattr(fp.root, group)
+			
+
+			# Primary key sequence
+			if group == 'main' and 'primary_key' in schema:
+				seqname = '_seq_' + schema['primary_key']
+				fp.createArray(g, seqname, np.array([1], dtype=np.uint64))
+
+			# BLOB storage arrays
+			if 'blobs' in schema:
+				for blobcol in schema['blobs']:
+					fp.createVLArray('/' + group +'/blobs', blobcol, BLOBAtom(), "BLOBs", createparents=True)
+					getattr(g.blobs, blobcol).append(None)	# ref=0 always points to None
+		return g
+
+	def drop_row_group(self, cell_id, group):
+		""" Delete the given HDF5 group and all its children
+		    from all tablets of cell cell_id
+		"""
+		with self.get_cell(cell_id, mode='w') as cell:
+			for table in self._tables:
+				with cell.open(table) as fp:
+					if group in fp.root:
+						fp.removeNode('/', group, recursive=True);
+
 	def _create_tablet(self, fn, table):
 		# Create a tablet at a given path, for table 'table'
 		assert os.access(fn, os.R_OK) == False
-
-		# Find the schema of the requested table
-		schema = self._get_schema(table)
 
 		# Create the cell directory if it doesn't exist
 		path = fn[:fn.rfind('/')];
@@ -259,16 +304,9 @@ class Catalog:
 
 		# Create the tablet
 		fp  = tables.openFile(fn, mode='w')
-		fp.createTable('/main', 'table', np.dtype(schema["columns"]), expectedrows=20*1000*1000, createparents=True)
 
-		if 'primary_key' in schema:
-			seqname = '_seq_' + schema['primary_key']
-			fp.createArray('/main', seqname, np.array([1], dtype=np.uint64))
-
-		if 'blobs' in schema:
-			for blobcol in schema['blobs']:
-				fp.createVLArray('/main/blobs', blobcol, tables.ObjectAtom(), "BLOBs", createparents=True)
-				fp.root.main.blobs.__getattr__(blobcol).append(None)	# ref=0 should be pointed to by no real element (equivalent to NULL pointer)
+		# Force creation of the main subgroup
+		self._get_row_group(fp, 'main', table)
 
 		return fp
 
@@ -359,7 +397,7 @@ class Catalog:
 
 		return colname
 
-	def append(self, cols):
+	def append(self, cols_, group='main', cell_id=None):
 		""" Insert a set of rows into a table in the database. Protects against
 		    multiple writers simultaneously inserting into the same file.
 
@@ -369,37 +407,76 @@ class Catalog:
 		    Return: array of primary keys of inserted rows
 		"""
 
-		# make a copy and perform some sanity checks
-		cols = dict(cols)
-		assert len(cols)
-		n = None
-		for _, col in cols.iteritems():
-			if n is None: n = len(col)
-			assert n == len(col), 'n=%d len(col)=%d' % (n, len(col))
+		assert group in ['main', 'cached']
 
-		# Resolve aliases
-		cols = dict(( (self.resolve_alias(name), col) for name, col in cols.iteritems()  ))
+		# Resolve aliases in the input, and prepare a Table()
+		cols = Table()
+		if getattr(cols_, 'items', None) is not None:
+			cols_ = cols_.items()
+		for name, col in cols_:
+			cols.add_column(self.resolve_alias(name), col)
+		assert cols.ncols()
 
-		# Locate cells into which we're going to store the results
-		schema = self._get_schema(self.primary_table)
-		raKey, decKey = schema["spatial_keys"]
-		key           = schema["primary_key"]
-		if key not in cols:	# if the primary key column has not been supplied, autoadd it
-			cols[key] = np.empty(n, dtype=np.dtype(dict(schema['columns'])[key]))
+		# if the primary key column has not been supplied by the user, add it
+		key = self.get_primary_key()
+		if key not in cols:
+			cols[key] = np.zeros(len(cols), dtype=self.columns[key].dtype)
 
-		ra, dec = cols[raKey], cols[decKey]
-		if "temporal_key" in schema:
-			t = cols[schema["temporal_key"]]
+		# Locate the cells into which we're going to store the rows
+		# - if <cell_id> is not None: insert as-is into the requested cell. The user is responsible for ensuring <prim_key> existence and uniqueness.
+		# - elif <primary_key> column exists and not all zeros: compute destination cells from it
+		# - elif <spatial_keys> columns exist: use them to determine destination cells
+		genKeys = False
+		if cell_id is not None:
+			# Explicit destination cell(s) have been provided
+			cells = np.array(cell_id, copy=False, ndmin=1)
+			if len(cells) == 1:
+				cells = np.resize(cells, len(cols))
+			assert len(cells) == len(cols)
+		elif key in cols and np.any(cols[key]):
+			# Deduce destination cells from IDs
+			assert 0, "Test this codepath!"
+			cells = self.pix.cell_for_id(cols[key])
 		else:
-			t = None
-		cells     = self.pix.cell_id_for_pos(ra, dec, t)
-		cols[key] = self.pix.obj_id_from_pos(ra, dec, t)
+			# Deduce destination cells from spatial and temporal keys (the fallback)
+			assert group == 'main'
+
+			lonKey, latKey = self.get_spatial_keys()
+			assert lonKey and latKey, "The table must have at least the spatial keys!"
+			assert lonKey in cols and latKey in cols, "The input must contain at least the spatial keys!"
+
+			tKey = self.get_temporal_key()
+			t = cols[tKey] if tKey is not None else None
+
+			cols[key][:] = self.pix.obj_id_from_pos(cols[lonKey], cols[latKey], t)
+			cells        = self.pix.cell_for_id(cols[key])
+
+			# TODO: Debugging, remove when happy
+			assert np.all(self.pix.cell_id_for_pos(cols[lonKey], cols[latKey], t) == cells)
+
+			genKeys = True
+
+		####
+		#schema = self._get_schema(self.primary_table)
+		#raKey, decKey = schema["spatial_keys"]
+		#key           = schema["primary_key"]
+		#if key not in cols:	# if the primary key column has not been supplied, autoadd it
+		#	cols[key] = np.empty(n, dtype=np.dtype(dict(schema['columns'])[key]))
+		#
+		#ra, dec = cols[raKey], cols[decKey]
+		#if "temporal_key" in schema:
+		#	t = cols[schema["temporal_key"]]
+		#else:
+		#	t = None
+		#cells     = self.pix.cell_id_for_pos(ra, dec, t)
+		#cols[key] = self.pix.obj_id_from_pos(ra, dec, t)
+		####
 
 		# TODO: Debugging, remove when confident
-		tmp = self.pix.cell_for_id(cols[key])
-		#print self.pix.str_id(cells)
-		#print self.pix.str_id(cols[key][:10])
-		assert np.all(tmp == cells)
+		#tmp = self.pix.cell_for_id(cols[key])
+		##print self.pix.str_id(cells)
+		##print self.pix.str_id(cols[key][:10])
+		#assert np.all(tmp == cells)
 
 		ntot = 0
 		unique_cells = list(set(cells))
@@ -424,19 +501,18 @@ class Catalog:
 
 			# Extract rows belonging to this cell
 			incell = cells == cell_id
-			nrows = sum(incell)
-			cols2 = {}
-			for name, col in cols.iteritems():
-				cols2[name] = col[incell]
+			cols2  = cols[incell]
+			nrows  = len(cols2)
 
-			# Store them in their tablets
+			# Store cell groups into their tablets
 			for table, schema in self._tables.iteritems():
 				fp    = self._open_tablet(cell_id, mode='w', table=table)
-				t     = fp.root.main.table
+				g     = self._get_row_group(fp, group, table)
+				t     = g.table
 				blobs = schema['blobs'] if 'blobs' in schema else dict()
 
-				if table == self.primary_table:
-					id_seq = fp.root.main.__getattr__('_seq_' + key)
+				if table == self.primary_table and genKeys:
+					id_seq = getattr(g, '_seq_' + key, None)
 					cols[key][incell] += np.arange(id_seq[0], id_seq[0] + nrows, dtype=np.uint64)
 					cols2[key] = cols[key][incell]
 					id_seq[0] += nrows
@@ -454,16 +530,16 @@ class Catalog:
 						# BLOB column - find unique objects, insert them
 						# into the BLOB VLArray, and put the indices to these
 						# into the actual table
-						assert cols2[colname].dtype == np.object_
+						assert cols2[colname].dtype == object
 						uobjs, _, ito = np.unique(cols2[colname], return_index=True, return_inverse=True)	# Note: implicitly flattens multi-D input arrays
 						ito = ito.reshape(rows[colname].shape)	# De-flatten the output indices
 
 						# Offset indices
-						barray = fp.root.main.blobs.__getattr__(colname)
+						barray = getattr(g.blobs, colname)
 						bsize = len(barray)
 						ito = ito + bsize
 
-						# Remap any None values to index 0 (where None is stored by fiat)
+						# Remap any None values to index 0 (where None is stored by convention)
 						# We use the fact that None will be sorted to the front of the unique sequence, if exists
 						if len(uobjs) and uobjs[0] is None:
 							##print "Remapping None", len((ito == bsize).nonzero()[0])
@@ -486,16 +562,16 @@ class Catalog:
 			self._unlock_cell(lock)
 
 			#print '[', nrows, ']'
-			self.__nrows = self.__nrows + nrows
+			self._nrows = self._nrows + nrows
 			ntot = ntot + nrows
 
-		assert ntot == n, 'ntot != n, ntot=%d, n=%d, cell_id=%d' % (ntot, n, cell_id)
-		assert len(np.unique1d(cols[key])) == n, 'len(np.unique1d(cols[key])) != n in cell %d' % cell_id
+		assert ntot == len(cols), 'ntot != len(cols), ntot=%d, len(cols)=%d, cell_id=%d' % (ntot, len(cols), cell_id)
+		assert len(np.unique1d(cols[key])) == len(cols), 'len(np.unique1d(cols[key])) != len(cols) (%s != %s) in cell %s' % (len(np.unique1d(cols[key])), len(cols), cell_id)
 
 		return cols[key]
 
 	def nrows(self):
-		return self.__nrows
+		return self._nrows
 
 	def close(self):
 		pass
@@ -582,12 +658,12 @@ class Catalog:
 		# load the blobs arrays
 		with self.get_cell(cell_id) as cell:
 			with cell.open(table) as fp:
-				b1 = fp.root.main.blobs.__getattr__(column)
+				b1 = getattr(fp.root.main.blobs, column)
 				if include_cached and 'cached' in fp.root:
 					# We have cached objects in 'cached' group -- read the blobs
 					# from there as well. blob refs of cached objects are
 					# negative.
-					b2 = fp.root.cached.blobs.__getattr__(column)
+					b2 = getattr(fp.root.cached.blobs, column)
 
 					blobs = np.empty(len(refs), dtype=object)
 					blobs[refs >= 0] = self._smart_load_blobs(b1,   refs[refs >= 0]),
@@ -619,6 +695,13 @@ class Catalog:
 					rows = fp.root.main.table.read()
 					if include_cached and 'cached' in fp.root:
 						rows2 = fp.root.cached.table.read()
+						# Make any neighbor cache BLOBs negative (so that fetch_blobs() know to
+						# look for them in the cache, instead of 'main')
+						schema = self._get_schema(table)
+						if 'blobs' in schema:
+							for blobcol in schema['blobs']:
+								rows[blobcol] *= -1
+						# Append the data from cache to the main tablet
 						rows = np.append(rows, rows2)
 		else:
 			schema = self._get_schema(table)
@@ -675,38 +758,6 @@ class Catalog:
 		if lockfile != None:
 			self._unlock_cell(lockfile)
 
-	def build_neighbor_cache(self, margin_x_arcsec=30):
-		""" Cache the objects found within margin_x (arcsecs) of
-		    each cell into neighboring cells as well, to support
-		    efficient nearest-neighbor lookups.
-
-		    This routine works in tandem with _cache_maker_mapper
-		    and _cache_maker_reducer auxilliary routines.
-		"""
-		margin_x = np.sqrt(2.) / 180. * (margin_x_arcsec/3600.)
-
-		# Find out which columns are our spatial keys
-		schema = self._get_schema(self.primary_table)
-		raKey, decKey = schema["spatial_keys"]
-		query = "%s, %s" % (raKey, decKey)
-
-		ntotal = 0
-		ncells = 0
-		for (_, ncached) in self.map_reduce(query, (_cache_maker_mapper, margin_x), _cache_maker_reducer):
-			ntotal = ntotal + ncached
-			ncells = ncells + 1
-			#print self._cell_prefix(cell_id), ": ", ncached, " cached objects"
-		print "Total %d cached objects in %d cells" % (ntotal, ncells)
-
-	def compute_summary_stats(self):
-		""" Compute frequently used summary statistics and
-		    store them into the dbinfo file. This should be called
-		    to refresh the stats after insertions.
-		"""
-		from tasks import compute_counts
-		self.__nrows = compute_counts(self)
-		self._store_schema()
-
 	def get_spatial_keys(self):
 		# Find out which columns are our spatial keys
 		return (self.spatial_keys[0].name, self.spatial_keys[1].name) if self.spatial_keys is not None else (None, None)
@@ -716,7 +767,7 @@ class Catalog:
 		return self.primary_key.name
 
 	def get_temporal_key(self):
-		return self.temporal_key.name if self.temporal_key else None
+		return self.temporal_key.name if self.temporal_key is not None else None
 
 ###############################################################
 # Aux functions implementing Catalog.iterate and Catalog.fetch
@@ -838,214 +889,5 @@ def fitskw(hdrs, kw):
 	res = np.array(res).reshape(shape)
 	return res
 
-###################################################################
-## Auxilliary functions implementing Catalog.build_neighbor_cache
-## functionallity
-def _cache_maker_mapper(rows, margin_x):
-	# Map: fetch all objects to be mapped, return them keyed
-	# by cell ID and table
-	self         = _cache_maker_mapper
-	cat          = self.CATALOG
-	cell_id      = self.CELL_ID
-
-	p, _ = cat.cell_bounds(cell_id)
-
-	# Find all objects within 'margin_x' from the cell pixel edge
-	# The pixel can be a rectangle, or a triangle, so we have to
-	# handle both situations correctly.
-	(x1, x2, y1, y2) = p.boundingBox()
-	d = x2 - x1
-	(cx, cy) = p.center()
-	if p.nPoints() == 4:
-		s = 1. - 2*margin_x / d
-		p.scale(s, s, cx, cy)
-	elif p.nPoints() == 3:
-		if (cx - x1) / d > 0.5:
-			ax1 = x1 + margin_x*(1 + 2**.5)
-			ax2 = x2 - margin_x
-		else:
-			ax1 = x1 + margin_x
-			ax2 = x2 - margin_x*(1 + 2**.5)
-
-		if (cy - y1) / d > 0.5:
-			ay2 = y2 - margin_x
-			ay1 = y1 + margin_x*(1 + 2**.5)
-		else:
-			ay1 = y1 + margin_x
-			ay2 = y2 - margin_x*(1 + 2**.5)
-		p.warpToBox(ax1, ax2, ay1, ay2)
-	else:
-		raise Exception("Expecting the pixel shape to be a rectangle or triangle!")
-
-	# Now reject everything not within the margin, and
-	# (for simplicity) send everything within the margin,
-	# no matter close to which edge it actually is, to
-	# all neighbors.
-	(ra, dec) = rows.as_columns()
-	(x, y) = bhpix.proj_bhealpix(ra, dec)
-	#in_ = np.fromiter( (not p.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=len(x))
-	in_ = ~p.isInsideV(x, y)
-
-	if not in_.any():
-		return Empty
-
-	# Load full rows, across all tablets, keeping only
-	# those with in_ == True
-	data = load_full_rows(cat, cell_id, in_)
-
-	# Mark these to be replicated all over the neighborhood
-	res = []
-	if len(data):
-		for neighbor in cat.pix.neighboring_cells(cell_id):
-			res.append( (neighbor, data) )
-
-	##print "Scanned margins of %s (%d objects)" % (cat._tablet_file(self.CELL_ID, table=cat.primary_table), len(data[cat.primary_table]['rows']))
-
-	return res
-
-def load_full_rows(cat, cell_id, in_):
-	""" Load all rows for all tablets, keeping only those with in_ == True.
-	    Return a nested dict:
-
-	    	ret = {
-		    	table_name: {
-		    		'rows': rows (ndarray)
-		    		'blobs': {
-		    			blobcolname: blobs (ndarray)
-		    			...
-		    		}
-			}
-		}
-
-	    Any blobs referred to in rows will be stored in blobs, to be indexed
-	    like:
-
-	       blobs = ret[table]['blobs'][blobcol][ ret[table][blobcolref] ]
-	"""
-	data = { }
-	for table in cat.tables:
-		data[table] = {}
-
-		# load all rows
-		rows = cat.fetch_tablet(cell_id, table)[in_]
-
-		# load all blobs
-		data[table]['blobs'] = {}
-		schema = cat._get_schema(table)
-		if 'blobs' in schema:
-			for bcolname in schema['blobs']:
-				# Get only unique blobs, and reindex accordingly
-				blobrefs, _, idx = np.unique(rows[bcolname], return_index=True, return_inverse=True)
-				idx = idx.reshape(rows[bcolname].shape)
-				rows[bcolname] = idx
-				assert rows[bcolname].min() == 0
-				assert rows[bcolname].max() == len(blobrefs)-1
-
-				# Fetch unique blobs
-				blobs    = cat.fetch_blobs(cell_id, table, bcolname, blobrefs)
-
-				# In the end, blobs will contain N unique blobs, while rows[bcolname] will
-				# have 0-based indices to those blobs
-				data[table]['blobs'][bcolname] = blobs
-
-		# This must follow the blob resolution, as it may
-		# modify the indices in the rows
-		data[table]['rows'] = rows
-
-	return data
-
-def extract_full_rows_subset(allrows, in_):
-	# Takes allrows in the format returned by load_full_rows and
-	# extracts those with in_==True, while correctly reindexing any
-	# BLOBs that are in there.
-	#
-	# Also works if in_ is a ndarray of indices.
-	ret = {}
-	for table, data in allrows.iteritems():
-		rows = data['rows'][in_]
-		xblobs = {}
-		for (bcolname, blobs) in data['blobs'].iteritems():
-			# reindex blob refs
-			blobrefs, _, idx = np.unique(rows[bcolname], return_index=True, return_inverse=True)
-			idx = idx.reshape(rows[bcolname].shape)
-
-			xblobs[bcolname] = blobs[blobrefs];
-			rows[bcolname]   = idx
-
-			assert rows[bcolname].min() == 0
-			assert rows[bcolname].max() == len(blobrefs)-1
-			assert (xblobs[bcolname][ rows[bcolname] ] == blobs[ data['rows'][in_][bcolname] ]).all()
-
-		ret[table] = { 'rows': rows, 'blobs': xblobs }
-	return ret
-
-def write_neighbor_cache(cat, cell_id, nborblocks):
-	# Store a list of full rows (as returned by load_full_rows)
-	# to neighbor tables of tablets in cell cell_id
-	# of catalog cat
-
-	assert cat.is_cell_local(cell_id)
-
-	ncached = 0
-	with cat.get_cell(cell_id, mode='w') as cell:
-		for table, schema in cat.tables.iteritems():
-			if 'cached_flag' in schema:
-				cachedFlag = schema['cached_flag']
-			else:
-				cachedFlag = None
-
-			with cell.open(table=table) as fp:
-				# Drop existing cache
-				if 'cached' in fp.root:
-					fp.removeNode('/', 'cached', recursive=True);
-
-				# Create destinations for rows and blobs
-				fp.createGroup('/', 'cached', title='Cached objects from neighboring cells')
-				fp.root.main.table.copy('/cached', 'table', start=0, stop=0, createparents=True)
-				blobs = set(( name for nbor in nborblocks for (name, _) in nbor[table]['blobs'].iteritems() ))
-				for name in blobs:
-					fp.createVLArray('/cached/blobs', name, tables.ObjectAtom(), "BLOBs", createparents=True)
-					fp.root.cached.blobs.__getattr__(name).append(0)	# ref=0 should be pointed to by no real element (equivalent to NULL pointer)
-				haveblobs = len(blobs) != 0
-
-				# Write records (rows and blobs)
-				for nbor in nborblocks:
-					rows  = nbor[table]['rows']
-
-					if haveblobs:
-						# Append cached blobs, and adjust the offsets
-						rows = rows.copy()		# Need to do this, so that modifications to rows[name] aren't permanent
-						blobs = nbor[table]['blobs']
-						for (name, data) in blobs.iteritems():
-							barray = fp.root.cached.blobs.__getattr__(name)
-							rows[name] += len(barray)
-							rows[name] *= -1		# Convention: cached blob refs are negative
-							for obj in data:
-								barray.append(obj)
-
-					# Append cached rows
-					if cachedFlag:
-						rows[cachedFlag] = True
-
-					fp.root.cached.table.append(rows)
-
-				# sanity
-				if ncached == 0:
-					ncached = fp.root.cached.table.nrows
-				assert ncached == fp.root.cached.table.nrows
-
-	return ncached
-
-def _cache_maker_reducer(cell_id, nborblocks):
-	self = _cache_maker_reducer
-	cat          = self.CATALOG
-
-	#print "Would write to %s." % (cat._tablet_file(cell_id, table=cat.primary_table));
-	#exit()
-
-	ncached = write_neighbor_cache(cat, cell_id, nborblocks);
-
-	# Return the number of new rows cached into this cell
-	return (cell_id, ncached)
 
 ###################################################################

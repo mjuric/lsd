@@ -68,6 +68,7 @@ class TableCache:
 	def resolve_blobs(self, cell_id, col, name, cat):
 		# Resolve blobs (if blob column). NOTE: the resolved blobs
 		# will not be cached.
+
 		if cat.columns[name].is_blob:
 			include_cached = self.include_cached if cat.name == self.root.name else True
 			col = cat.fetch_blobs(cell_id, column=name, refs=col, include_cached=include_cached)
@@ -420,7 +421,7 @@ class TableColsProxy:
 		# Return a list of columns in catalog catname
 		if catname == '':
 			catname = self.root_catalog
-		return self.catalogs[catname].cat.all_columns()
+		return self.catalogs[catname].cat.columns.keys()
 
 class QueryInstance(object):
 	# Internal working state variables
@@ -434,11 +435,15 @@ class QueryInstance(object):
 	catalogs = None		# A name:Catalog dict() with all the catalogs listed on the FROM line.
 	root	 = None		# CatalogEntry instance with the primary (root) catalog
 	query_clauses = None	# Tuple with parsed query clauses
+	pix      = None         # Pixelization object (TODO: this should be moved to class DB)
+	locals   = None		# Extra local variables to be made available within the query
 
 	def __init__(self, q, cell_id, bounds, include_cached):
 		self.catalogs	   = q.catalogs
 		self.root	   = q.root
 		self.query_clauses = q.query_clauses
+		self.pix           = q.root.cat.pix
+		self.locals        = q.locals
 
 		self.cell_id	= cell_id
 		self.bounds	= bounds
@@ -478,7 +483,10 @@ class QueryInstance(object):
 			if len(rows):
 				if not in_.all():
 					rows = rows[in_]
-	
+
+				# Attach metadata
+				rows.cell_id = self.cell_id
+
 				yield rows
 
 		# We yield nothing if the result set is empty.
@@ -514,7 +522,8 @@ class QueryInstance(object):
 		col = self.tcache.resolve_blobs(self.cell_id, col, name, cat)
 
 		# Return the column as an iarray
-		return col.view(iarray)
+		col = col.view(iarray)
+		return col
 
 	def __getitem__(self, name):
 		# An already loaded column?
@@ -546,8 +555,12 @@ class QueryInstance(object):
 		if name in self.catalogs:
 			return CatProxy(self, name)
 
+		# Is this one of the local variables passed in by the user?
+		if name in self.locals:
+			return self.locals[name]
+
 		# This object is unknown to us -- let it fall through, it may
-		# be a global/Python variable or function
+		# be a global variable or function
 		raise KeyError(name)
 
 	def __setitem__(self, key, val):
@@ -560,26 +573,30 @@ class QueryEngine(object):
 	catalogs = None		# A name:Catalog dict() with all the catalogs listed on the FROM line.
 	root	 = None		# CatalogEntry instance with the primary (root) catalog
 	query_clauses  = None	# Parsed query clauses
+	locals   = None		# Extra variables to be made local to the query
 
-	def __init__(self, db, query):
+	def __init__(self, db, query, locals = {}):
 		# parse query
 		(select_clause, where_clause, from_clause) = qp.parse(query)
 
 		self.root, self.catalogs = db.construct_join_tree(from_clause);
-		select_clause = qp.resolve_wildcards(select_clause, TableColsProxy(self.root.name, self.catalogs))
-		self.query_clauses = (select_clause, where_clause, from_clause)
+		select_clause            = qp.resolve_wildcards(select_clause, TableColsProxy(self.root.name, self.catalogs))
+		self.query_clauses       = (select_clause, where_clause, from_clause)
+
+		self.locals = locals
 
 	def on_cell(self, cell_id, bounds=None, include_cached=False):
 		return QueryInstance(self, cell_id, bounds, include_cached)
 
 class Query(object):
-	db = None
+	db      = None
+	qengine = None
 
-	def __init__(self, db, query):
+	def __init__(self, db, query, locals = {}):
 		self.db		 = db
-		self.qengine = QueryEngine(db, query)
+		self.qengine = QueryEngine(db, query, locals=locals)
 
-	def execute(self, kernels, bounds=None, include_cached=False, testbounds=True, nworkers=None, progress_callback=None):
+	def execute(self, kernels, bounds=None, include_cached=False, cells=[], testbounds=True, nworkers=None, progress_callback=None):
 		""" A MapReduce implementation, where rows from individual cells
 		    get mapped by the mapper, with the result reduced by the reducer.
 		    
@@ -602,11 +619,17 @@ class Query(object):
 		    If the reducer is None, only the mapping step is performed and the
 		    return value of the mapper is passed to the user.
 		"""
-		partspecs = self.qengine.root.get_cells(bounds)
+		partspecs = dict()
+		# Add explicitly requested cells
+		for cell_id in cells:
+			partspecs[cell_id] = [(None, None)]
+		# Add cells within bounds
+		if len(cells) == 0 or bounds is not None:
+			partspecs.update(self.qengine.root.get_cells(bounds))
 
 		# tell _mapper not to test spacetime boundaries if the user requested so
 		if not testbounds:
-			partspecs = [ (part_id, None) for (part_id, _) in partspecs ]
+			partspecs = dict([ (part_id, None) for (part_id, _) in partspecs ])
 
 		# Insert our mapper into the kernel chain
 		kernels = list(kernels)
@@ -617,7 +640,7 @@ class Query(object):
 		for result in pool.map_reduce_chain(partspecs.items(), kernels, progress_callback=progress_callback):
 			yield result
 
-	def iterate(self, bounds=None, include_cached=False, return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None):
+	def iterate(self, bounds=None, include_cached=False, cells=[], return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None):
 		""" Yield rows (either on a row-by-row basis if return_blocks==False
 		    or in chunks (numpy structured array)) within a
 		    given footprint. Calls 'filter' callable (if given) to filter
@@ -630,15 +653,15 @@ class Query(object):
 		mapper = filter if filter is not None else _iterate_mapper
 
 		for rows in self.execute(
-								[mapper], bounds, include_cached,
-								testbounds=testbounds, nworkers=nworkers, progress_callback=progress_callback):
+				[mapper], bounds, include_cached,
+				cells=cells, testbounds=testbounds, nworkers=nworkers, progress_callback=progress_callback):
 			if return_blocks:
 				yield rows
 			else:
 				for row in rows:
 					yield row
 
-	def fetch(self, bounds=None, include_cached=False, return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None):
+	def fetch(self, bounds=None, include_cached=False, cells=[], filter=None, testbounds=True, nworkers=None, progress_callback=None):
 		""" Return a table (numpy structured array) of all rows within a
 		    given footprint. Calls 'filter' callable (if given) to filter
 		    the returned rows. Returns None if there are no rows to return.
@@ -661,7 +684,9 @@ class Query(object):
 		"""
 
 		ret = None
-		for rows in self.iterate(bounds, include_cached, return_blocks=True, filter=filter, testbounds=testbounds, nworkers=nworkers, progress_callback=progress_callback):
+		for rows in self.iterate(
+				bounds, include_cached,
+				cells=cells, return_blocks=True, filter=filter, testbounds=testbounds, nworkers=nworkers, progress_callback=progress_callback):
 			# ensure enough memory has been allocated (and do it
 			# intelligently if not)
 			if ret is None:
@@ -675,8 +700,18 @@ class Query(object):
 				ret[nret:nret+len(rows)] = rows
 				nret = nret + len(rows)
 
-		ret.resize(nret)
+		if ret is not None:
+			ret.resize(nret)
+
 		return ret
+
+	def fetch_cell(self, cell_id, include_cached=False):
+		""" Execute the query on a given (single) cell.
+
+		    Does not launch extra workers, nor shows the
+		    progress bar.
+		"""
+		return self.fetch(cells=[cell_id], include_cached=include_cached, nworkers=1, progress_callback=pool2.progress_pass)
 
 class DB(object):
 	path = None		# Root of the database, where all catalogs reside
@@ -689,8 +724,8 @@ class DB(object):
 
 		self.catalogs = dict()	# A cache of catalog instances
 
-	def query(self, query):
-		return Query(self, query)
+	def query(self, query, locals={}):
+		return Query(self, query, locals=locals)
 
 	def create_catalog(self, catname, catdef):
 		"""
@@ -798,6 +833,116 @@ class DB(object):
 	
 		# Return the root of the tree, and a dict of all the Catalog instances
 		return root, dict((  (catname, cat) for (catname, (cat, _)) in cats.iteritems() ))
+
+	def build_neighbor_cache(self, cat_path, margin_x_arcsec=30):
+		""" Cache the objects found within margin_x (arcsecs) of
+		    each cell into neighboring cells as well, to support
+		    efficient nearest-neighbor lookups.
+
+		    This routine works in tandem with _cache_maker_mapper
+		    and _cache_maker_reducer auxilliary routines.
+		"""
+		margin_x = np.sqrt(2.) / 180. * (margin_x_arcsec/3600.)
+
+		ntotal = 0
+		ncells = 0
+		query = "_ID, _LON, _LAT FROM '%s'" % (cat_path)
+		for (_, ncached) in self.query(query).execute([
+						(_cache_maker_mapper,  margin_x, self, cat_path),
+						(_cache_maker_reducer, self, cat_path)
+					]):
+			ntotal = ntotal + ncached
+			ncells = ncells + 1
+			#print self._cell_prefix(cell_id), ": ", ncached, " cached objects"
+		print "Total %d cached objects in %d cells" % (ntotal, ncells)
+
+	def compute_summary_stats(self, *cat_paths):
+		""" Compute frequently used summary statistics and
+		    store them into the dbinfo file. This should be called
+		    to refresh the stats after insertions.
+		"""
+		from tasks import compute_counts
+		for cat_path in cat_paths:
+			cat = self.catalog(cat_path)
+			cat._nrows = compute_counts(self, cat_path)
+			cat._store_schema()
+
+###################################################################
+## Auxilliary functions implementing DB.build_neighbor_cache
+## functionallity
+def _cache_maker_mapper(qresult, margin_x, db, cat_path):
+	# Map: fetch all rows to be copied to adjacent cells,
+	# yield them keyed by destination cell ID
+	for rows in qresult:
+		cell_id = rows.cell_id
+		p, _ = qresult.pix.cell_bounds(cell_id)
+
+		# Find all objects within 'margin_x' from the cell pixel edge
+		# The pixel can be a rectangle, or a triangle, so we have to
+		# handle both situations correctly.
+		(x1, x2, y1, y2) = p.boundingBox()
+		d = x2 - x1
+		(cx, cy) = p.center()
+		if p.nPoints() == 4:
+			s = 1. - 2*margin_x / d
+			p.scale(s, s, cx, cy)
+		elif p.nPoints() == 3:
+			if (cx - x1) / d > 0.5:
+				ax1 = x1 + margin_x*(1 + 2**.5)
+				ax2 = x2 - margin_x
+			else:
+				ax1 = x1 + margin_x
+				ax2 = x2 - margin_x*(1 + 2**.5)
+
+			if (cy - y1) / d > 0.5:
+				ay2 = y2 - margin_x
+				ay1 = y1 + margin_x*(1 + 2**.5)
+			else:
+				ay1 = y1 + margin_x
+				ay2 = y2 - margin_x*(1 + 2**.5)
+			p.warpToBox(ax1, ax2, ay1, ay2)
+		else:
+			raise Exception("Expecting the pixel shape to be a rectangle or triangle!")
+
+		# Now reject everything not within the margin, and
+		# (for simplicity) send everything within the margin,
+		# no matter close to which edge it actually is, to
+		# all neighbors.
+		(x, y) = bhpix.proj_bhealpix(rows['_LON'], rows['_LAT'])
+		inMargin = ~p.isInsideV(x, y)
+
+		if not inMargin.any():
+			continue
+
+		# Fetch only the rows that are within the margin
+		idsInMargin = rows['_ID'][inMargin]
+		q           = db.query("* FROM '%s' WHERE np.in1d(_ID, idsInMargin, assume_unique=True)" % cat_path, {'idsInMargin': idsInMargin} )
+		data        = q.fetch_cell(cell_id)
+
+		# Send these to neighbors
+		if data is not None:
+			for neighbor in qresult.pix.neighboring_cells(cell_id):
+				yield (neighbor, data)
+
+		##print "Scanned margins of %s*.h5 (%d objects)" % (db.catalog(cat_path)._cell_prefix(cell_id), len(data))
+
+def _cache_maker_reducer(kv, db, cat_path):
+	# Cache all rows to be cached in this cell
+	cell_id, rowblocks = kv
+
+	# Delete existing neighbors
+	cat = db.catalog(cat_path)
+	cat.drop_row_group(cell_id, 'cached')
+
+	# Add to cache
+	ncached = 0
+	for rows in rowblocks:
+		cat.append(rows, cell_id=cell_id, group='cached')
+		ncached += len(rows)
+		##print cell_id, len(rows), cat.pix.path_to_cell(cell_id)
+
+	# Return the number of new rows cached into this cell
+	yield cell_id, ncached
 
 ###############################################################
 # Aux. functions implementing Query.iterate() and

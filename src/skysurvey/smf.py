@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-from join_ops import DB
 import pyfits
 import pool2
 import time
@@ -235,14 +234,12 @@ def gen_cat2type(catdef):
 		
 	return cat2type
 
-def import_from_smf(dbdir, det_catname, exp_catname, smf_files, create=False):
+def import_from_smf(db, det_catname, exp_catname, smf_files, create=False):
 	""" Import a PS1 catalog from DVO
 
 	    Note: Assumes underlying shared storage for all catalog
 	          cells (i.e., any worker is able to write to any cell).
 	"""
-	db = DB(dbdir)
-
 	if create:
 		# Create the new database
 		det_cat  = db.create_catalog(det_catname, det_cat_def)
@@ -251,8 +248,8 @@ def import_from_smf(dbdir, det_catname, exp_catname, smf_files, create=False):
 		# Set up a one-to-X join relationship between the two catalogs (join det_cat:exp_id->exp_cat:exp_id)
 		db.define_join('%s:%s' % (det_catname, exp_catname),
 			type = 'indirect',
-			m1   = ("ps1_det", "det_id"),
-			m2   = ("ps1_det", "exp_id")
+			m1   = (det_catname, "det_id"),
+			m2   = (det_catname, "exp_id")
 			)
 	else:
 		det_cat = db.catalog(det_catname)
@@ -272,6 +269,7 @@ def import_from_smf(dbdir, det_catname, exp_catname, smf_files, create=False):
 		time_pass = (t1 - t0) / 60
 		time_tot = time_pass / at * len(smf_files)
 		print('  ===> Imported %s [%d/%d, %5.2f%%] +%-6d %9d (%.0f/%.0f min.)' % (file, at, len(smf_files), 100 * float(at) / len(smf_files), nloaded, ntot, time_pass, time_tot))
+	del pool
 
 def add_lb(cols):
 	(ra, dec) = cols['ra'], cols['dec']
@@ -434,51 +432,41 @@ def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
 #    cells.
 # 3) store the copies into the cache of each cell.
 
-def make_image_cache(dbdir, det_cat_path, exp_cat_path):
+def make_image_cache(db, det_cat_path, exp_cat_path):
 	# Entry point for creation of image cache
 
-	db = DB(dbdir)
-	det_cat = db.catalog(det_cat_path)
-	exp_cat = db.catalog(exp_cat_path)
-
-	# Fetch all non-empty cells with detections. This will be the
-	# list over which the first kernel will map.
-	det_cells = det_cat.get_cells()
-
-	pool = pool2.Pool()
-	for _ in pool.map_reduce_chain(det_cells,
-					      [
-						(_exp_id_gather,  det_cat, exp_cat),
-						(_exp_id_load,    exp_cat),
-						(_exp_store_rows, exp_cat)
-					      ]):
+	query = "_EXP FROM '%s'" % (det_cat_path)
+	for _ in db.query(query).execute([
+					_exp_id_gather,
+					(_exp_id_load,    db, exp_cat_path),
+					(_exp_store_rows, db, exp_cat_path)
+				      ],
+				      include_cached=True):
 		pass;
+	exit()
 
-def _exp_id_gather(det_cell, det_cat, exp_cat):
-	#-- This kernel is called once for each cell in det_cat.
-
+def _exp_id_gather(qresult):
 	# Fetch all exp_ids referenced from this cell
-	(exp_id, ) = det_cat.query_cell(det_cell, 'exp_id').as_columns()
-	exp_id     = np.unique(exp_id)
-	exp_cells  = exp_cat.cell_for_id(exp_id)
+	for rows in qresult:
+		cell_id = rows.cell_id
 
-	# keep only those that aren't local
-	outside    = exp_cells != det_cell
-	exp_id     =    exp_id[outside]
-	exp_cells  = exp_cells[outside]
+		exp_id     = np.unique(rows['_EXP'])
+		exp_cells  = qresult.pix.cell_for_id(exp_id)
 
-	# pack them in (exp_cell, (det_cell, exposures)) tuples
-	ret = [];
-	for exp_cell in set(exp_cells):
-		# List of exposure IDs from exp_cell, that need
-		# to be cached in det_cell
-		exps = exp_id[exp_cells == exp_cell]
+		# keep only those that aren't local
+		outside    = exp_cells != cell_id
+		exp_id     =    exp_id[outside]
+		exp_cells  = exp_cells[outside]
 
-		ret.append( (exp_cell, (det_cell, exps)) )
+		# return (exp_cell, (det_cell, exposures)) tuples
+		for exp_cell in set(exp_cells):
+			# List of exposure IDs from exp_cell, that need
+			# to be cached in det_cell
+			exps = exp_id[exp_cells == exp_cell]
 
-	return ret
+			yield (exp_cell, (cell_id, exps))
 
-def _exp_id_load(kv, exp_cat):
+def _exp_id_load(kv, db, exp_cat_path):
 	#-- This kernel is called once for each exp_cat cell referenced from det_cat
 	#
 	# kv = (exp_cell, detexps) with
@@ -487,53 +475,47 @@ def _exp_id_load(kv, exp_cat):
 	# are the cells that should get a copy of each of those
 	# exposure IDs.
 	#
-
 	exp_cell, detexps = kv
 
-	# Load exp_id and sort it
-	(exp_id,) = exp_cat.query_cell(exp_cell, 'exp_id').as_columns()
-	sorted_idx = np.argsort(exp_id)
-	exp_id = exp_id[sorted_idx]
+	# Load the entire cell
+	rows = db.query("_ID, * FROM '%s'" % exp_cat_path).fetch_cell(exp_cell)
+	if rows is None:
+		return
+	exp_id = rows['_ID']
+	rows.drop_column('_ID')
 
-	# Find all rows that appear in any of the detexps lists
-	in_ = np.zeros(len(exp_id), dtype=bool)
-	idx_list = {}
-	for (det_cell, exps) in detexps:
-		idx = np.searchsorted(exp_id, exps)
-		assert (exp_id[idx] == exps).all()		# It's a bug if there are exp_id duplicates or unmatched exp_ids
+	# Dispatch the right rows to their destination cells
+	for (cache_cell, exps) in detexps:
+		in_ = np.in1d(exp_id, exps, assume_unique=True)
+		ret = rows[in_]
 
-		in_[idx] = True
-		idx_list[det_cell] = sorted_idx[idx]
+#		import cPickle
+#		ss = cPickle.dumps(ret, -1)
+#		print "PICKLED LENGTH: ", len(ret), len(ss)
+#		exit()
+#		continue
 
-	# return in_ to original (pre-sorting) ordering
-	in_[sorted_idx] = in_.copy()
-	idxin = np.arange(len(in_))[in_]			# Indexes of tablet rows that will be loaded
+		yield cache_cell, ret
 
-	# Load full rows
-	allrows = catalog.load_full_rows(exp_cat, exp_cell, in_)
+	#print exp_cell, " -> ", [ (cache_cell, len(rows[exp_cat.primary_table]['rows'])) for (det_cellt, rows) in ret ]
 
-	# Dispatch the right rows to right det_cells
-	ret = []
-	for (det_cell, idx_) in idx_list.iteritems():
-		idx = np.searchsorted(idxin, idx_)		# idxall are indices in the full table. Reduce to only those appearing after culling by in_
-		assert (idxin[idx] == idx_).all()
+def _exp_store_rows(kv, db, exp_cat_path):
+	# Cache all rows to be cached in this cell
+	cell_id, rowblocks = kv
 
-		rows = catalog.extract_full_rows_subset(allrows, idx)
-		ret.append( (det_cell, rows) )
+	# Delete existing neighbors
+	exp_cat = db.catalog(exp_cat_path)
+	exp_cat.drop_row_group(cell_id, 'cached')
 
-	#print exp_cell, " -> ", [ (det_cell, len(rows[exp_cat.primary_table]['rows'])) for (det_cell, rows) in ret ]
-
-	# Returns a list of (dec_cell, fullrows) tuples
-	return ret
-
-def _exp_store_rows(kv, exp_cat):
-	# Store all rows to the correct cells.
-	cell_id, nborblocks = kv
-
-	ncached = catalog.write_neighbor_cache(exp_cat, cell_id, nborblocks);
+	# Add to cache
+	ncached = 0
+	for rows in rowblocks:
+		exp_cat.append(rows, cell_id=cell_id, group='cached')
+		ncached += len(rows)
+		##print cell_id, len(rows), exp_cat.pix.path_to_cell(cell_id)
 
 	# Return the number of new rows cached into this cell
-	return (cell_id, ncached)
+	yield cell_id, ncached
 
 ###############
 # object catalog creator

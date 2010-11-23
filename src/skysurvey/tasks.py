@@ -61,15 +61,14 @@ def compute_coverage(db, query, dx = 0.5, bounds=None, include_cached=False, fil
 
 ###################################################################
 ## Count the number of objects in the entire catalog
-def ls_mapper(rows):
+def ls_mapper(qresult):
 	# return the number of rows in this chunk, keyed by the filename
-	self = ls_mapper
-	return (self.CELL_ID, len(rows))
+	for rows in qresult:
+		yield rows.cell_id, len(rows)
 
-def compute_counts(cat, include_cached=False):
+def compute_counts(db, cat, include_cached=False):
 	ntotal = 0
-	primary_key = cat._get_schema(cat.primary_table)['primary_key']
-	for (_, nobjects) in cat.map_reduce(primary_key, ls_mapper, include_cached=include_cached):
+	for (_, nobjects) in db.query("_ID FROM '%s'" % cat).execute([ls_mapper], include_cached=include_cached):
 		ntotal = ntotal + nobjects
 	return ntotal
 ###################################################################

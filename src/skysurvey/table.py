@@ -146,6 +146,10 @@ class Table(object):
 			template = np.zeros(size, dtype=dtype)
 			cols = [ (name, template[name]) for name in template.dtype.names ]
 
+		# Detect dict() and Table()s
+		if getattr(cols, 'items', None) is not None:
+			cols = cols.items()
+
 		for (name, col) in cols:
 			self.add_column(name, col, supress_row_update=True)
 
@@ -176,7 +180,8 @@ class Table(object):
 
 	def resize(self, size, refcheck=True):
 		for (pos, _) in enumerate(self.column_data):
-			self.column_data[pos] = np.resize(self.column_data[pos], size)
+			col = self.column_data[pos]
+			self.column_data[pos] = np.resize(col, (size,) + col.shape[1:])
 
 #	def append_rows(self, other):
 #		# Sanity checks:
