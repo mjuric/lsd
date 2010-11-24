@@ -489,15 +489,33 @@ def _exp_id_load(kv, db, exp_cat_path):
 		in_ = np.in1d(exp_id, exps, assume_unique=True)
 		ret = rows[in_]
 
-#		import cPickle
-#		ss = cPickle.dumps(ret, -1)
-#		print "PICKLED LENGTH: ", len(ret), len(ss)
-#		exit()
-#		continue
-
-		yield cache_cell, ret
+		# Yield row-by-row, to help the content-deduplication
+		# mechanisms of the framework to do a better job
+		for i in xrange(len(ret)):
+			yield cache_cell, ret[i:i+1]
+		#yield cache_cell, ret
 
 	#print exp_cell, " -> ", [ (cache_cell, len(rows[exp_cat.primary_table]['rows'])) for (det_cellt, rows) in ret ]
+
+def _store_rows(cell_id, exp_cat, rowlist):
+	# Helper for _exp_store_rows
+	if len(rowlist) == 0:
+		return 0
+
+	n = 0
+	for rows in rowlist: n += len(rows)
+
+	arows = rowlist.pop(0)
+	at = len(arows)
+	arows.resize(n)
+
+	for rows in rowlist:
+		arows[at:at+len(rows)] = rows
+		at += len(rows)
+	assert at == n, '%d %d' % (at, n)
+
+	exp_cat.append(arows, cell_id=cell_id, group='cached')
+	return len(arows)
 
 def _exp_store_rows(kv, db, exp_cat_path):
 	# Cache all rows to be cached in this cell
@@ -507,12 +525,20 @@ def _exp_store_rows(kv, db, exp_cat_path):
 	exp_cat = db.catalog(exp_cat_path)
 	exp_cat.drop_row_group(cell_id, 'cached')
 
-	# Add to cache
+	# Accumulate a few blocks, then add them to cache (appending
+	# bit-by-bit is expensive because of the all the fsyncs() invloved)
 	ncached = 0
+	rowlist = []
+	chk = 0
 	for rows in rowblocks:
-		exp_cat.append(rows, cell_id=cell_id, group='cached')
-		ncached += len(rows)
-		##print cell_id, len(rows), exp_cat.pix.path_to_cell(cell_id)
+		chk += len(rows)
+		rowlist.append(rows)
+
+		if len(rowlist) >= 50:
+			ncached += _store_rows(cell_id, exp_cat, rowlist)
+			rowlist = [ ]
+	ncached += _store_rows(cell_id, exp_cat, rowlist)
+	assert chk == ncached
 
 	# Return the number of new rows cached into this cell
 	yield cell_id, ncached
