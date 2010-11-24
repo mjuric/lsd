@@ -493,8 +493,8 @@ class Catalog:
 
 					unique_cells.pop(i)
 					break
-				except subprocess.CalledProcessError:
-					#print err
+				except subprocess.CalledProcessError as _:
+#					print "LOCK:", _
 					pass
 			else:
 				raise Exception('Appear to be stuck on a lock file!')

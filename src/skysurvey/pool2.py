@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import time
+import mmap
 from utils import unpack_callable
 
 RET_KEYVAL = 1
@@ -20,30 +21,20 @@ def _worker(qcmd, qin, qout):
 		     items to be passed to mapper, until a
 		     message 'DONE' is encountered. Return the
 		     results yielded by mapper via qout.
-
-		     If pickle_kv=True, assume the results
-		     yielded by mapper are (k, v) tuples, and
-		     return (k, cPickle.dumps(v)).
 	"""
 	for cmd, args in iter(qcmd.get, 'EXIT'):
 		if cmd == 'MAP':
-			mapper, mapper_args, pickle_kv = args
+			mapper, mapper_args = args
 
 			i, item, result = None, None, None
 			for (i, item) in iter(qin.get, 'DONE'):
 				for result in mapper(item, *mapper_args):
-					if pickle_kv:
-						# Assume the mapper output is a (k, v) tuple, and
-						# pickle the value. This is useful for map-reduce chains
-						# where the server will just store the pickled string to
-						# a file for the reducer.
-						result = (result[0], cPickle.dumps(result[1]))
 					qout.put((i, result))
 				qout.put('DONE')
 
 			# Immediately release memory
 			del result, i, item
-			del mapper, mapper_args, pickle_kv
+			del mapper, mapper_args
 			del args
 
 def _unserializer(file, offsets):
@@ -54,8 +45,9 @@ def _unserializer(file, offsets):
 		mm = mmap.mmap(f.fileno(), 0, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
 
 		for offs in offsets:
+			##print "Seek to ", offs
 			mm.seek(offs)
-			yield pickle.load(mm)
+			yield cPickle.load(mm)
 
 		mm.close()
 
@@ -63,7 +55,21 @@ def _reduce_from_pickle_jar(kw, file, reducer, reducer_args):
 	# open the pickle jar, load the objects, pass them on to the
 	# actual reducer
 	key, offsets = kw
-	return reducer((key, _unserializer(file, offsets)), *reducer_args)
+	for result in reducer((key, _unserializer(file, offsets)), *reducer_args):
+		yield result
+
+def _output_pickled_kv(item, K_fun, K_args):
+	# return a pickled value, deduplicating if possible
+	unique_objects = set()
+
+	for (k, v) in K_fun(item, *K_args):
+		p = cPickle.dumps(v, -1)
+
+		hash = digest(p)
+		if hash in unique_objects:
+			p = None
+
+		yield (k, (hash, p))
 
 def _reduce_from_pickled(kw, pkl, reducer, args):
 	# open the piclke jar, load the objects, pass them on to the
@@ -171,7 +177,7 @@ class Pool:
 		if nworkers != None:
 			self.nworkers = nworkers
 
-	def imap_unordered(self, input, mapper, mapper_args=(), progress_callback=None, progress_callback_stage='map', pickle_kv=False):
+	def imap_unordered(self, input, mapper, mapper_args=(), progress_callback=None, progress_callback_stage='map'):
 		""" Execute in parallel a callable <mapper> on all values of
 		    iterable <input>, ensuring that no more than ~nworkers
 		    results are pending in the output queue """
@@ -196,7 +202,7 @@ class Pool:
 
 			# Initialize this map
 			for q in self.qcmd:
-				q.put( ('MAP', (mapper, mapper_args, pickle_kv)) )
+				q.put( ('MAP', (mapper, mapper_args)) )
 
 			# Queue the data to operate on
 			i = -1
@@ -323,25 +329,80 @@ class Pool:
 
 		progress_callback('mapreduce', 'begin', input, None, None)
 
+		back_to_disk = True
+
+		if back_to_disk:
+			unique_objects = {}
+			fp, prev_fp = None, None
+
 		for i, K in enumerate(kernels):
 			K_fun, K_args = unpack_callable(K)
 			last_step = (i + 1 == len(kernels))
 			stage = where(i == 0, 'map', 'reduce')
 
+			if back_to_disk:
+				# Insert picklers/unpicklers
+				if i != 0:
+					# Insert unpickler
+					K_fun, K_args = _reduce_from_pickle_jar, (prev_fp.name, K_fun, K_args)
+#					if i == 2: exit()
+
+				if not last_step:
+					# Insert pickler
+					K_fun, K_args = _output_pickled_kv, (K_fun, K_args)
+
+					# Create a disk backing store for intermediate results
+					fp = tempfile.NamedTemporaryFile(mode='wb', prefix='mapresults-', dir='.', suffix='.pkl', delete=True)
+					fd = fp.file.fileno()
+					os.ftruncate(fd, 1 * 2**40)  # 1TB ought to be enough for temporary storage (for now...)
+					mm = mmap.mmap(fd, 0)
+
+			# Call the distributed mappers
 			mresult = defaultdict(list)
 			for r in self.imap_unordered(input, K_fun, K_args, progress_callback=progress_callback, progress_callback_stage=stage):
 				if last_step:
 					# yield the final result
 					yield r
 				else:
-					# Prepare for next reduction
 					(k, v) = r
+
+					if back_to_disk:
+						(hash, v) = v
+						if hash in unique_objects:
+							v = unique_objects[hash]
+						else:
+							# The output value has already been pickled (but not the key). Store the
+							# pickled value into the pickle jar, and keep the (key, offset) tuple.
+							offs = mm.tell()
+							mm.write(v)
+							assert len(v) == mm.tell() - offs
+							v = offs
+							unique_objects[hash] = offs
+
+					# Prepare for next reduction
 					mresult[k].append(v)
 
 			input = mresult.items()
 
+			if back_to_disk:
+				# Close/clear the intermediate result backing store from the previous step
+				if prev_fp is not None:
+					prev_mm.resize(1)
+					prev_mm.close()
+					os.ftruncate(prev_fp.file.fileno(), 0)
+					prev_fp.close()
+
+				if fp is not None:
+					prev_fp, prev_mm = fp, mm
+
 		if progress_callback != None:
 			progress_callback('mapreduce', 'end', None, None, None)
+
+def digest(s):
+	import hashlib
+	#return hashlib.md5(s).hexdigest()
+	#return hashlib.sha1(s).digest()
+	return hashlib.md5(s).digest()
 
 #	def distributed_map_reduce_chain(self, input, kernels, partitioners, progress_callback=None):
 #		""" A poor-man's map-reduce implementation.
