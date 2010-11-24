@@ -3,25 +3,67 @@
 from multiprocessing import Process, Queue, cpu_count
 from collections import defaultdict
 import cPickle as pickle
+import cPickle
 import os
 import sys
 import tempfile
 import time
 from utils import unpack_callable
 
-def _worker(qin, qout):
-	# Dispatch the call to the target function, collecting
-	# back yielded results and returning them as a list
-	for mapper, i, args in iter(qin.get, 'EXIT'):
-		for result in mapper(*args):
-			qout.put((i, result))
-		qout.put("DONE")
+RET_KEYVAL = 1
+RET_KEYVAL_LIST = 2
 
-def _decoder(message):
-	# Decode a message encoded by the _worker and yield
-	# back the results
-	for (i, result) in message:
-		return (i, result)
+def _worker(qcmd, qin, qout):
+	""" Waits for commands on qcmd. Possible commands are:
+		MAP: On MAP, store mapper and mapper_args, and
+		     begin listening on qin for a stream of
+		     items to be passed to mapper, until a
+		     message 'DONE' is encountered. Return the
+		     results yielded by mapper via qout.
+
+		     If pickle_kv=True, assume the results
+		     yielded by mapper are (k, v) tuples, and
+		     return (k, cPickle.dumps(v)).
+	"""
+	for cmd, args in iter(qcmd.get, 'EXIT'):
+		if cmd == 'MAP':
+			mapper, mapper_args, pickle_kv = args
+
+			i, item, result = None, None, None
+			for (i, item) in iter(qin.get, 'DONE'):
+				for result in mapper(item, *mapper_args):
+					if pickle_kv:
+						# Assume the mapper output is a (k, v) tuple, and
+						# pickle the value. This is useful for map-reduce chains
+						# where the server will just store the pickled string to
+						# a file for the reducer.
+						result = (result[0], cPickle.dumps(result[1]))
+					qout.put((i, result))
+				qout.put('DONE')
+
+			# Immediately release memory
+			del result, i, item
+			del mapper, mapper_args, pickle_kv
+			del args
+
+def _unserializer(file, offsets):
+	# Helper for _reduce_from_pickle_jar -- takes a filename and
+	# a list of offsets, and returns a generator unpickling objects
+	# at given offsets
+	with open(file) as f:
+		mm = mmap.mmap(f.fileno(), 0, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+
+		for offs in offsets:
+			mm.seek(offs)
+			yield pickle.load(mm)
+
+		mm.close()
+
+def _reduce_from_pickle_jar(kw, file, reducer, reducer_args):
+	# open the pickle jar, load the objects, pass them on to the
+	# actual reducer
+	key, offsets = kw
+	return reducer((key, _unserializer(file, offsets)), *reducer_args)
 
 def _reduce_from_pickled(kw, pkl, reducer, args):
 	# open the piclke jar, load the objects, pass them on to the
@@ -100,6 +142,7 @@ def where(cond, a, b):
 	return a if cond else b
 
 class Pool:
+	qcmd = None
 	qin = None
 	qout = None
 	ps = []
@@ -117,7 +160,8 @@ class Pool:
 
 		self.qin = Queue()
 		self.qout = Queue(self.nworkers*2)
-		self.ps = [ Process(target=_worker, args=(self.qin, self.qout)) for _ in xrange(self.nworkers) ]
+		self.qcmd = [ Queue() for _ in xrange(self.nworkers) ]
+		self.ps = [ Process(target=_worker, args=(self.qcmd[i], self.qin, self.qout)) for i in xrange(self.nworkers) ]
 
 		for p in self.ps:
 			p.daemon = True
@@ -127,7 +171,7 @@ class Pool:
 		if nworkers != None:
 			self.nworkers = nworkers
 
-	def imap_unordered(self, input, mapper, mapper_args=(), return_index=False, progress_callback=None, progress_callback_stage='map'):
+	def imap_unordered(self, input, mapper, mapper_args=(), progress_callback=None, progress_callback_stage='map', pickle_kv=False):
 		""" Execute in parallel a callable <mapper> on all values of
 		    iterable <input>, ensuring that no more than ~nworkers
 		    results are pending in the output queue """
@@ -150,10 +194,19 @@ class Pool:
 			# Create workers (if not created already)
 			self._create_workers()
 
+			# Initialize this map
+			for q in self.qcmd:
+				q.put( ('MAP', (mapper, mapper_args, pickle_kv)) )
+
+			# Queue the data to operate on
 			i = -1
-			for (i, val) in enumerate(input):
-				self.qin.put( (mapper, i, (val,) + mapper_args) )
+			for (i, item) in enumerate(input):
+				self.qin.put( (i, item) )
 			n = i + 1
+
+			# Queue the end-of-map markers
+			for _ in xrange(self.nworkers):
+				self.qin.put('DONE')
 
 			# yield the outputs
 			k = 0
@@ -165,18 +218,12 @@ class Pool:
 					continue
 
 				(i, result) = ret
-				if return_index:
-					yield (i, result)
-				else:
-					yield result
+				yield result
 		else:
 			# Execute in-thread, without external workers
-			for (i, val) in enumerate(input):
-				for result in mapper(val, *mapper_args):
-					if return_index:
-						yield (i, result)
-					else:
-						yield result
+			for (i, item) in enumerate(input):
+				for result in mapper(item, *mapper_args):
+					yield result
 				progress_callback(progress_callback_stage, 'step', input, i, None)
 
 		progress_callback(progress_callback_stage, 'end', input, None, None)
