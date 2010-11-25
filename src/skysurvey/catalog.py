@@ -74,6 +74,8 @@ class Catalog:
 	NULL = 0		# The value for NULL in JOINed rows that had no matches
 
 	_tables  = None		# Tables in catalog ( dict of lists of (tablename, schema, primary_key) tuples)
+	_fgroups = None		# Map of group name -> absolute path
+	_filters = None		# Default PyTables filters to be applied to every Leaf in the file (can be overridden on per-tablet and per-blob basis)
 
 	columns       = None
 	primary_table = None	# Primary table of this catalog ( the one holding the IDs and spatial/temporal keys)
@@ -87,7 +89,88 @@ class Catalog:
 		    This comes in handy for direct JOINs.
 		"""
 		schema = self._get_schema(table)
-		return schema.get('path', '%s/data' % (self.path))
+		return schema.get('path', '%s/tablets' % (self.path))
+
+	def _get_fgroup_path(self, fgroup):
+		""" Allow specification of per-filegroup paths.
+		    May come in handy for direct JOINs.
+		"""
+		if fgroup not in self._fgroups or 'path' not in self._fgroups:
+			return '%s/files/%s' % (self.path, fgroup)
+
+		return self._fgroups[fgroup]['path']
+
+	def resolve_uri(self, uri, return_parts=False):
+		""" Resolve an lsd: URI referring to this catalog
+		"""
+		assert uri[:4] == 'lsd:'
+
+		_, catname, fgroup, fn = uri.split(':', 3)
+
+		(file, args, suffix) = self._get_fgroup_filter(fgroup)
+		path = '%s/%s%s' % (self._get_fgroup_path(fgroup), fn, suffix)
+		
+		if not return_parts:
+			return path
+		else:
+			return path, (catname, fgroup, fn), (file, args, suffix)
+
+	def _get_fgroup_filter(self, fgroup):
+		# Check for any filters associated with this fgroup
+		if fgroup in self._fgroups and 'filter' in self._fgroups[fgroup]:
+			(filter, kwargs) = self._fgroups[fgroup]['filter']
+			if filter == 'gzip':
+				# Gzipped file
+				import gzip
+				file = gzip.GzipFile
+				suffix = '.gz'
+			elif filter == 'bzip2':
+				# Bzipped file
+				import bz2
+				file = bz2.BZ2File
+				suffix = '.bz2'
+			else:
+				raise Exception('Unknown filter "%s" on file group %f' % fgroup)
+		else:
+			# Plain file
+			import __builtin__
+			file = __builtin__.file
+			kwargs = ()
+			suffix = ''
+
+		return file, kwargs, suffix
+
+	@contextmanager
+	def open_uri(self, uri, mode='r', clobber=True):
+		""" Open the resource (a file) at the given URI and
+		    return a file-like object.
+		"""
+		(fn, (_, fgroup, _), (file, kwargs, _)) = self.resolve_uri(uri, return_parts=True)
+
+		if mode != 'r':
+			# Create directory to the file, if it
+			# doesn't exist.
+			path = fn[:fn.rfind('/')];
+			if not os.path.exists(path):
+				utils.mkdir_p(path)
+			if clobber == False and os.access(fn, os.F_OK):
+				raise Exception('File %s exists and clobber=False' % fn)
+
+		f = file(fn, mode, **kwargs)
+		
+		yield f
+		
+		f.close()
+
+	def set_default_filters(self, **filters):
+		""" Set default PyTables filters (compression, checksums) """
+		self._filters = filters
+		self._store_schema()
+
+	def define_fgroup(self, fgroup, fgroupdef):
+		""" Define a file group """
+		self._fgroups[fgroup] = fgroupdef
+		self._store_schema()
 
 	def _tablet_filename(self, table):
 		""" The filename of a tablet in a cell """
@@ -166,6 +249,9 @@ class Catalog:
 		for _, schema in self._tables.iteritems():
 			schema['columns'] = [ tuple(val) for val in schema['columns'] ]
 
+		self._fgroups = data.get('fgroups', {})
+		self._filters = data.get('filters', {})
+
 		self._rebuild_internal_schema()
 
 	def _rebuild_internal_schema(self):
@@ -209,6 +295,8 @@ class Catalog:
 		data["nrows"] = self._nrows
 		data["tables"] = self._tables.items()
 		data["name"] = self.name
+		data["fgroups"] = self._fgroups
+		data["filters"] = self._filters
 
 		f = open(self.path + '/schema.cfg', 'w')
 		f.write(json.dumps(data, indent=4, sort_keys=True))
@@ -267,9 +355,11 @@ class Catalog:
 			schema = self._get_schema(table)
 
 			# Table
-			fp.createTable('/' + group, 'table', np.dtype(schema["columns"]), expectedrows=20*1000*1000, createparents=True)
+			filters      = schema.get('filters', self._filters)
+			expectedrows = schema.get('expectedrows', 20*1000*1000)
+
+			fp.createTable('/' + group, 'table', np.dtype(schema["columns"]), createparents=True, expectedrows=expectedrows, filters=tables.Filters(**filters))
 			g = getattr(fp.root, group)
-			
 
 			# Primary key sequence
 			if group == 'main' and 'primary_key' in schema:
@@ -278,8 +368,11 @@ class Catalog:
 
 			# BLOB storage arrays
 			if 'blobs' in schema:
-				for blobcol in schema['blobs']:
-					fp.createVLArray('/' + group +'/blobs', blobcol, BLOBAtom(), "BLOBs", createparents=True)
+				for blobcol, blobdef in schema['blobs'].iteritems():
+					filters          = blobdef.get('filters', filters)
+					expectedsizeinMB = blobdef.get('expectedsizeinMB', 1.0)
+
+					fp.createVLArray('/' + group +'/blobs', blobcol, BLOBAtom(), "BLOBs", createparents=True, filters=tables.Filters(**filters), expectedsizeinMB=expectedsizeinMB)
 					getattr(g.blobs, blobcol).append(None)	# ref=0 always points to None
 		return g
 
@@ -365,10 +458,12 @@ class Catalog:
 		self.path = path
 
 		utils.mkdir_p(self.path)
-		if os.path.isfile(self.path + '/dbinfo.json'):
+		if os.path.isfile(self.path + '/schema.cfg'):
 			raise Exception("Creating a new catalog in '%s' would overwrite an existing one." % self.path)
 
 		self._tables = OrderedDict()
+		self._fgroups = dict()
+		self._filters = dict()
 		self.columns = OrderedDict()
 		self.name = name
 
@@ -816,78 +911,6 @@ def tick(s, t):
 	dt = tt - t[0]
 	print >> sys.stderr, s, ":", dt
 	t[0] = tt
-
-def _fitskw_dumb(hdrs, kw):
-	# Easy way
-	res = []
-	for ahdr in hdrs:
-		hdr = pyfits.Header( txtfile=StringIO(ahdr) )
-		res.append(hdr[kw])
-	return res
-
-def fits_quickparse(header):
-	""" An ultra-simple FITS header parser. Does not support
-	    CONTINUE statements, HIERARCH, or anything of the sort;
-	    just plain vanilla:
-	    	key = value / comment
-	    one-liners. The upshot is that it's fast.
-
-	    Assumes each 80-column line has a '\n' at the end
-	"""
-	res = {}
-	for line in header.split('\n'):
-		at = line.find('=')
-		if at == -1 or at > 8:
-			continue
-
-		# get key
-		key = line[0:at].strip()
-
-		# parse value (string vs number, remove comment)
-		val = line[at+1:].strip()
-		if val[0] == "'":
-			# string
-			val = val[1:val[1:].find("'")]
-		else:
-			# number or T/F
-			at = val.find('/')
-			if at == -1: at = len(val)
-			val = val[0:at].strip()
-			if val.lower() in ['t', 'f']:
-				# T/F
-				val = val.lower() == 't'
-			else:
-				# Number
-				val = float(val)
-				if int(val) == val:
-					val = int(val)
-		res[key] = val
-	return res;
-
-def fitskw(hdrs, kw):
-	""" Intelligently extract a keyword kw from an arbitrarely
-	    shaped object ndarray of FITS headers.
-	"""
-	shape = hdrs.shape
-	hdrs = hdrs.reshape(hdrs.size)
-
-	res = []
-	cache = dict()
-	for ahdr in hdrs:
-		ident = id(ahdr)
-		if ident not in cache:
-			if ahdr is not None:
-				#hdr = pyfits.Header( txtfile=StringIO(ahdr) )
-				hdr = fits_quickparse(ahdr)
-				cache[ident] = hdr[kw]
-			else:
-				cache[ident] = None
-		res.append(cache[ident])
-
-	#assert res == _fitskw_dumb(hdrs, kw)
-
-	res = np.array(res).reshape(shape)
-	return res
 
 
 ###################################################################

@@ -10,6 +10,8 @@ import native
 import os, json, glob
 import sys
 import copy
+import urlparse
+from contextlib import contextmanager
 
 #
 # The result is a J = Table() with id, idx, isnull columns for each joined catalog
@@ -432,6 +434,7 @@ class QueryInstance(object):
 	bounds   = None
 
 	# These will be filled in from a QueryEngine instance
+	db       = None		# The controlling database instance
 	catalogs = None		# A name:Catalog dict() with all the catalogs listed on the FROM line.
 	root	 = None		# CatalogEntry instance with the primary (root) catalog
 	query_clauses = None	# Tuple with parsed query clauses
@@ -439,6 +442,7 @@ class QueryInstance(object):
 	locals   = None		# Extra local variables to be made available within the query
 
 	def __init__(self, q, cell_id, bounds, include_cached):
+		self.db            = q.db
 		self.catalogs	   = q.catalogs
 		self.root	   = q.root
 		self.query_clauses = q.query_clauses
@@ -467,7 +471,8 @@ class QueryInstance(object):
 			#		column from the SELECT clause, if it's referenced in WHERE
 			rows = Table()
 			global_ = globals()
-			global_['pix'] = self.root.cat.pix
+			global_['_PIX'] = self.root.cat.pix
+			global_['_DB']  = self.db
 			for (asname, name) in select_clause:
 #				col = self[name]	# For debugging
 				col = eval(name, global_, self)
@@ -570,12 +575,15 @@ class QueryInstance(object):
 		self.columns[key] = val
 
 class QueryEngine(object):
+	db       = None		# The controlling database instance
+
 	catalogs = None		# A name:Catalog dict() with all the catalogs listed on the FROM line.
 	root	 = None		# CatalogEntry instance with the primary (root) catalog
 	query_clauses  = None	# Parsed query clauses
 	locals   = None		# Extra variables to be made local to the query
 
 	def __init__(self, db, query, locals = {}):
+		self.db = db
 		# parse query
 		(select_clause, where_clause, from_clause) = qp.parse(query)
 
@@ -724,6 +732,32 @@ class DB(object):
 
 		self.catalogs = dict()	# A cache of catalog instances
 
+	def resolve_uri(self, uri):
+		""" Resolve the given URI into something that can be
+		    passed on to file() for loading.
+		"""
+		if uri[:4] != 'lsd:':
+			return uri
+
+		_, catname, _ = uri.split(':', 2)
+		return catalog(catname).resolve_uri(uri)
+
+	@contextmanager
+	def open_uri(self, uri, mode='r', clobber=True):
+		if uri[:4] != 'lsd:':
+			# Interpret this as a general URL
+			import urllib
+
+			f = urllib.urlopen(uri)
+			yield f
+
+			f.close()
+		else:
+			# Pass on to the controlling catalog
+			_, catname, _ = uri.split(':', 2)
+			with self.catalog(catname).open_uri(uri, mode, clobber) as f:
+				yield f
+
 	def query(self, query, locals={}):
 		return Query(self, query, locals=locals)
 
@@ -733,9 +767,18 @@ class DB(object):
 		"""
 		cat = self.catalog(catname, create=True)
 
+		# Add fgroups
+		if 'fgroups' in catdef:
+			for fgroup, fgroupdef in catdef['fgroups'].iteritems():
+				cat.define_fgroup(fgroup, fgroupdef)
+
+		cat.set_default_filters(**catdef.get('filters', {}))
+
+		tschema = catdef['schema']
+
 		# Ensure we create the primary table first
 		primary_table = None
-		for tname, schema in catdef.iteritems():
+		for tname, schema in tschema.iteritems():
 			if 'primary_key' in schema:
 				primary_table = tname;
 				break;
@@ -749,9 +792,9 @@ class DB(object):
 			cat.create_table(tname, schema)
 
 		if primary_table is not None:
-			aux_create_table(cat, primary_table, catdef[primary_table])
+			aux_create_table(cat, primary_table, tschema[primary_table])
 
-		for tname, schema in catdef.iteritems():
+		for tname, schema in tschema.iteritems():
 			if tname != primary_table:
 				aux_create_table(cat, tname, schema)
 
@@ -974,6 +1017,159 @@ def _mapper(partspec, mapper, qengine, include_cached, _pass_empty=False):
 	# Pass on to mapper (and yield its results)
 	for result in mapper(qengine.on_cell(cell_id, bounds, include_cached), *mapper_args):
 		yield result
+
+###############################
+
+def _fitskw_dumb(hdrs, kw):
+	# Easy way
+	res = []
+	for ahdr in hdrs:
+		hdr = pyfits.Header( txtfile=StringIO(ahdr) )
+		res.append(hdr[kw])
+	return res
+
+def fits_quickparse(header):
+	""" An ultra-simple FITS header parser. Does not support
+	    CONTINUE statements, HIERARCH, or anything of the sort;
+	    just plain vanilla:
+	    	key = value / comment
+	    one-liners. The upshot is that it's fast.
+
+	    Assumes each 80-column line has a '\n' at the end
+	"""
+	res = {}
+	for line in header.split('\n'):
+		at = line.find('=')
+		if at == -1 or at > 8:
+			continue
+
+		# get key
+		key = line[0:at].strip()
+
+		# parse value (string vs number, remove comment)
+		val = line[at+1:].strip()
+		if val[0] == "'":
+			# string
+			val = val[1:val[1:].find("'")]
+		else:
+			# number or T/F
+			at = val.find('/')
+			if at == -1: at = len(val)
+			val = val[0:at].strip()
+			if val.lower() in ['t', 'f']:
+				# T/F
+				val = val.lower() == 't'
+			else:
+				# Number
+				val = float(val)
+				if int(val) == val:
+					val = int(val)
+		res[key] = val
+	return res;
+
+def fitskw(hdrs, kw, default=0):
+	""" Intelligently extract a keyword kw from an arbitrarely
+	    shaped object ndarray of FITS headers.
+	"""
+	shape = hdrs.shape
+	hdrs = hdrs.reshape(hdrs.size)
+
+	res = []
+	cache = dict()
+	for ahdr in hdrs:
+		ident = id(ahdr)
+		if ident not in cache:
+			if ahdr is not None:
+				#hdr = pyfits.Header( txtfile=StringIO(ahdr) )
+				hdr = fits_quickparse(ahdr)
+				cache[ident] = hdr.get(kw, default)
+			else:
+				cache[ident] = default
+		res.append(cache[ident])
+
+	#assert res == _fitskw_dumb(hdrs, kw)
+
+	res = np.array(res).reshape(shape)
+	return res
+
+def ffitskw(uris, kw, default = False, db=None):
+	""" Intelligently load FITS headers stored in
+	    <uris> ndarray, and fetch the requested
+	    keyword from them.
+	"""
+
+	if len(uris) == 0:
+		return np.empty(0)
+
+	uuris, idx = np.unique(uris, return_inverse=True)
+	idx = idx.reshape(uris.shape)
+
+	if db is None:
+		# _DB is implicitly defined inside queries
+		db = _DB
+
+	ret = []
+	for uri in uuris:
+		if uri is not None:
+			with db.open_uri(uri) as f:
+				hdr_str = f.read()
+			hdr = fits_quickparse(hdr_str)
+			ret.append(hdr.get(kw, default))
+		else:
+			ret.append(default)
+
+	# Broadcast
+	ret = np.array(ret)[idx]
+
+	assert ret.shape == uris.shape, '%s %s %s' % (ret.shape, uris.shape, idx.shape)
+
+	return ret
+
+def OBJECT(uris, db=None):
+	""" Dereference blobs referred to by URIs,
+	    assuming they're pickled Python objects.
+	"""
+	return deref(uris, db, True)
+
+def BLOB(uris, db=None):
+	""" Dereference blobs referred to by URIs,
+	    loading them as plain files
+	"""
+	return deref(uris, db, False)
+
+def deref(uris, db=None, unpickle=False):
+	""" Dereference blobs referred to by URIs,
+	    either as BLOBs or Python objects
+	"""
+	if len(uris) == 0:
+		return np.empty(0, dtype=object)
+
+	uuris, idx = np.unique(uris, return_inverse=True)
+	idx = idx.reshape(uris.shape)
+
+	if db is None:
+		# _DB is implicitly defined inside queries
+		db = _DB
+
+	ret = np.empty(len(uuris), dtype=object)
+	for i, uri in enumerate(uuris):
+		if uri is not None:
+			with db.open_uri(uri) as f:
+				if unpickle:
+					ret[i] = cPickle.load(f)
+				else:
+					ret[i] = f.read()
+		else:
+			ret[i] = None
+
+	# Broadcast
+	ret = np.array(ret)[idx]
+
+	assert ret.shape == uris.shape, '%s %s %s' % (ret.shape, uris.shape, idx.shape)
+
+	return ret
+
+###############################
 
 def test_kernel(qresult):
 	for rows in qresult:

@@ -62,13 +62,12 @@ if not mode or mode == 'import':
 
 if not mode or mode == 'postprocess':
 	# Build neighbor caches for detections
-#	print >> sys.stderr, "Building neighbor cache (detections): ",
-#	db.build_neighbor_cache(det_catdir)
+	print >> sys.stderr, "Building neighbor cache (detections): ",
+	db.build_neighbor_cache(det_catdir)
 
 	# Build neighbor caches for images tables
 	print >> sys.stderr, "Building neighbor cache (exposures): ",
 	smf.make_image_cache(db, det_catdir, exp_catdir)
-	exit()
 
 	# Sanity check: all queries linking to images must resolve within cell
 	print >> sys.stderr, "Consistency check: ",
