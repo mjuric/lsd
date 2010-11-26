@@ -636,6 +636,9 @@ def make_object_catalog(db, obj_catdir, det_catdir, radius=1./3600., create=True
 					      ],
 					      progress_callback=pool2.progress_pass):
 		at += 1
+		if nexp is None:
+			continue
+
 		t1 = time.time()
 		time_pass = (t1 - t0) / 60
 		time_tot = time_pass / at * len(det_cells)
@@ -761,9 +764,9 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		# there's no way we'll get a match that will be kept in the end. Just continue to the
 		# next one if this is the case.
 		cachedonly = len(objs) == 0 and cached.all()
-		print cached
 		if cachedonly:
-			print "Skipping cached-only", len(cached)
+#			print "Skipping cached-only", len(cached)
+			yield (None, None, None, None, None, None) # Yield just to have the progress counter properly incremented
 			continue;
 
 		# prep join table

@@ -56,15 +56,13 @@ class TableCache:
 
 		# See if we have already loaded the required tablet
 		tcache = self.cache[cell_id][cat.name][include_cached]
-		if table in tcache:
-			col = tcache[table][name]
-		else:
+		if table not in tcache:
 			# Load and cache the tablet
-			rows = cat.fetch_tablet(cell_id, table, include_cached=include_cached)
-			tcache[table] = rows
+			rows = tcache[table] = cat.fetch_tablet(cell_id, table, include_cached=include_cached)
+		else:
+			rows = tcache[table]
 
-			col = rows[name]
-
+		col = rows[name]
 		return col
 
 	def resolve_blobs(self, cell_id, col, name, cat):
@@ -420,10 +418,12 @@ class TableColsProxy:
 		self.catalogs = catalogs
 
 	def __getitem__(self, catname):
-		# Return a list of columns in catalog catname
+		# Return a list of columns in catalog catname, unless
+		# they're pseudocolumns
 		if catname == '':
 			catname = self.root_catalog
-		return self.catalogs[catname].cat.columns.keys()
+		cat = self.catalogs[catname].cat
+		return [ name for (name, coldef) in cat.columns.iteritems() if not cat._is_pseudotable(coldef.table) ]
 
 class QueryInstance(object):
 	# Internal working state variables
@@ -531,7 +531,6 @@ class QueryInstance(object):
 	#################
 
 	def load_column(self, name, catname):
-		#
 		# If we're just peeking, construct the column from schema
 		if self.cell_id is None:
 			assert self.bounds is None
@@ -570,6 +569,19 @@ class QueryInstance(object):
 		col = col.view(iarray)
 		return col
 
+	def load_pseudocolumn(self, name):
+		""" Generate per-query pseudocolumns.
+		
+		    Developer note: When adding a new pseudocol, make sure to also add
+		       it to the if() statement in __getitem__
+		"""
+		if name == '_ROWNUM':
+			# like Oracle's ROWNUM, but on a per-cell basis (and zero-based)
+			nrows = len(self.jmap) if self.jmap is not None else 0
+			return np.arange(nrows, dtype=np.uint64)
+		else:
+			raise Exception('Unknown pseudocolumn %s' % name)
+
 	def __getitem__(self, name):
 		# An already loaded column?
 		if name in self.columns:
@@ -595,6 +607,11 @@ class QueryInstance(object):
 				self[name] = self.load_column(colname, catname)
 				#print "Loaded column %s.%s.%s for %s (len=%s)" % (catname, table, colname2, name, len(self.columns[name]))
 				return self.columns[name]
+
+		# A query pseudocolumn?
+		if name in ['_ROWNUM']:
+			col = self[name] = self.load_pseudocolumn(colname)
+			return col
 
 		# A name of a catalog? Return a proxy object
 		if name in self.catalogs:

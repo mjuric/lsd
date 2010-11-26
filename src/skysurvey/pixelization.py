@@ -163,6 +163,13 @@ class Pixelization(object):
 
 		return cell_id
 
+	def id_for_cell_i(self, cell_id, i):
+		# Returns an ID given a valid cell_id and the 32-bit
+		# object ID part
+		assert np.all(self.is_cell_id(cell_id))		# Must be cell_id
+		assert not np.any(i & 0xFFFFFFFF00000000)	# Must be 32bit
+		return (cell_id & 0xFFFFFFFF00000000) | i
+
 	def is_cell_id(self, id):
 		# Return True if id is a cell_id
 		return id | 0x00000000FFFFFFFF == id

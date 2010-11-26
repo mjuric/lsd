@@ -180,8 +180,10 @@ class Catalog:
 		return '%s/%s/%s' % (self._get_table_data_path(table), self.pix.path_to_cell(cell_id), self._tablet_filename(table))
 
 	def tablet_exists(self, cell_id, table=None):
-		""" Return True if the given tablet exists in cell_id """
-		if table is None:
+		""" Return True if the given tablet exists in cell_id.
+		    For pseudo-tables check the existence of primary_table
+		"""
+		if table is None or self._is_pseudotable(table):
 			table = self.primary_table
 
 		assert table in self._tables
@@ -253,13 +255,23 @@ class Catalog:
 		self._filters = data.get('filters', {})
 		self._aliases = data.get('aliases', {})
 
+		# Add pseudocolumns table
+		self._tables['_PSEUDOCOLS'] = \
+		{
+			'columns': [
+				('_CACHED', 'bool'),
+				('_ROWIDX', 'u8'),
+				('_ROWID',  'u8')
+			]
+		}
+
 		self._rebuild_internal_schema()
 
 	def _store_schema(self):
 		data = dict()
 		data["level"], data["t0"], data["dt"] = self.pix.level, self.pix.t0, self.pix.dt
 		data["nrows"] = self._nrows
-		data["tables"] = self._tables.items()
+		data["tables"] = [ (name, schema) for (name, schema) in self._tables.iteritems() if name[0] != '_' ]
 		data["name"] = self.name
 		data["fgroups"] = self._fgroups
 		data["filters"] = self._filters
@@ -283,7 +295,7 @@ class Catalog:
 				self.columns[colname].dtype = np.dtype(dtype)
 				self.columns[colname].table = table
 
-			if self.primary_table is None:
+			if self.primary_table is None and not self._is_pseudotable(table):
 				self.primary_table = table
 				if 'primary_key'  in schema:
 					self.primary_key  = self.columns[schema['primary_key']]
@@ -322,6 +334,8 @@ class Catalog:
 		# has a primary_key
 		if table in self._tables and not ignore_if_exists:
 			raise Exception('Trying to create a table that already exists!')
+		if self._is_pseudotable(table):
+			raise Exception("Tables beginning with '_' are reserved for system use.")
 
 		self._tables[table] = schema
 
@@ -396,6 +410,8 @@ class Catalog:
 		"""
 		with self.get_cell(cell_id, mode='w') as cell:
 			for table in self._tables:
+				if self._is_pseudotable(table):
+					continue
 				with cell.open(table) as fp:
 					if group in fp.root:
 						fp.removeNode('/', group, recursive=True);
@@ -488,6 +504,7 @@ class Catalog:
 		self.pix = Pixelization(level, t0, dt)
 
 		self._store_schema()
+		self._load_schema()	# This will trigger the addition of pseudotables
 
 	def update(self, table, keys, rows):
 		raise Exception('Not implemented')
@@ -513,7 +530,6 @@ class Catalog:
 		elif colname == '_TIME'   and 'temporal_key' in schema: return schema['temporal_key']
 		# TODO: Consider moving these to user aliases at some point
 		elif colname == '_EXP'    and 'exposure_key' in schema: return schema['exposure_key']
-		elif colname == '_CACHED' and 'cached_flag'  in schema: return schema['cached_flag']
 
 		# User aliases
 		return self._aliases.get(colname, colname)
@@ -637,6 +653,9 @@ class Catalog:
 
 			# Store cell groups into their tablets
 			for table, schema in self._tables.iteritems():
+				if self._is_pseudotable(table):
+					continue
+
 				fp    = self._open_tablet(cur_cell_id, mode='w', table=table)
 				g     = self._get_row_group(fp, group, table)
 				t     = g.table
@@ -831,10 +850,14 @@ class Catalog:
 		# unpopulated (happens in static-temporal JOINs)
 		cell_id = self.static_if_no_temporal(cell_id)
 
+		if self._is_pseudotable(table):
+			return self._fetch_pseudotable(cell_id, table, include_cached)
+
 		if self.tablet_exists(cell_id, table):
 			with self.get_cell(cell_id) as cell:
 				with cell.open(table) as fp:
 					rows = fp.root.main.table.read()
+					nnoncached = len(rows)
 					if include_cached and 'cached' in fp.root:
 						rows2 = fp.root.cached.table.read()
 						# Make any neighbor cache BLOBs negative (so that fetch_blobs() know to
@@ -851,17 +874,31 @@ class Catalog:
 
 		return rows
 
-#	def query_cell(self, cell_id, query='*', include_cached=False):
-#		""" Execute a query on a local cell.
-#
-#		    If the cell_id has a temporal component, and there are no
-#		    tablets in that cell, a static sky cell corresponding
-#		    to it will be tried.
-#		"""
-#		assert self.is_cell_local(cell_id)
-#
-#		return self.fetch(query, cell_id, include_cached=include_cached, progress_callback=pool2.progress_pass);
-#
+	def _fetch_pseudotable(self, cell_id, table, include_cached=False):
+		# Pseudo-columns: _CACHED, _ROWID and _ROWIDX
+		# DO NOT CALL DIRECTLY !!
+
+		assert table == '_PSEUDOCOLS'
+
+		# Find out how many rows are there in this cell
+		nrows1 = nrows2 = 0
+		if self.tablet_exists(cell_id, self.primary_table):
+			with self.get_cell(cell_id) as cell:
+				with cell.open(self.primary_table) as fp:
+					nrows1 = len(fp.root.main.table)
+					nrows2 = len(fp.root.cached.table) if (include_cached and 'cached' in fp.root) else 0
+		nrows = nrows1 + nrows2
+
+		cached = np.zeros(nrows, dtype=np.bool)			# _CACHED
+		cached[nrows1:] = True
+		rowidx = np.arange(0, nrows, dtype=np.uint64)		# _ROWIDX
+		rowid  = self.pix.id_for_cell_i(cell_id, rowidx)	# _ROWID
+
+		pcols  = Table([('_CACHED', cached), ('_ROWIDX', rowidx), ('_ROWID', rowid)])
+		return pcols
+
+	def _is_pseudotable(self, table):
+		return table[0] == '_'
 
 	class CellProxy:
 		cat     = None
