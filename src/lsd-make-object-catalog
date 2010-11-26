@@ -10,7 +10,7 @@ import skysurvey as lsd
 from   skysurvey.utils import *
 
 def usage():
-	print "Usage: %s [-c|--create] <obj_cat_dir> <det_cat_dir>" % sys.argv[0]
+	print "Usage: %s [-c|--create] <db> <obj_cat_dir> <det_cat_dir>" % sys.argv[0]
 
 try:
 	optlist, args = getopt.getopt(sys.argv[1:], 'c', ['create'])
@@ -19,12 +19,12 @@ except getopt.GetoptError, err:
 	usage()
 	exit(-1)
 
-if len(args) != 2:
+if len(args) != 3:
 	print "Error: Not enough command line arguments."
 	usage()
 	exit(-1)
 
-(obj_catdir, det_catdir) = args[0], args[1]
+(dbdir, obj_catdir, det_catdir) = args
 
 create = False
 for (o, a) in optlist:
@@ -35,4 +35,5 @@ for (o, a) in optlist:
 # Actual work
 #
 
-smf.make_object_catalog(obj_catdir, det_catdir, create=create)
+db = lsd.DB(dbdir)
+smf.make_object_catalog(db, obj_catdir, det_catdir, create=create)

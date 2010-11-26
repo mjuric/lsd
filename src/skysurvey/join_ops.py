@@ -454,38 +454,32 @@ class QueryInstance(object):
 
 		self.tcache	= TableCache(self.root, include_cached)
 		self.columns	= {}
+		
+	def peek(self):
+		assert self.cell_id is None
+		return self.eval_select()
 
 	def __iter__(self):
-		(select_clause, where_clause, _) = self.query_clauses
+		assert self.cell_id is not None # Cannot call iter when peeking
 
 		# Evaluate the JOIN map
 		self.jmap   	    = self.root.evaluate_join(self.cell_id, self.bounds, self.tcache)
 
 		if self.jmap is not None:
-			# eval individual columns in select clause to slurp them up from disk
-			# and have them ready for the WHERE clause
-			#
-			# TODO: We can optimize this by evaluating WHERE first, using the result
+			# TODO: We could optimize this by evaluating WHERE first, using the result
 			#       to cull the output number of rows, and then evaluating the columns.
 			#		When doing so, care must be taken to fall back onto evaluating a
 			#		column from the SELECT clause, if it's referenced in WHERE
-			rows = Table()
-			global_ = globals()
-			global_['_PIX'] = self.root.cat.pix
-			global_['_DB']  = self.db
-			for (asname, name) in select_clause:
-#				col = self[name]	# For debugging
-				col = eval(name, global_, self)
-#				exit()
 
-				self[asname] = col
-				rows.add_column(asname, col)
-	
-			# evaluate the WHERE clause, to obtain the final filter
-			in_    = np.empty(len(rows), dtype=bool)
-			in_[:] = eval(where_clause, global_, self)
-	
+			globals_ = self.prep_globals()
+
+			# eval individual columns in select clause to slurp them up from disk
+			# and have them ready for the WHERE clause
+			rows = self.eval_select(globals_)
+
 			if len(rows):
+				in_  = self.eval_where(globals_)
+
 				if not in_.all():
 					rows = rows[in_]
 
@@ -496,35 +490,81 @@ class QueryInstance(object):
 
 		# We yield nothing if the result set is empty.
 
+	def prep_globals(self):
+		globals_ = globals()
+
+		# Add implicit global objects present in queries
+		globals_['_PIX'] = self.root.cat.pix
+		globals_['_DB']  = self.db
+		
+		return globals_
+
+	def eval_where(self, globals_ = None):
+		(_, where_clause, _) = self.query_clauses
+
+		if globals_ is None:
+			globals_ = self.prep_globals()
+
+		# evaluate the WHERE clause, to obtain the final filter
+		in_    = np.empty(len(next(self.columns.itervalues())), dtype=bool)
+		in_[:] = eval(where_clause, globals_, self)
+
+		return in_
+
+	def eval_select(self, globals_ = None):
+		(select_clause, _, _) = self.query_clauses
+
+		if globals_ is None:
+			globals_ = self.prep_globals()
+
+		rows = Table()
+		for (asname, name) in select_clause:
+#			col = self[name]	# For debugging
+			col = eval(name, globals_, self)
+#			exit()
+
+			self[asname] = col
+			rows.add_column(asname, col)
+
+		return rows
+	
 	#################
 
 	def load_column(self, name, catname):
-		# Load the column from table 'table' of the catalog 'catname'
-		# Also cache the loaded tablet, for future reuse
-		cat = self.catalogs[catname].cat
+		#
+		# If we're just peeking, construct the column from schema
+		if self.cell_id is None:
+			assert self.bounds is None
 
-		# Load the column (via cache)
-		col = self.tcache.load_column(self.cell_id, name, cat)
+			dtype = self.catalogs[catname].cat.columns[name].dtype
+			col = np.empty(0, dtype=dtype)
+		else:
+			# Load the column from table 'table' of the catalog 'catname'
+			# Also cache the loaded tablet, for future reuse
+			cat = self.catalogs[catname].cat
 
-		# Join/filter if needed
-		if catname in self.jmap:
-			isnullKey  = catname + '._NULL'
-			idx			= self.jmap[catname]
-			if len(col):
-				col         = col[idx]
+			# Load the column (via cache)
+			col = self.tcache.load_column(self.cell_id, name, cat)
+
+			# Join/filter if needed
+			if catname in self.jmap:
+				isnullKey  = catname + '._NULL'
+				idx			= self.jmap[catname]
+				if len(col):
+					col         = col[idx]
 	
-				if isnullKey in self.jmap:
-					isnull		= self.jmap[isnullKey]
-					col[isnull] = cat.NULL
-			elif len(idx):
-				# This tablet is empty, but columns show up here because of an OUTER join.
-				# Just return NULLs of proper dtype
-				assert self.jmap[isnullKey].all()
-				assert (idx == 0).all()
-				col = np.zeros(shape=(len(idx),) + col.shape[1:], dtype=col.dtype)
+					if isnullKey in self.jmap:
+						isnull		= self.jmap[isnullKey]
+						col[isnull] = cat.NULL
+				elif len(idx):
+					# This tablet is empty, but columns show up here because of an OUTER join.
+					# Just return NULLs of proper dtype
+					assert self.jmap[isnullKey].all()
+					assert (idx == 0).all()
+					col = np.zeros(shape=(len(idx),) + col.shape[1:], dtype=col.dtype)
 
-		# Resolve blobs (if a blobref column)
-		col = self.tcache.resolve_blobs(self.cell_id, col, name, cat)
+			# Resolve blobs (if a blobref column)
+			col = self.tcache.resolve_blobs(self.cell_id, col, name, cat)
 
 		# Return the column as an iarray
 		col = col.view(iarray)
@@ -570,7 +610,7 @@ class QueryInstance(object):
 
 	def __setitem__(self, key, val):
 		if len(self.columns):
-			assert len(val) == len(self.columns.values()[0]), "%s: %d != %d" % (key, len(val), len(self.columns.values()[0]))
+			assert len(val) == len(next(self.columns.itervalues())), "%s: %d != %d" % (key, len(val), len(self.columns.values()[0]))
 
 		self.columns[key] = val
 
@@ -596,6 +636,9 @@ class QueryEngine(object):
 	def on_cell(self, cell_id, bounds=None, include_cached=False):
 		return QueryInstance(self, cell_id, bounds, include_cached)
 
+	def peek(self):
+		return QueryInstance(self, None, None, None).peek()
+
 class Query(object):
 	db      = None
 	qengine = None
@@ -604,7 +647,7 @@ class Query(object):
 		self.db		 = db
 		self.qengine = QueryEngine(db, query, locals=locals)
 
-	def execute(self, kernels, bounds=None, include_cached=False, cells=[], testbounds=True, nworkers=None, progress_callback=None):
+	def execute(self, kernels, bounds=None, include_cached=False, cells=[], testbounds=True, nworkers=None, progress_callback=None, yield_empty=False):
 		""" A MapReduce implementation, where rows from individual cells
 		    get mapped by the mapper, with the result reduced by the reducer.
 		    
@@ -645,10 +688,16 @@ class Query(object):
 
 		# start and run the workers
 		pool = pool2.Pool(nworkers)
+		yielded = False
 		for result in pool.map_reduce_chain(partspecs.items(), kernels, progress_callback=progress_callback):
 			yield result
+			yielded = True
 
-	def iterate(self, bounds=None, include_cached=False, cells=[], return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None):
+		# Yield an empty row, if requested
+		if not yielded and yield_empty:
+			yield self.qengine.peek()
+
+	def iterate(self, bounds=None, include_cached=False, cells=[], return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None, yield_empty=False):
 		""" Yield rows (either on a row-by-row basis if return_blocks==False
 		    or in chunks (numpy structured array)) within a
 		    given footprint. Calls 'filter' callable (if given) to filter
@@ -662,7 +711,8 @@ class Query(object):
 
 		for rows in self.execute(
 				[mapper], bounds, include_cached,
-				cells=cells, testbounds=testbounds, nworkers=nworkers, progress_callback=progress_callback):
+				cells=cells, testbounds=testbounds, nworkers=nworkers, progress_callback=progress_callback,
+				yield_empty=yield_empty):
 			if return_blocks:
 				yield rows
 			else:
@@ -694,7 +744,9 @@ class Query(object):
 		ret = None
 		for rows in self.iterate(
 				bounds, include_cached,
-				cells=cells, return_blocks=True, filter=filter, testbounds=testbounds, nworkers=nworkers, progress_callback=progress_callback):
+				cells=cells, return_blocks=True, filter=filter, testbounds=testbounds,
+				yield_empty=True,
+				nworkers=nworkers, progress_callback=progress_callback):
 			# ensure enough memory has been allocated (and do it
 			# intelligently if not)
 			if ret is None:
@@ -761,6 +813,14 @@ class DB(object):
 	def query(self, query, locals={}):
 		return Query(self, query, locals=locals)
 
+	def _aux_create_table(self, cat, tname, schema):
+		schema = copy.deepcopy(schema)
+
+		# Remove any extra fields off schema['column']
+		schema['columns'] = [ (name, type) for (name, type, _, _) in schema['columns'] ]
+
+		cat.create_table(tname, schema)
+
 	def create_catalog(self, catname, catdef):
 		"""
 			Creates the catalog given the extended schema description.
@@ -772,31 +832,24 @@ class DB(object):
 			for fgroup, fgroupdef in catdef['fgroups'].iteritems():
 				cat.define_fgroup(fgroup, fgroupdef)
 
+		# Add filters
 		cat.set_default_filters(**catdef.get('filters', {}))
 
+		# Add column groups
 		tschema = catdef['schema']
 
 		# Ensure we create the primary table first
-		primary_table = None
+		schemas = []
 		for tname, schema in tschema.iteritems():
-			if 'primary_key' in schema:
-				primary_table = tname;
-				break;
+			schemas.insert(np.where('primary_key' in schema, 0, len(schemas)), (tname, schema))
+		assert len(schemas) and 'primary_key' in schemas[0][1]
+		for tname, schema in schemas:
+			self._aux_create_table(cat, tname, schema)
 
-		def aux_create_table(cat, tname, schema):
-			schema = copy.deepcopy(schema)
-
-			# Remove any extra fields off schema['column']
-			schema['columns'] = [ (name, type) for (name, type, _, _) in schema['columns'] ]
-
-			cat.create_table(tname, schema)
-
-		if primary_table is not None:
-			aux_create_table(cat, primary_table, tschema[primary_table])
-
-		for tname, schema in tschema.iteritems():
-			if tname != primary_table:
-				aux_create_table(cat, tname, schema)
+		# Add aliases (must do this last, as the aliased columns have to exist)
+		if 'aliases' in catdef:
+			for alias, colname in catdef['aliases'].iteritems():
+				cat.define_alias(alias, colname)
 
 		return cat
 

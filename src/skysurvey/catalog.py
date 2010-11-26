@@ -77,7 +77,7 @@ class Catalog:
 	_fgroups = None		# Map of group name -> absolute path
 	_filters = None		# Default PyTables filters to be applied to every Leaf in the file (can be overridden on per-tablet and per-blob basis)
 
-	columns       = None
+	columns       = None	# OrderedDict of ColumnType objects representing the schema
 	primary_table = None	# Primary table of this catalog ( the one holding the IDs and spatial/temporal keys)
 	primary_key   = None
 	spatial_keys  = None
@@ -209,7 +209,7 @@ class Catalog:
 		#print "Reverting to static sky", self._cell_prefix(cell_id)
 		return cell_id
 
-	def get_cells(self, bounds, return_bounds=False):
+	def get_cells(self, bounds=None, return_bounds=False):
 		""" Return a list of cells
 		"""
 		data_path = self._get_table_data_path(self.primary_table)
@@ -251,8 +251,23 @@ class Catalog:
 
 		self._fgroups = data.get('fgroups', {})
 		self._filters = data.get('filters', {})
+		self._aliases = data.get('aliases', {})
 
 		self._rebuild_internal_schema()
+
+	def _store_schema(self):
+		data = dict()
+		data["level"], data["t0"], data["dt"] = self.pix.level, self.pix.t0, self.pix.dt
+		data["nrows"] = self._nrows
+		data["tables"] = self._tables.items()
+		data["name"] = self.name
+		data["fgroups"] = self._fgroups
+		data["filters"] = self._filters
+		data["aliases"] = self._aliases
+
+		f = open(self.path + '/schema.cfg', 'w')
+		f.write(json.dumps(data, indent=4, sort_keys=True))
+		f.close()
 
 	def _rebuild_internal_schema(self):
 		# Rebuild internal representation of the schema from self._tables
@@ -289,20 +304,18 @@ class Catalog:
 					assert self.columns[colname].dtype.base == np.int64, "Data structure error: blob reference columns must be of int64 type"
 					self.columns[colname].is_blob = True
 
-	def _store_schema(self):
-		data = dict()
-		data["level"], data["t0"], data["dt"] = self.pix.level, self.pix.t0, self.pix.dt
-		data["nrows"] = self._nrows
-		data["tables"] = self._tables.items()
-		data["name"] = self.name
-		data["fgroups"] = self._fgroups
-		data["filters"] = self._filters
+	#################
 
-		f = open(self.path + '/schema.cfg', 'w')
-		f.write(json.dumps(data, indent=4, sort_keys=True))
-		f.close()
+	@property
+	def dtype(self):
+		# Return the dtype of a row in this catalog
+		return np.dtype([ (name, coltype.dtype) for (name, coltype) in self.columns.iteritems() ])
 
-	###############
+	def dtype_for(self, cols):
+		# Return the dtype of a row consisting of [cols]
+		return np.dtype([ (name, self.columns[self.resolve_alias(name)].dtype) for name in cols ])
+
+	#################
 
 	def create_table(self, table, schema, ignore_if_exists=False):
 		# Create a new table and set it as primary if it
@@ -312,9 +325,10 @@ class Catalog:
 
 		self._tables[table] = schema
 
+		if 'spatial_keys' in schema and 'primary_key' not in schema:
+			raise Exception('Trying to create spatial keys in a non-primary table!')
+
 		if 'primary_key' in schema:
-			if 'spatial_keys' not in schema:
-				raise Exception('Trying to create a primary table with no spatial keys!')
 			if self.primary_table is not None:
 				raise Exception('Trying to create a primary table ("%s") while one ("%s") already exists!' % (table, self.primary_table))
 			self.primary_table = table
@@ -464,6 +478,7 @@ class Catalog:
 		self._tables = OrderedDict()
 		self._fgroups = dict()
 		self._filters = dict()
+		self._aliases = dict()
 		self.columns = OrderedDict()
 		self.name = name
 
@@ -477,20 +492,31 @@ class Catalog:
 	def update(self, table, keys, rows):
 		raise Exception('Not implemented')
 
+	def define_alias(self, alias, colname):
+		""" Defines an aliase for a column name
+		"""
+		assert colname in self.columns
+
+		self._aliases[alias] = colname
+		self._store_schema()
+
 	def resolve_alias(self, colname):
 		""" Return the real column name for special column
 		    aliases.
 		"""
 		schema = self._get_schema(self.primary_table);
 
-		if colname == '_ID'     and 'primary_key'  in schema: return schema['primary_key']
-		if colname == '_LON'    and 'spatial_keys' in schema: return schema['spatial_keys'][0]
-		if colname == '_LAT'    and 'spatial_keys' in schema: return schema['spatial_keys'][1]
-		if colname == '_TIME'   and 'temporal_key' in schema: return schema['temporal_key']
-		if colname == '_EXP'    and 'exposure_key' in schema: return schema['exposure_key']
-		if colname == '_CACHED' and 'cached_flag'  in schema: return schema['cached_flag']
+		# built-in aliases
+		if   colname == '_ID'     and 'primary_key'  in schema: return schema['primary_key']
+		elif colname == '_LON'    and 'spatial_keys' in schema: return schema['spatial_keys'][0]
+		elif colname == '_LAT'    and 'spatial_keys' in schema: return schema['spatial_keys'][1]
+		elif colname == '_TIME'   and 'temporal_key' in schema: return schema['temporal_key']
+		# TODO: Consider moving these to user aliases at some point
+		elif colname == '_EXP'    and 'exposure_key' in schema: return schema['exposure_key']
+		elif colname == '_CACHED' and 'cached_flag'  in schema: return schema['cached_flag']
 
-		return colname
+		# User aliases
+		return self._aliases.get(colname, colname)
 
 	def append(self, cols_, group='main', cell_id=None):
 		""" Insert a set of rows into a table in the database. Protects against
@@ -506,7 +532,7 @@ class Catalog:
 
 		# Resolve aliases in the input, and prepare a Table()
 		cols = Table()
-		if getattr(cols_, 'items', None) is not None:
+		if getattr(cols_, 'items', None):			# Permit cols_ to be a dict()-like object
 			cols_ = cols_.items()
 		for name, col in cols_:
 			cols.add_column(self.resolve_alias(name), col)
@@ -516,40 +542,50 @@ class Catalog:
 		key = self.get_primary_key()
 		if key not in cols:
 			cols[key] = np.zeros(len(cols), dtype=self.columns[key].dtype)
+#		assert cols[key].dtype == np.uint64
+#		if sys.byteorder == 'little':
+#			keyCI = cols[key].view(dtype=[('row_part', np.uint32), ('cell_part', np.uint32)])
+#		else:
+#			keyCI = cols[key].view(dtype=[('cell_part', np.uint32), ('row_part', np.uint32)])
 
 		# Locate the cells into which we're going to store the rows
-		# - if <cell_id> is not None: insert as-is into the requested cell. The user is responsible for ensuring <prim_key> existence and uniqueness.
+		# - if <cell_id> is not None: override everything else and insert into the requested cell(s).
 		# - elif <primary_key> column exists and not all zeros: compute destination cells from it
 		# - elif <spatial_keys> columns exist: use them to determine destination cells
-		genKeys = False
+		#
+		# Rules for (auto)generation of keys:
+		# - if the key is all zeros, the cell part (higher 32 bits) will be set to the cell_part of cell_id
+		# - if the object part of the key is all zeros, it will be generated from the cell's sequence
+		#
+		# Note that a key with cell part of 0x0 points to a valid cell (the south pole)!
+		#
 		if cell_id is not None:
-			# Explicit destination cell(s) have been provided
+			# Explicit vector (or scalar) of destination cell(s) has been provided
+			# Overrides anything that would've been computed from primary_key or spatial_keys
+			# Shouldn't be used EVER (unless you really, really, really know what you're doing.)
 			cells = np.array(cell_id, copy=False, ndmin=1)
 			if len(cells) == 1:
 				cells = np.resize(cells, len(cols))
-			assert len(cells) == len(cols)
-		elif key in cols and np.any(cols[key]):
-			# Deduce destination cells from IDs
-			assert 0, "Test this codepath!"
-			cells = self.pix.cell_for_id(cols[key])
 		else:
-			# Deduce destination cells from spatial and temporal keys (the fallback)
-			assert group == 'main'
+			# Deduce any unset keys from spatial_keys
+			if not cols[key].all():
+				assert group == 'main'	# TODO: I think we could remove this restriction...
+				need_key = cols[key] == 0
 
-			lonKey, latKey = self.get_spatial_keys()
-			assert lonKey and latKey, "The table must have at least the spatial keys!"
-			assert lonKey in cols and latKey in cols, "The input must contain at least the spatial keys!"
+				# Deduce remaining cells from spatial and temporal keys
+				lonKey, latKey = self.get_spatial_keys()
+				assert lonKey and latKey, "The table must have at least the spatial keys!"
+				assert lonKey in cols and latKey in cols, "The input must contain at least the spatial keys!"
+				tKey = self.get_temporal_key()
 
-			tKey = self.get_temporal_key()
-			t = cols[tKey] if tKey is not None else None
+				lon = cols[lonKey][need_key]
+				lat = cols[latKey][need_key]
+				t   = cols[tKey][need_key]   if tKey is not None else None
 
-			cols[key][:] = self.pix.obj_id_from_pos(cols[lonKey], cols[latKey], t)
-			cells        = self.pix.cell_for_id(cols[key])
+				cols[key][need_key] = self.pix.obj_id_from_pos(lon, lat, t)
 
-			# TODO: Debugging, remove when happy
-			assert np.all(self.pix.cell_id_for_pos(cols[lonKey], cols[latKey], t) == cells)
-
-			genKeys = True
+			# Deduce destination cells from keys
+			cells = self.pix.cell_for_id(cols[key])
 
 		####
 		#schema = self._get_schema(self.primary_table)
@@ -581,10 +617,10 @@ class Catalog:
 			for k in xrange(3600):
 				try:
 					i = k % len(unique_cells)
-					cell_id = unique_cells[i]
+					cur_cell_id = unique_cells[i]
 
 					# Try to acquire a lock for the entire cell
-					lock = self._lock_cell(cell_id, retries=0)
+					lock = self._lock_cell(cur_cell_id, retries=0)
 
 					unique_cells.pop(i)
 					break
@@ -595,22 +631,33 @@ class Catalog:
 				raise Exception('Appear to be stuck on a lock file!')
 
 			# Extract rows belonging to this cell
-			incell = cells == cell_id
+			incell = cells == cur_cell_id
 			cols2  = cols[incell]
 			nrows  = len(cols2)
 
 			# Store cell groups into their tablets
 			for table, schema in self._tables.iteritems():
-				fp    = self._open_tablet(cell_id, mode='w', table=table)
+				fp    = self._open_tablet(cur_cell_id, mode='w', table=table)
 				g     = self._get_row_group(fp, group, table)
 				t     = g.table
 				blobs = schema['blobs'] if 'blobs' in schema else dict()
 
-				if table == self.primary_table and genKeys:
-					id_seq = getattr(g, '_seq_' + key, None)
-					cols[key][incell] += np.arange(id_seq[0], id_seq[0] + nrows, dtype=np.uint64)
-					cols2[key] = cols[key][incell]
-					id_seq[0] += nrows
+				if table == self.primary_table:
+					# Find keys needing an autogenerated ID
+					_, _, _, i = self.pix._xyti_from_id(cols2[key])
+					if not i.all():
+						assert cell_id is None
+						need_keys = i == 0
+						nnk = need_keys.sum()
+
+						# Generate nnk keys
+						id_seq = getattr(g, '_seq_' + key, None)
+						genIds = np.arange(id_seq[0], id_seq[0] + nnk, dtype=np.uint64)
+						id_seq[0] += nnk
+
+						# Store the keys where they're needed
+						cols2[key][need_keys] += genIds
+						cols[key][incell] = cols2[key]
 
 				# Construct a compatible numpy array, that will leave
 				# unspecified columns set to zero
@@ -660,8 +707,8 @@ class Catalog:
 			self._nrows = self._nrows + nrows
 			ntot = ntot + nrows
 
-		assert ntot == len(cols), 'ntot != len(cols), ntot=%d, len(cols)=%d, cell_id=%d' % (ntot, len(cols), cell_id)
-		assert len(np.unique1d(cols[key])) == len(cols), 'len(np.unique1d(cols[key])) != len(cols) (%s != %s) in cell %s' % (len(np.unique1d(cols[key])), len(cols), cell_id)
+		assert ntot == len(cols), 'ntot != len(cols), ntot=%d, len(cols)=%d, cur_cell_id=%d' % (ntot, len(cols), cur_cell_id)
+		assert len(np.unique1d(cols[key])) == len(cols), 'len(np.unique1d(cols[key])) != len(cols) (%s != %s) in cell %s' % (len(np.unique1d(cols[key])), len(cols), cur_cell_id)
 
 		return cols[key]
 

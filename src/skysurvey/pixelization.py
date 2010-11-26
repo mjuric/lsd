@@ -139,7 +139,7 @@ class Pixelization(object):
 		# Special handling for cell IDs
 		cellids = ci == 0xFFFFFFFF
 		if np.any(cellids):
-			assert id.all()
+			assert np.all(cellids)
 			(cx, cy) = bhpix.xy_center(cx, cy, self.level)
 
 		return (cx, cy, ct, ci)
@@ -178,9 +178,9 @@ class Pixelization(object):
 		assert np.all(self.is_cell_id(cell_id))
 		return cell_id & self.tmask
 
-	def str_id(self, cell_id):
-		""" Binary pretty-print a cell_id """
-		s = bin(cell_id)
+	def str_id(self, id):
+		""" Binary pretty-print an id """
+		s = bin(id)
 		s = '0'*64 + s[2:]
 		idbits = 64 - (2*self.xybits+self.tbits)
 		ret = []

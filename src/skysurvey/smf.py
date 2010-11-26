@@ -206,6 +206,7 @@ det_cat_def = \
 
 obj_cat_def = \
 {
+	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
 	'schema': {
 		#
 		#	 LSD column name      Type    FITS column      Description
@@ -221,6 +222,27 @@ obj_cat_def = \
 			'spatial_keys': ('ra', 'dec'),
 			"cached_flag": "cached"
 		}
+	}
+}
+
+o2d_cat_def = \
+{
+	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'schema': {
+		'main': {
+			'columns': [
+				('o2d_id',		'u8', '', 'Unique ID of this row'),
+				('obj_id',		'u8', '', 'Object ID'),
+				('det_id',		'u8', '', 'Detection ID'),
+				('dist',		'f4', '', 'Distance (in degrees)')
+			],
+			'primary_key': 'o2d_id',
+		}
+	},
+	'aliases': {
+		'_M1': 'obj_id',
+		'_M2': 'det_id',
+		'_DIST': 'dist'
 	}
 }
 
@@ -569,9 +591,8 @@ def _exp_store_rows(kv, db, exp_cat_path):
 ###############
 # object catalog creator
 
-def make_object_catalog(obj_catdir, det_catdir, radius=1./3600., create=True):
+def make_object_catalog(db, obj_catdir, det_catdir, radius=1./3600., create=True):
 	# Entry point for creation of image cache
-	det_cat = catalog.Catalog(det_catdir)
 
 	# For debugging -- a simple check to see if matching works is to rerun
 	# the match across a just matched catalog. In this case, we expect
@@ -580,55 +601,64 @@ def make_object_catalog(obj_catdir, det_catdir, radius=1./3600., create=True):
 	if _rematching:
 		create = False
 
+	det_cat = db.catalog(det_catdir)
+
+	o2d_catdir = '_%s_to_%s' % (obj_catdir, det_catdir)
+
 	if create:
 		# Create the new object database
-		obj_cat = create_catalog(obj_catdir, 'ps1_obj', obj_cat_def)
-	else:
-		obj_cat = catalog.Catalog(obj_catdir)
+		obj_cat = db.create_catalog(obj_catdir, obj_cat_def)
+		o2d_cat = db.create_catalog(o2d_catdir, o2d_cat_def)
 
-	# Set up join relationship and table between the object and detections catalog
-	join_table = 'join:' + det_cat.name
-	obj_cat.create_table(join_table, { 'columns': [('obj_id', 'u8'), ('det_id', 'u8'), ('d1', 'f4')] }, ignore_if_exists=True, hidden=True)
-	obj_cat.define_join(det_cat, join_table, join_table, 'obj_id', 'det_id')
+		# Set up a one-to-X join relationship between the two catalogs (join obj_cat:obj_id->det_cat:det_id)
+		db.define_join('%s:%s' % (obj_catdir, det_catdir),
+			type = 'indirect',
+			m1   = (o2d_catdir, "obj_id"),
+			m2   = (o2d_catdir, "det_id")
+			)
+	else:
+		obj_cat = db.catalog(obj_catdir)
+		o2d_cat = db.catalog(o2d_catdir)
 
 	# Fetch all non-empty cells with detections. Group them by the same spatial
 	# cell ID. This will be the list over which the first kernel will map.
-	det_cells = det_cat.group_cells_by_spatial(det_cat.get_cells()).items()
+	det_cells = det_cat.get_cells()
+	det_cells_grouped = det_cat.pix.group_cells_by_spatial(det_cells).items()
 
 	t0 = time.time()
 	pool = pool2.Pool()
 	ntot = 0
 	ntotobj = 0
 	at = 0
-	for result in pool.map_reduce_chain(det_cells,
+	for (nexp, nobj, ndet, nnew, nmatch, ndetnc) in pool.map_reduce_chain(det_cells_grouped,
 					      [
-						(_obj_det_match, obj_cat, det_cat, radius, join_table, _rematching),
+						(_obj_det_match, db, obj_catdir, det_catdir, o2d_catdir, radius, _rematching),
 					      ],
 					      progress_callback=pool2.progress_pass):
 		at += 1
 		t1 = time.time()
 		time_pass = (t1 - t0) / 60
 		time_tot = time_pass / at * len(det_cells)
-		for (nexp, nobj, ndet, nnew, nmatch, ndetnc) in result:
-			ntot += nmatch
-			ntotobj += nnew
-			nobjnew = nobj + nnew
-			pctnew   = 100. * nnew / nobjnew  if nobjnew else 0.
-			pctmatch = 100. * nmatch / ndetnc if ndetnc else 0.
-			print "  match %7d det to %7d obj (%3d exps): %7d new (%6.2f%%), %7d matched (%6.2f%%)  [%.0f/%.0f min.]" % (ndet, nobj, nexp, nnew, pctnew, nmatch, pctmatch, time_pass, time_tot)
-			assert not _rematching or nmatch >= ndetnc
+
+		ntot += nmatch
+		ntotobj += nnew
+		nobjnew = nobj + nnew
+		pctnew   = 100. * nnew / nobjnew  if nobjnew else 0.
+		pctmatch = 100. * nmatch / ndetnc if ndetnc else 0.
+		print "  match %7d det to %7d obj (%3d exps): %7d new (%6.2f%%), %7d matched (%6.2f%%)  [%.0f/%.0f min.]" % (ndet, nobj, nexp, nnew, pctnew, nmatch, pctmatch, time_pass, time_tot)
+		assert not _rematching or nmatch >= ndetnc
 
 	print >> sys.stderr, "Building neighbor cache for static sky: ",
-	obj_cat.build_neighbor_cache()
+	db.build_neighbor_cache(obj_catdir)
 
 	# Compute summary stats for object catalog
 	print >> sys.stderr, "Computing summary statistics for static sky: ",
-	obj_cat.compute_summary_stats()
+	db.compute_summary_stats(obj_catdir)
 
 	print "Matched a total of %d sources." % (ntot)
 	print "Total of %d objects added." % (ntotobj)
-	print "Objects in the object catalog: %d." % (obj_cat.nrows())
-	print "Objects in the detection catalog: %d." % (det_cat.nrows())
+	print "Rows in the object catalog: %d." % (obj_cat.nrows())
+	print "Rows in the detection catalog: %d." % (det_cat.nrows())
 	assert not _rematching or det_cat.nrows() == ntot
 
 def reserve_space(arr, minsize):
@@ -639,7 +669,8 @@ def reserve_space(arr, minsize):
 	arr.resize(l, refcheck=False)
 
 # Single-pass detections->objects mapper.
-def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=False):
+#def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=False):
+def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _rematching=False):
 	"""
 	This kernel assumes:
 	   a) det_cat and obj_cat have equal partitioning (equally sized/enumerated spatial cells)
@@ -696,36 +727,33 @@ def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=Fals
 	det_cells.sort()
 	assert len(det_cells)
 
-	## Debugging: verify temporal cells all fall into the same static sky cell
-	x, y, t, _ = det_cat.unpack_id(det_cells)
-	assert (x == x[0]).all()
-	assert (y == y[0]).all()
-	assert (len(np.unique(t)) == len(t))
-	######
+	# Fetch the frequently used bits
+	obj_cat = db.catalog(obj_catdir)
+	det_cat = db.catalog(det_catdir)
+	o2d_cat = db.catalog(o2d_catdir)
+	pix = obj_cat.pix
 
 	# locate cell center (for gnomonic projection)
-	(bounds, tbounds)  = obj_cat.cell_bounds(obj_cell)
+	(bounds, tbounds)  = pix.cell_bounds(obj_cell)
 	(clon, clat) = bhpix.deproj_bhealpix(*bounds.center())
 
 	# fetch existing static sky, convert to gnomonic
-	objs  = obj_cat.query_cell(obj_cell, '_ID, _LON, _LAT', include_cached=True)
+	objs  = db.query('_ID, _LON, _LAT FROM %s' % obj_catdir).fetch_cell(obj_cell, include_cached=True)
 	xyobj = np.column_stack(gnomonic(objs['_LON'], objs['_LAT'], clon, clat))
-	nobj = len(objs)	# Total number of static sky objects
-
-	# get join table metadata
-	jdtype = np.dtype(obj_cat._get_schema(join_table)['columns'])
-	objKey, detKey, distKey = jdtype.names[0:3]			# Extract column names
+	nobj  = len(objs)	# Total number of static sky objects
 
 	# for sanity checks/debugging (see below)
 	expseen = set()
 
-	# Loop, xmatch, and store
-	ret = []
+	## TODO: Debugging, remove when happy
 	assert (np.unique(sorted(det_cells)) == sorted(det_cells)).all()
 	##print "Det cells: ", det_cells
+
+	# Loop, xmatch, and store
+	det_query = db.query('_ID, _LON, _LAT, _EXP, _CACHED FROM %s' % det_catdir)
 	for det_cell in det_cells:
 		# fetch detections in this cell, convert to gnomonic coordinates
-		detections = det_cat.query_cell(det_cell, '_ID, _LON, _LAT, _EXP, _CACHED', include_cached=True)
+		detections = det_query.fetch_cell(det_cell, include_cached=True)
 		_, ra2, dec2, exposures, cached = detections.as_columns()
 		detections.add_column('xy', np.column_stack(gnomonic(ra2, dec2, clon, clat)))
 
@@ -733,12 +761,13 @@ def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=Fals
 		# there's no way we'll get a match that will be kept in the end. Just continue to the
 		# next one if this is the case.
 		cachedonly = len(objs) == 0 and cached.all()
+		print cached
 		if cachedonly:
-			##print "Skipping cached-only", len(cached)
+			print "Skipping cached-only", len(cached)
 			continue;
 
 		# prep join table
-		join  = np.empty(0, dtype=jdtype)
+		join  = table.Table(dtype=o2d_cat.dtype_for(['_ID', '_M1', '_M2', '_DIST']))
 		njoin = 0;
 		nobj0 = nobj;
 
@@ -776,8 +805,8 @@ def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=Fals
 				unmatched  = np.ones(ndet, dtype=bool)
 				match_idx  = np.empty(ndet, dtype='i4')
 
-			##x, y, t, _ = det_cat.unpack_id(det_cell)
-			##print "DC %s, MJD%s, Exposure %s: %d detections, %d objects, %d matched, %d unmatched" % (det_cell, t, exposure, len(detections2), nobj, nmatched, nunmatched)
+##			x, y, t = pix._xyt_from_cell_id(det_cell)
+##			print "det_cell %s, MJD %s, Exposure %s  ==  %d detections, %d objects, %d matched, %d unmatched" % (det_cell, t, exposure, len(detections2), nobj, len(unmatched)-unmatched.sum(), unmatched.sum())
 
 			# Promote unmatched detections to new objects
 			_, newra, newdec, _, _, newxy = detections2[unmatched].as_columns()
@@ -789,20 +818,22 @@ def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=Fals
 
 			# Join objects to their detections
 			reserve_space(join, njoin+ndet)
-			join[objKey][njoin:njoin+ndet]  = match_idx
-			join[detKey][njoin:njoin+ndet]  =       id2
-			join[distKey][njoin:njoin+ndet] =      dist
+			join['_M1'][njoin:njoin+ndet]   = match_idx
+			join['_M2'][njoin:njoin+ndet]   =       id2
+			join['_DIST'][njoin:njoin+ndet] =      dist
 			njoin += ndet
 
 			# Prep for next loop
 			nobj  += nunmatched
 			xyobj  = np.append(xyobj, newxy, axis=0)
 
-			# Debugging: Final consistency check (remove when happy with the code)
-			dist = gc_dist( objs['_LON'][  join[objKey][njoin-ndet:njoin]  ],
-					objs['_LAT'][  join[objKey][njoin-ndet:njoin]  ], ra2, dec2)
+			# TODO: Debugging: Final consistency check (remove when happy with the code)
+			dist = gc_dist( objs['_LON'][  join['_M1'][njoin-ndet:njoin]  ],
+					objs['_LAT'][  join['_M1'][njoin-ndet:njoin]  ], ra2, dec2)
 			assert (dist < radius).all()
-
+### Debugging
+#			if len(expseen) % 10 == 0: break
+###
 		# Truncate output tables to their actual number of elements
 		objs = objs[0:nobj]
 		join = join[0:njoin]
@@ -812,7 +843,8 @@ def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=Fals
 		# be processed and stored by their parent cells. Also leave out the objects
 		# that are already stored in the database
 		(x, y) = bhpix.proj_bhealpix(objs['_LON'], objs['_LAT'])
-		in_    = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=nobj)	# Objects in cell selector
+##		in_    = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=nobj)	# Objects in cell selector
+		in_    = bounds.isInsideV(x, y)
 		innew  = in_.copy();
 		innew[:nobj0] = False											# New objects in cell selector
 
@@ -826,27 +858,40 @@ def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=Fals
 			##print len(ids), ids
 
 		# Change the relative index to true obj_id in the join table
-		join[objKey] = ids[join[objKey]]
+		join['_M1'] = ids[join['_M1']]
 
 		# Keep only the joins to objects inside the cell
-		join = join[ np.in1d(join[objKey], ids[in_]) ]
+		join = join[ np.in1d(join['_M1'], ids[in_]) ]
 
 		# Append to the join table, in *dec_cell* of obj_cat (!important!)
 		if len(join) != 0:
-			# Store the xmatch table
-			#obj_cat._drop_tablet(obj_cell, join_table)
-			obj_cat._append_tablet(det_cell, join_table, join)
+			# compute the cell_id part of the join table's
+			# IDs.While this is unimportant now (as we could
+			# just set all of them equal to cell_id part of
+			# cell_id), if we ever decide to change the
+			# pixelation of the catalog later on, this will
+			# allow us to correctly split up the join table as
+			# well.
+			_, _, t    = pix._xyt_from_cell_id(det_cell)	# This row points to a detection in the temporal cell ...
+			x, y, _, _ = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
+			join['_ID'][:] = pix._id_from_xyti(x, y, t, 0) # This will make the new IDs have zeros in the object part (so Catalog.append will autogen them)
+
+#			print "XX-", len(join)
+#			for i, c in enumerate(join['_ID'][::5000]):
+#				print pix.str_id(c), pix.str_id(join['_M1'][i]), x[i], y[i], t
+
+			o2d_cat.append(join)
 
 		assert not cachedonly or (nobjadded == 0 and len(join) == 0)
+
+#		print 'XXX:', len(join), ids, objs['_ID'], in_, nobj0, nobjadded
+#		exit()
+
 		# return: Number of exposures, number of objects before processing this cell, number of detections processed (incl. cached),
 		#         number of newly added objects, number of detections xmatched, number of detection processed that weren't cached
 		# Note: some of the xmatches may be to newly added objects (e.g., if there are two 
 		#       overlapping exposures within a cell; first one will add new objects, second one will match agains them)
-		ret.append( (len(uexposures), nobj0, len(detections), nobjadded, len(join), (cached == False).sum()) )
-
-		##print 'XXX:', len(join), ids, objs['_ID']
-
-	return ret
+		yield (len(uexposures), nobj0, len(detections), nobjadded, len(join), (cached == False).sum())
 
 if __name__ == '__main__':
 	make_object_catalog('ps1_obj', 'ps1_det')
