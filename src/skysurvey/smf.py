@@ -234,9 +234,12 @@ o2d_cat_def = \
 				('o2d_id',		'u8', '', 'Unique ID of this row'),
 				('obj_id',		'u8', '', 'Object ID'),
 				('det_id',		'u8', '', 'Detection ID'),
-				('dist',		'f4', '', 'Distance (in degrees)')
+				('dist',		'f4', '', 'Distance (in degrees)'),
+				('ra',			'f8', 'ra_psf',		''),
+				('dec',			'f8', 'dec_psf',	''),
 			],
 			'primary_key': 'o2d_id',
+			'spatial_keys': ('ra', 'dec'),
 		}
 	},
 	'aliases': {
@@ -623,6 +626,9 @@ def make_object_catalog(db, obj_catdir, det_catdir, radius=1./3600., create=True
 	# Fetch all non-empty cells with detections. Group them by the same spatial
 	# cell ID. This will be the list over which the first kernel will map.
 	det_cells = det_cat.get_cells()
+	if _rematching:
+		det_cells = [ 6352049725029482495 ]
+##	det_cells = [ 6351768254347739135 ]
 	det_cells_grouped = det_cat.pix.group_cells_by_spatial(det_cells).items()
 
 	t0 = time.time()
@@ -744,6 +750,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 	objs  = db.query('_ID, _LON, _LAT FROM %s' % obj_catdir).fetch_cell(obj_cell, include_cached=True)
 	xyobj = np.column_stack(gnomonic(objs['_LON'], objs['_LAT'], clon, clat))
 	nobj  = len(objs)	# Total number of static sky objects
+	tree  = None
 
 	# for sanity checks/debugging (see below)
 	expseen = set()
@@ -754,7 +761,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 
 	# Loop, xmatch, and store
 	det_query = db.query('_ID, _LON, _LAT, _EXP, _CACHED FROM %s' % det_catdir)
-	for det_cell in det_cells:
+	for det_cell in sorted(det_cells):
 		# fetch detections in this cell, convert to gnomonic coordinates
 		detections = det_query.fetch_cell(det_cell, include_cached=True)
 		_, ra2, dec2, exposures, cached = detections.as_columns()
@@ -769,8 +776,14 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			yield (None, None, None, None, None, None) # Yield just to have the progress counter properly incremented
 			continue;
 
+		ggg = False; xxx = False;
+#		if 6118126431491946267 in _ and not cached[_ == 6118126431491946267].all():
+		if 6118126431491946267 in _:
+			ggg = True
+			print 'Found in', det_cell, 'cached=', cached[_ == 6118126431491946267]
+
 		# prep join table
-		join  = table.Table(dtype=o2d_cat.dtype_for(['_ID', '_M1', '_M2', '_DIST']))
+		join  = table.Table(dtype=o2d_cat.dtype_for(['_ID', '_M1', '_M2', '_DIST', '_LON', '_LAT']))
 		njoin = 0;
 		nobj0 = nobj;
 
@@ -780,7 +793,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		# different exposures within a same temporal cell are allowed
 		# to belong to the same object
 		uexposures = set(exposures)
-		for exposure in uexposures:
+		for exposure in sorted(uexposures):
 			# Sanity check: a consistent catalog cannot have two
 			# exposures stretching over more than one cell
 			assert exposure not in expseen
@@ -794,9 +807,11 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			if len(xyobj) != 0:
 				# Construct kD-tree and find the object nearest to each
 				# detection from this cell
-				tree = kdtree(xyobj)
+				if tree is None or nobj_old != len(xyobj):
+					del tree
+					nobj_old = len(xyobj)
+					tree = kdtree(xyobj)
 				match_idx, match_d2 = tree.knn(xydet, 1)
-				del tree
 				match_idx = match_idx[:,0]		# First neighbor only
 
 				# Compute accurate distances, and select detections not matched to existing objects
@@ -808,8 +823,19 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 				unmatched  = np.ones(ndet, dtype=bool)
 				match_idx  = np.empty(ndet, dtype='i4')
 
-##			x, y, t = pix._xyt_from_cell_id(det_cell)
-##			print "det_cell %s, MJD %s, Exposure %s  ==  %d detections, %d objects, %d matched, %d unmatched" % (det_cell, t, exposure, len(detections2), nobj, len(unmatched)-unmatched.sum(), unmatched.sum())
+			if 6118126431491946267 in id2 and ggg:
+				ii = id2 == 6118126431491946267
+				rr, dd = objs['_LON'][match_idx[ii]], objs['_LAT'][match_idx[ii]]
+				(x, y) = bhpix.proj_bhealpix(rr, dd)
+				in_    = bounds.isInsideV(x, y)
+				_, _, tt = det_cat.pix._xyt_from_cell_id(det_cell)
+				print '--', det_cell, match_idx[ii], 'dist=', dist[ii]*3600, 'unm=', unmatched[ii], 'inside=', in_, det_cat.pix.cell_id_for_pos(rr, dd, tt)
+				print '--', rr, dd, ra2[ii], dec2[ii]
+				xxx = in_[0]
+				mmm = True
+
+#			x, y, t = pix._xyt_from_cell_id(det_cell)
+#			print "det_cell %s, MJD %s, Exposure %s  ==  %d detections, %d objects, %d matched, %d unmatched" % (det_cell, t, exposure, len(detections2), nobj, len(unmatched)-unmatched.sum(), unmatched.sum())
 
 			# Promote unmatched detections to new objects
 			_, newra, newdec, _, _, newxy = detections2[unmatched].as_columns()
@@ -817,6 +843,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			reserve_space(objs, nobj+nunmatched)
 			objs['_LON'][nobj:nobj+nunmatched] = newra
 			objs['_LAT'][nobj:nobj+nunmatched] = newdec
+			dist[unmatched]                    = 0.
 			match_idx[unmatched] = np.arange(nobj, nobj+nunmatched, dtype='i4')	# Set the indices of unmatched detections to newly created objects
 
 			# Join objects to their detections
@@ -824,7 +851,14 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			join['_M1'][njoin:njoin+ndet]   = match_idx
 			join['_M2'][njoin:njoin+ndet]   =       id2
 			join['_DIST'][njoin:njoin+ndet] =      dist
+			# TODO: For debugging; remove when happy
+			join['_LON'][njoin:njoin+ndet]  =       ra2
+			join['_LAT'][njoin:njoin+ndet]  =      dec2
 			njoin += ndet
+
+#			if xxx:
+#				assert 6118126431491946267 in join['_M2']
+#				print 'xxxxx'
 
 			# Prep for next loop
 			nobj  += nunmatched
@@ -837,6 +871,8 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 ### Debugging
 #			if len(expseen) % 10 == 0: break
 ###
+		assert not ggg or mmm
+
 		# Truncate output tables to their actual number of elements
 		objs = objs[0:nobj]
 		join = join[0:njoin]
@@ -848,6 +884,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		(x, y) = bhpix.proj_bhealpix(objs['_LON'], objs['_LAT'])
 ##		in_    = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=nobj)	# Objects in cell selector
 		in_    = bounds.isInsideV(x, y)
+##		in_    = np.ones(len(x), dtype=np.bool)
 		innew  = in_.copy();
 		innew[:nobj0] = False											# New objects in cell selector
 
@@ -856,14 +893,23 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		if nobjadded:
 			# Append the new objects to the object catalog, obtaining their IDs.
 			##print len(ids), ids
-			assert not _rematching
+			if _rematching:
+				print 'cell_id=%s, nnew=%s' % (det_cell, nobjadded)
+				print objs[innew]
+				assert not _rematching
 			ids[innew] = obj_cat.append(objs[('_LON', '_LAT')][innew])
 			##print len(ids), ids
 
-		# Change the relative index to true obj_id in the join table
+		# Set the indices of objects not in this cell to zero (== a value
+		# no valid object in the database can have). Therefore, all
+		# out-of-bounds links will have _M1 == 0 (#1), and will be removed
+		# by the np1d call (#2)
+		ids[~in_] = 0
+
+		# 1) Change the relative index to true obj_id in the join table
 		join['_M1'] = ids[join['_M1']]
 
-		# Keep only the joins to objects inside the cell
+		# 2) Keep only the joins to objects inside the cell
 		join = join[ np.in1d(join['_M1'], ids[in_]) ]
 
 		# Append to the join table, in *dec_cell* of obj_cat (!important!)
@@ -879,11 +925,18 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			x, y, _, _ = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
 			join['_ID'][:] = pix._id_from_xyti(x, y, t, 0) # This will make the new IDs have zeros in the object part (so Catalog.append will autogen them)
 
+#			if xxx:
+#				assert 6118126431491946267 in join['_M2']
+			if 6118126431491946267 in join['_M2']:
+				print 'WRITE @ %s' % (join['_M2'] == 6118126431491946267).nonzero(), det_cell
+
 #			print "XX-", len(join)
 #			for i, c in enumerate(join['_ID'][::5000]):
 #				print pix.str_id(c), pix.str_id(join['_M1'][i]), x[i], y[i], t
 
-			o2d_cat.append(join)
+			if xxx or True:
+				o2d_cat.append(join)
+#				exit()
 
 		assert not cachedonly or (nobjadded == 0 and len(join) == 0)
 

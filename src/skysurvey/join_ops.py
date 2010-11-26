@@ -575,10 +575,16 @@ class QueryInstance(object):
 		    Developer note: When adding a new pseudocol, make sure to also add
 		       it to the if() statement in __getitem__
 		"""
+		# Detect the number of rows
+		nrows = len(self['_ID'])
+
 		if name == '_ROWNUM':
 			# like Oracle's ROWNUM, but on a per-cell basis (and zero-based)
-			nrows = len(self.jmap) if self.jmap is not None else 0
 			return np.arange(nrows, dtype=np.uint64)
+		elif name == '_CELLID':
+			ret = np.empty(nrows, dtype=np.uint64)
+			ret[:] = self.cell_id
+			return ret
 		else:
 			raise Exception('Unknown pseudocolumn %s' % name)
 
@@ -609,8 +615,8 @@ class QueryInstance(object):
 				return self.columns[name]
 
 		# A query pseudocolumn?
-		if name in ['_ROWNUM']:
-			col = self[name] = self.load_pseudocolumn(colname)
+		if name in ['_ROWNUM', '_CELLID']:
+			col = self[name] = self.load_pseudocolumn(name)
 			return col
 
 		# A name of a catalog? Return a proxy object
