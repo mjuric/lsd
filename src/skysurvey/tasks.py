@@ -8,6 +8,7 @@ from itertools import izip
 import bhpix
 import catalog
 from utils import as_columns, gnomonic, gc_dist, unpack_callable
+from table import Table
 
 ###################################################################
 ## Sky-coverage computation
@@ -76,7 +77,7 @@ def compute_counts(db, cat, include_cached=False):
 ###################################################################
 ## Cross-match two catalogs
 
-def _xmatch_mapper(rows, cat_to, radius, join_table):
+def _xmatch_mapper(qresult, cat_to_dir, radius, xm_catdir):
 	"""
 	    Mapper:
 	    	- given all objects in a cell, make an ANN tree
@@ -85,56 +86,100 @@ def _xmatch_mapper(rows, cat_to, radius, join_table):
 	"""
 	from scikits.ann import kdtree
 
-	# locate cell center
-	self     = _xmatch_mapper
-	cell_id  = self.CELL_ID
-	cat      = self.CATALOG
+	db     = qresult.db
+	pix    = qresult.pix
+	cat_to = db.catalog(cat_to_dir)
+	cat_xm = db.catalog(xm_catdir)
 
-	bounds, _    = cat.cell_bounds(cell_id)
-	(clon, clat) = bhpix.deproj_bhealpix(*bounds.center())
+	for rows in qresult:
+		cell_id  = rows.cell_id
 
-	# Fetch data and project to tangent plane around the center
-	# of the cell. We assume the cell is small enough for the
-	# distortions not to matter
-	if not cat_to.tablet_exists(cell_id):
-		return len(rows), 0, 0
+		join = Table()
 
-	(id1, ra1, dec1) = rows.as_columns()
-	(id2, ra2, dec2) = cat_to.query_cell(cell_id, '_ID, _LON, _LAT', include_cached=True).as_columns()
-	xy1 = np.column_stack(gnomonic(ra1, dec1, clon, clat))
-	xy2 = np.column_stack(gnomonic(ra2, dec2, clon, clat))
+		(id1, ra1, dec1) = rows.as_columns()
+		(id2, ra2, dec2) = db.query('_ID, _LON, _LAT FROM %s' % cat_to_dir).fetch_cell(cell_id, include_cached=True).as_columns()
 
-	# Construct kD-tree to find an object in cat_to that is nearest
-	# to an object in cat_from, for every object in cat_from
-	tree = kdtree(xy2)
-	match_idx, match_d2 = tree.knn(xy1, 1)
-	del tree
-	match_idx = match_idx[:,0]		# Consider first neighbor only
+		if len(id2) != 0:
+			# Project to tangent plane around the center of the cell. We
+			# assume the cell is small enough for the distortions not to
+			# matter and Euclidian distances apply
+			bounds, _    = pix.cell_bounds(cell_id)
+			(clon, clat) = bhpix.deproj_bhealpix(*bounds.center())
+			xy1 = np.column_stack(gnomonic(ra1, dec1, clon, clat))
+			xy2 = np.column_stack(gnomonic(ra2, dec2, clon, clat))
 
-	# Create the index table array
-	join = np.empty(len(match_idx), dtype=cat._get_schema(join_table)['columns'])
-	join['id1'] = id1
-	join['id2'] = id2[match_idx]
-	join['d1']  = gc_dist(ra1, dec1, ra2[match_idx], dec2[match_idx])
+			# Construct kD-tree to find an object in cat_to that is nearest
+			# to an object in cat_from, for every object in cat_from
+			tree = kdtree(xy2)
+			match_idx, match_d2 = tree.knn(xy1, 1)
+			del tree
+			match_idx = match_idx[:,0]		# Consider first neighbor only
 
-	# Remove matches beyond the xmatch radius
-	join = join[join['d1'] < radius]
+			# Create the index table array
+			join['_M1']   = id1
+			join['_M2']   = id2[match_idx]
+			join['_DIST'] = gc_dist(ra1, dec1, ra2[match_idx], dec2[match_idx])
+			join['_LON']  = ra2[match_idx]
+			join['_LAT']  = dec2[match_idx]
 
-	if len(join) != 0:
-		# Store the join table
-		cat._drop_tablet(cell_id, join_table)
-		cat._append_tablet(cell_id, join_table, join)
+			# Remove matches beyond the xmatch radius
+			join = join[join['_DIST'] < radius]
 
-		return len(id1), len(id2), len(join)
-	else:
-		return len(rows), 0, 0
+		if len(join):
+			# compute the cell_id part of the join table's
+			# IDs. While this is unimportant now (as we could
+			# just set all of them equal to cell_id part of
+			# cell_id), if we ever decide to change the
+			# pixelation of the catalog later on, this will
+			# allow us to correctly repixelize the join table as
+			# well.
+			x, y, t, _  = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
+			join['_ID'] = pix._id_from_xyti(x, y, t, 0)     # This will make the new IDs have zeros in the object part (so Catalog.append will autogen them)
 
-def xmatch(cat_from, cat_to, radius=1./3600.):
+			# TODO: Debugging, remove when happy
+			cid = np.unique(pix.cell_for_id(join['_ID']))
+			assert len(cid) == 1, len(cid)
+			assert cid[0] == cell_id, '%s %s' % (cid[0], cell_id)
+			####
+
+			cat_xm.append(join)
+
+			yield len(id1), len(id2), len(join)
+		else:
+			yield len(rows), 0, 0
+
+xm_cat_def = \
+{
+	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'schema': {
+		'main': {
+			'columns': [
+				('xm_id',		'u8', '', 'Unique ID of this row'),
+				('m1',			'u8', '', 'ID in catalog one'),
+				('m2',			'u8', '', 'ID in catalog two'),
+				('dist',		'f4', '', 'Distance (in degrees)'),
+				# Not strictly necessary, but useful for creation of neighbor cache (needed for joins agains M2 table)
+				# TODO: split this off into a separate column group
+				('ra',			'f8', '', 'Position from catalog two'),
+				('dec',			'f8', '', 'Position from catalog two'),
+			],
+			'primary_key': 'xm_id',
+			'spatial_keys': ('ra', 'dec'),
+		}
+	},
+	'aliases': {
+		'_M1': 'm1',
+		'_M2': 'm2',
+		'_DIST': 'dist'
+	}
+}
+
+def xmatch(db, cat_from_dir, cat_to_dir, radius=1./3600.):
 	""" Cross-match objects from cat_to with cat_from catalog and
 	    store the result into a cross-match table in cat_from.
 
 	    Typical usage:
-	    	xmatch(ps1_obj, sdss_obj)
+	    	xmatch(db, ps1_obj, sdss_obj)
 
 	   Note:
 	        - No attempt is being made to force the xmatch result to be a
@@ -142,20 +187,47 @@ def xmatch(cat_from, cat_to, radius=1./3600.):
 	          may be mapped to a same object in cat_to
 	"""
 	# Create the x-match table and setup the JOIN relationship
-	join_table = 'join:' + cat_to.name
-	cat_from.create_table(join_table, { 'columns': [('id1', 'u8'), ('id2', 'u8'), ('d1', 'f4')] }, ignore_if_exists=True, hidden=True)
+
+	xm_catdir = '_%s_to_%s' % (cat_from_dir, cat_to_dir)
+
+	if not db.catalog_exists(xm_catdir):
+		# Create the new linkage table if needed
+		xm_cat  = db.create_catalog(xm_catdir, xm_cat_def)
+
+		if cat_from_dir != cat_to_dir: # If it's a self-join (useful only for debugging), setup no JOIN relations
+			# Set up a one-to-X join relationship between the two catalogs (join obj_cat:obj_id->det_cat:det_id)
+			db.define_default_join(cat_from_dir, cat_to_dir,
+				type = 'indirect',
+				m1   = (xm_catdir, "m1"),
+				m2   = (xm_catdir, "m2")
+			)
+
+			# Set up a join between the indirection table and cat_from (mostly for debugging)
+			db.define_default_join(cat_from_dir, xm_catdir,
+				type = 'indirect',
+				m1   = (xm_catdir, "m1"),
+				m2   = (xm_catdir, "xm_id")
+			)
+
+			# Set up a join between the indirection table and cat_to (mostly for debugging)
+			db.define_default_join(cat_to_dir, xm_catdir,
+				type = 'indirect',
+				m1   = (xm_catdir, "m2"),
+				m2   = (xm_catdir, "xm_id")
+			)
 
 	ntot = 0
-	for (nfrom, nto, nmatch) in cat_from.map_reduce("_ID, _LON, _LAT", (_xmatch_mapper, cat_to, radius, join_table), progress_callback=pool2.progress_pass):
+	for (nfrom, nto, nmatch) in db.query("_ID, _LON, _LAT from '%s'" % cat_from_dir).execute(
+					[ (_xmatch_mapper, cat_to_dir, radius, xm_catdir) ],
+					progress_callback=pool2.progress_pass):
 		ntot += nmatch
 		if nfrom != 0 and nto != 0:
 			pctfrom = 100. * nmatch / nfrom
 			pctto   = 100. * nmatch / nto
 			print "  ===> %7d xmatch %7d -> %7d matched (%6.2f%%, %6.2f%%)" % (nfrom, nto, nmatch, pctfrom, pctto)
-			if cat_from.name == cat_to.name:	# debugging: sanity check when xmatching to self
+			if cat_from_dir == cat_to_dir:	# debugging: sanity check when xmatching to self
 				assert nfrom == nmatch
 
-	cat_from.define_join(cat_to, join_table, join_table, 'id1', 'id2')
 	print "Matched a total of %d sources." % (ntot)
 
 ###################################################################

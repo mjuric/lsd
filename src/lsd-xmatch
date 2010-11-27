@@ -10,7 +10,7 @@ import skysurvey as lsd
 from   skysurvey.utils import *
 
 def usage():
-	print "Usage: %s [--radius=<arcsec>] <from_cat> <to_cat>" % sys.argv[0]
+	print "Usage: %s [--radius=<arcsec>] <db> <from_cat> <to_cat>" % sys.argv[0]
 
 try:
 	optlist, args = getopt.getopt(sys.argv[1:], 'hr:', ['help', 'radius='])
@@ -19,12 +19,13 @@ except getopt.GetoptError, err:
 	usage()
 	exit(-1)
 
-if len(args) != 2:
+if len(args) != 3:
 	print "Error: Incorrect number of command-line arguments."
 	usage()
 	exit(-1)
 
-(from_cat_dir, to_cat_dir) = args[0], args[1]
+(dbdir, from_cat_dir, to_cat_dir) = args
+db = lsd.DB(dbdir)
 
 radius = 1.
 for (o, a) in optlist:
@@ -38,7 +39,4 @@ for (o, a) in optlist:
 # Actual work
 #
 
-from_cat = lsd.Catalog(from_cat_dir)
-to_cat   = lsd.Catalog(to_cat_dir)
-
-lsd.xmatch(from_cat, to_cat, radius/3600.)
+lsd.xmatch(db, from_cat_dir, to_cat_dir, radius/3600.)

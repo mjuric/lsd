@@ -249,9 +249,6 @@ o2d_cat_def = \
 	}
 }
 
-def to_dtype(cols):
-	return list(( (name, dtype) for (name, dtype, _) in cols ))
-
 def gen_cat2fits(catdef):
 	""" Returns a mapping from catalog columns to
 	    FITS columns:

@@ -901,7 +901,14 @@ class DB(object):
 
 	def define_default_join(self, obj_catdir, o2d_catdir, type, **joindef):
 		return self.define_join('.%s:%s' % (obj_catdir, o2d_catdir), type, **joindef)
-	
+
+	def catalog_exists(self, catname):
+		try:
+			self.catalog(catname)
+			return True
+		except IOError:
+			return False
+
 	def catalog(self, catname, create=False):
 		""" Given the catalog name, returns a Catalog object.
 		"""

@@ -479,7 +479,7 @@ class Catalog:
 		else:
 			self.path = path
 			if not os.path.isdir(self.path):
-				raise Exception('Cannot access table: "%s" is inexistant or not readable.' % (path))
+				raise IOError('Cannot access table: "%s" is inexistant or not readable.' % (path))
 			self._load_schema()
 
 	def create_catalog(self, name, path, level, t0, dt):
