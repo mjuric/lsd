@@ -899,6 +899,9 @@ class DB(object):
 		f.write(json.dumps(joindef, indent=4, sort_keys=True))
 		f.close()
 
+	def define_default_join(self, obj_catdir, o2d_catdir, type, **joindef):
+		return self.define_join('.%s:%s' % (obj_catdir, o2d_catdir), type, **joindef)
+	
 	def catalog(self, catname, create=False):
 		""" Given the catalog name, returns a Catalog object.
 		"""
@@ -925,8 +928,8 @@ class DB(object):
 		# TODO: Expand this to allow the 'joined to via' and related syntax, once it becomes available in the parser
 		for catname, (e, _) in catlist:
 			# Check for catalogs that can be joined onto this one (where this one is on the right hand side of the relation)
-			# Look for ,join files named catname:*.join
-			pattern = "%s/%s:*.join" % (self.path, catname)
+			# Look for default .join files named ".<catname>:*.join"
+			pattern = "%s/.%s:*.join" % (self.path, catname)
 			for fn in glob.iglob(pattern):
 				jcatname = fn[fn.rfind(':')+1:fn.rfind('.join')]
 				if jcatname not in cats:

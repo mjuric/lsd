@@ -287,7 +287,7 @@ def import_from_smf(db, det_catname, exp_catname, smf_files, create=False):
 		exp_cat  = db.create_catalog(exp_catname, exp_cat_def)
 
 		# Set up a one-to-X join relationship between the two catalogs (join det_cat:exp_id->exp_cat:exp_id)
-		db.define_join('%s:%s' % (det_catname, exp_catname),
+		db.define_default_join(det_catname, exp_catname,
 			type = 'indirect',
 			m1   = (det_catname, "det_id"),
 			m2   = (det_catname, "exp_id")
@@ -614,10 +614,22 @@ def make_object_catalog(db, obj_catdir, det_catdir, radius=1./3600., create=True
 		o2d_cat = db.create_catalog(o2d_catdir, o2d_cat_def)
 
 		# Set up a one-to-X join relationship between the two catalogs (join obj_cat:obj_id->det_cat:det_id)
-		db.define_join('%s:%s' % (obj_catdir, det_catdir),
+		db.define_default_join(obj_catdir, det_catdir,
 			type = 'indirect',
 			m1   = (o2d_catdir, "obj_id"),
 			m2   = (o2d_catdir, "det_id")
+			)
+		# Set up a join between the indirection table and detections catalog (det_cat:det_id->o2d_cat:o2d_id)
+		db.define_default_join(det_catdir, o2d_catdir,
+			type = 'indirect',
+			m1   = (o2d_catdir, "det_id"),
+			m2   = (o2d_catdir, "o2d_id")
+			)
+		# Set up a join between the indirection table and detections catalog (det_cat:det_id->o2d_cat:o2d_id)
+		db.define_default_join(obj_catdir, o2d_catdir,
+			type = 'indirect',
+			m1   = (o2d_catdir, "obj_id"),
+			m2   = (o2d_catdir, "o2d_id")
 			)
 	else:
 		obj_cat = db.catalog(obj_catdir)
@@ -626,9 +638,6 @@ def make_object_catalog(db, obj_catdir, det_catdir, radius=1./3600., create=True
 	# Fetch all non-empty cells with detections. Group them by the same spatial
 	# cell ID. This will be the list over which the first kernel will map.
 	det_cells = det_cat.get_cells()
-	if _rematching:
-		det_cells = [ 6352049725029482495 ]
-##	det_cells = [ 6351768254347739135 ]
 	det_cells_grouped = det_cat.pix.group_cells_by_spatial(det_cells).items()
 
 	t0 = time.time()
@@ -655,14 +664,17 @@ def make_object_catalog(db, obj_catdir, det_catdir, radius=1./3600., create=True
 		pctnew   = 100. * nnew / nobjnew  if nobjnew else 0.
 		pctmatch = 100. * nmatch / ndetnc if ndetnc else 0.
 		print "  match %7d det to %7d obj (%3d exps): %7d new (%6.2f%%), %7d matched (%6.2f%%)  [%.0f/%.0f min.]" % (ndet, nobj, nexp, nnew, pctnew, nmatch, pctmatch, time_pass, time_tot)
-		assert not _rematching or nmatch >= ndetnc
 
 	print >> sys.stderr, "Building neighbor cache for static sky: ",
 	db.build_neighbor_cache(obj_catdir)
+	print >> sys.stderr, "Building neighbor cache for indirection table: ",
+	db.build_neighbor_cache(o2d_catdir)
 
 	# Compute summary stats for object catalog
 	print >> sys.stderr, "Computing summary statistics for static sky: ",
 	db.compute_summary_stats(obj_catdir)
+	print >> sys.stderr, "Computing summary statistics for indirection table: ",
+	db.compute_summary_stats(o2d_catdir)
 
 	print "Matched a total of %d sources." % (ntot)
 	print "Total of %d objects added." % (ntotobj)
@@ -678,13 +690,14 @@ def reserve_space(arr, minsize):
 	arr.resize(l, refcheck=False)
 
 # Single-pass detections->objects mapper.
-#def _obj_det_match(cells, obj_cat, det_cat, radius, join_table, _rematching=False):
 def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _rematching=False):
 	"""
 	This kernel assumes:
-	   a) det_cat and obj_cat have equal partitioning (equally sized/enumerated spatial cells)
+	   a) det_cat and obj_cat have equal partitioning (equally
+	      sized/enumerated spatial cells)
 	   b) both det_cat and obj_cat have up-to-date neighbor caches
-	   c) temporal det_cat cells within this spatial cell are stored local to this process (relevant for shared-nothing setups)
+	   c) temporal det_cat cells within this spatial cell are stored
+	      local to this process (relevant for shared-nothing setups)
 	   d) exposures don't stretch across temporal cells
 
 	Algorithm:
@@ -692,11 +705,11 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 	   - project them to tangent plane around the center of the cell
 	     (we assume the cell is small enough for the distortions not to matter)
 	   - construct a kD tree in (x, y) tangent space
-	   - for each temporal cell:
+	   - for each temporal cell, in sorted order (++):
 	   	1.) Fetch the detections, including the cached ones (+)
 	   	2.) Project to tangent plane
 
-	   	3.) for each exposure:
+	   	3.) for each exposure, in sorted order (++):
 		    a.) Match agains the kD tree of objects
 		    b.) Add those that didn't match to the list of objects 
 
@@ -714,6 +727,13 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		    correctly matches cases when the object is right inside
 		    the cell boundary, but the detection is just to the
 		    outside.
+
+	   (++) Having cells and detections sorted ensures that objects in overlapping
+	        (cached) regions are seen by kernels in different cells in the same
+	        order, thus resulting in the same matches. Note: this may fail in
+	        extremely crowded region, but as of now it's not clear how big of
+	        a problem (if any!) will this pose.
+
 	   (*) Cached objects must be loaded and matched against to guard against
 	       the case where an object is just outside the edge, while a detection
 	       is just inside. If the cached object was not loaded, the detection
@@ -726,7 +746,8 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 	       it from being promoted into a new object.
 
 	   TODO: The above algorithm ensures no detection is assigned to more than
-	   	one object. Implement a consistency check to verify that.
+	   	one object. It also ensures that each detection links to an object.
+	   	Implement a consistency check to verify that.
 	"""
 
 	from scikits.ann import kdtree
@@ -776,12 +797,6 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			yield (None, None, None, None, None, None) # Yield just to have the progress counter properly incremented
 			continue;
 
-		ggg = False; xxx = False;
-#		if 6118126431491946267 in _ and not cached[_ == 6118126431491946267].all():
-		if 6118126431491946267 in _:
-			ggg = True
-			print 'Found in', det_cell, 'cached=', cached[_ == 6118126431491946267]
-
 		# prep join table
 		join  = table.Table(dtype=o2d_cat.dtype_for(['_ID', '_M1', '_M2', '_DIST', '_LON', '_LAT']))
 		njoin = 0;
@@ -823,17 +838,6 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 				unmatched  = np.ones(ndet, dtype=bool)
 				match_idx  = np.empty(ndet, dtype='i4')
 
-			if 6118126431491946267 in id2 and ggg:
-				ii = id2 == 6118126431491946267
-				rr, dd = objs['_LON'][match_idx[ii]], objs['_LAT'][match_idx[ii]]
-				(x, y) = bhpix.proj_bhealpix(rr, dd)
-				in_    = bounds.isInsideV(x, y)
-				_, _, tt = det_cat.pix._xyt_from_cell_id(det_cell)
-				print '--', det_cell, match_idx[ii], 'dist=', dist[ii]*3600, 'unm=', unmatched[ii], 'inside=', in_, det_cat.pix.cell_id_for_pos(rr, dd, tt)
-				print '--', rr, dd, ra2[ii], dec2[ii]
-				xxx = in_[0]
-				mmm = True
-
 #			x, y, t = pix._xyt_from_cell_id(det_cell)
 #			print "det_cell %s, MJD %s, Exposure %s  ==  %d detections, %d objects, %d matched, %d unmatched" % (det_cell, t, exposure, len(detections2), nobj, len(unmatched)-unmatched.sum(), unmatched.sum())
 
@@ -856,10 +860,6 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			join['_LAT'][njoin:njoin+ndet]  =      dec2
 			njoin += ndet
 
-#			if xxx:
-#				assert 6118126431491946267 in join['_M2']
-#				print 'xxxxx'
-
 			# Prep for next loop
 			nobj  += nunmatched
 			xyobj  = np.append(xyobj, newxy, axis=0)
@@ -868,10 +868,6 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			dist = gc_dist( objs['_LON'][  join['_M1'][njoin-ndet:njoin]  ],
 					objs['_LAT'][  join['_M1'][njoin-ndet:njoin]  ], ra2, dec2)
 			assert (dist < radius).all()
-### Debugging
-#			if len(expseen) % 10 == 0: break
-###
-		assert not ggg or mmm
 
 		# Truncate output tables to their actual number of elements
 		objs = objs[0:nobj]
@@ -882,9 +878,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		# be processed and stored by their parent cells. Also leave out the objects
 		# that are already stored in the database
 		(x, y) = bhpix.proj_bhealpix(objs['_LON'], objs['_LAT'])
-##		in_    = np.fromiter( (bounds.isInside(px, py) for (px, py) in izip(x, y)), dtype=np.bool, count=nobj)	# Objects in cell selector
 		in_    = bounds.isInsideV(x, y)
-##		in_    = np.ones(len(x), dtype=np.bool)
 		innew  = in_.copy();
 		innew[:nobj0] = False											# New objects in cell selector
 
@@ -892,13 +886,8 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		nobjadded = innew.sum()
 		if nobjadded:
 			# Append the new objects to the object catalog, obtaining their IDs.
-			##print len(ids), ids
-			if _rematching:
-				print 'cell_id=%s, nnew=%s' % (det_cell, nobjadded)
-				print objs[innew]
-				assert not _rematching
+			assert not _rematching, 'cell_id=%s, nnew=%s\n%s' % (det_cell, nobjadded, objs[innew])
 			ids[innew] = obj_cat.append(objs[('_LON', '_LAT')][innew])
-			##print len(ids), ids
 
 		# Set the indices of objects not in this cell to zero (== a value
 		# no valid object in the database can have). Therefore, all
@@ -925,23 +914,9 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			x, y, _, _ = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
 			join['_ID'][:] = pix._id_from_xyti(x, y, t, 0) # This will make the new IDs have zeros in the object part (so Catalog.append will autogen them)
 
-#			if xxx:
-#				assert 6118126431491946267 in join['_M2']
-			if 6118126431491946267 in join['_M2']:
-				print 'WRITE @ %s' % (join['_M2'] == 6118126431491946267).nonzero(), det_cell
-
-#			print "XX-", len(join)
-#			for i, c in enumerate(join['_ID'][::5000]):
-#				print pix.str_id(c), pix.str_id(join['_M1'][i]), x[i], y[i], t
-
-			if xxx or True:
-				o2d_cat.append(join)
-#				exit()
+			o2d_cat.append(join)
 
 		assert not cachedonly or (nobjadded == 0 and len(join) == 0)
-
-#		print 'XXX:', len(join), ids, objs['_ID'], in_, nobj0, nobjadded
-#		exit()
 
 		# return: Number of exposures, number of objects before processing this cell, number of detections processed (incl. cached),
 		#         number of newly added objects, number of detections xmatched, number of detection processed that weren't cached
