@@ -6,44 +6,63 @@ from slalib import sla_eqgal
 from itertools import imap, izip
 import time
 
-def initialize_column_definitions():
-	# Astrometry table
-	astromCols = [
-		# column in Catalog	Datatype	Column in sweep files
-		('id',			'u8',	''),			# computed column
-		('cached', 		'bool',	''),			# computed column
-		('ra',			'f8',	'ra'),
-		('dec',			'f8',	'dec'),
-		('l',			'f8',	''),			# computed column
-		('b',			'f8',	''),			# computed column
-		('type',		'i4',	'objc_type'),
-		('flags',		'i4',	'objc_flags'),
-		('flags2',		'i4',	'objc_flags2'),
-		('resolve_status',	'i2',	'resolve_status')
-	]
-
-	# Survey metadata table
-	surveyCols = [
-		('run', 		'i4',	'run'),
-		('camcol',		'i4',	'camcol'),
-		('field',		'i4',	'field'),
-		('objid',		'i4',	'id'),
-	]
-
-	# Photometry table
-	photoCols = [];
-	for mag in 'ugriz':
-		photoCols.append( (mag,           'f4',	'') )
-		photoCols.append( (mag + 'Err',   'f4',	'') )
-		photoCols.append( (mag + 'Ext',   'f4',	'') )
-		photoCols.append( (mag + 'Calib', 'i2',	'') )
-
-	return (astromCols, surveyCols, photoCols)
-
-def to_dtype(cols):
-	return list(( (name, dtype) for (name, dtype, _) in cols ))
-
-(astromCols, surveyCols, photoCols) = initialize_column_definitions();
+sdss_cat_def = \
+{
+	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'schema': {
+		#
+		#	 LSD column name      Type    FITS (sweep files) column
+		#
+		'main': {
+			'columns': [
+				('sdss_id',		'u8',	''),			# computed column
+				('ra',			'f8',	'ra'),
+				('dec',			'f8',	'dec'),
+				('l',			'f8',	''),			# computed column
+				('b',			'f8',	''),			# computed column
+				('type',		'i4',	'objc_type'),
+				('flags',		'i4',	'objc_flags'),
+				('flags2',		'i4',	'objc_flags2'),
+				('resolve_status',	'i2',	'resolve_status')
+			],
+			'primary_key' : 'sdss_id',
+			'spatial_keys': ('ra', 'dec'),
+		},
+		'survey': {
+			'columns': [
+				('run', 		'i4',	'run'),
+				('camcol',		'i4',	'camcol'),
+				('field',		'i4',	'field'),
+				('objid',		'i4',	'id'),
+			],
+			'exposure_key': 'run',
+		},
+		'photometry': {
+			'columns': [
+				('u',			'f4',	''),
+				('uErr',		'f4',	''),
+				('uExt',		'f4',	''),
+				('uCalib',		'i2',	''),
+				('g',			'f4',	''),
+				('gErr',		'f4',	''),
+				('gExt',		'f4',	''),
+				('gCalib',		'i2',	''),
+				('r',			'f4',	''),
+				('rErr',		'f4',	''),
+				('rExt',		'f4',	''),
+				('rCalib',		'i2',	''),
+				('i',			'f4',	''),
+				('iErr',		'f4',	''),
+				('iExt',		'f4',	''),
+				('iCalib',		'i2',	''),
+				('z',			'f4',	''),
+				('zErr',		'f4',	''),
+				('zExt',		'f4',	''),
+				('zCalib',		'i2',	''),
+			],
+		}
+	}
+}
 
 # SDSS flag definitions
 F1_SATURATED		 = (2**18)
@@ -54,26 +73,22 @@ F1_EDGE			 = (2**2)
 F2_DEBLENDED_AS_MOVING	 = (2**0)
 RS_SURVEY_PRIMARY	 = (2**8)
 
-def import_from_sweeps(catdir, sweep_files, create=False):
-	""" Import SDSS (stellar) catalog from a collection of SDSS sweep files.
+def import_from_sweeps(db, sdss_catname, sweep_files, create=False):
+	""" Import SDSS catalog from a collection of SDSS sweep files.
 
 	    Note: Assumes underlying shared storage for all catalog
 	          cells (i.e., any worker is able to write to any cell).
 	"""
 	if create:
 		# Create the new database
-		cat = catalog.Catalog(catdir, name='sdss', mode='c')
-		cat.create_table('astrometry', { 'columns': to_dtype(astromCols), 'primary_key': 'id', 'spatial_keys': ('ra', 'dec'), "cached_flag": "cached" })
-		cat.create_table('survey',     { 'columns': to_dtype(surveyCols) })
-		cat.create_table('photometry', { 'columns': to_dtype(photoCols) })
+		sdss_cat = db.create_catalog(sdss_catname, sdss_cat_def)
 	else:
-		cat = catalog.Catalog(catdir)
+		sdss_cat = db.catalog(sdss_catname)
 
 	t0 = time.time()
 	at = 0; ntot = 0
 	pool = pool2.Pool()
-	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (cat,), progress_callback=pool2.progress_pass):
-	#for (file, nloaded, nin) in imap(lambda file: import_from_sweeps_aux(file, cat), sweep_files):
+	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (db, sdss_catname), progress_callback=pool2.progress_pass):
 		at = at + 1
 		ntot = ntot + nloaded
 		t1 = time.time()
@@ -81,10 +96,12 @@ def import_from_sweeps(catdir, sweep_files, create=False):
 		time_tot = time_pass / at * len(sweep_files)
 		sfile = "..." + file[-67:] if len(file) > 70 else file
 		print('  ===> Imported %-70s [%d/%d, %5.2f%%] +%-6d %9d (%.0f/%.0f min.)' % (sfile, at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot, time_pass, time_tot))
+	del pool
 
-def import_from_sweeps_aux(file, cat):
+def import_from_sweeps_aux(file, db, catname):
 	# import an SDSS run
 	dat = pyfits.getdata(file, 1)
+	cat = db.catalog(catname)
 
 	F1 = F1_BRIGHT | F1_SATURATED | F1_NODEBLEND | F1_EDGE;	# these must not be set for an object to qualify
 	F2 = F2_DEBLENDED_AS_MOVING				# these must not be set for an object to qualify	# Compute which objects pass flag cuts
@@ -94,15 +111,16 @@ def import_from_sweeps_aux(file, cat):
 	rs = dat.field('resolve_status')
 	ok = (rs & RS_SURVEY_PRIMARY != 0) & (f1 & F1 == 0) & (f2 & F2 == 0)
 
-	# Import objects
+	# Import objects passing some basic quality cuts
 	if any(ok != 0):
 		# Load the data, cutting on flags
-		cols                     = dict(( (name, dat.field(fitsname)[ok])   for (name, _, fitsname) in astromCols + surveyCols if fitsname != ''))
+		coldefs = sdss_cat_def['schema']['main']['columns'] + sdss_cat_def['schema']['survey']['columns']
+		cols    = dict(( (name, dat.field(fitsname)[ok])   for (name, _, fitsname) in coldefs if fitsname != ''))
 		(ext, flux, ivar, calib) = [ dat.field(col)[ok].transpose()    for col in ['extinction', 'modelflux', 'modelflux_ivar', 'calib_status'] ]
 
-		# Compute magnitudes in all bands
-		for band in xrange(5):
-			(fluxB, ivarB, extB, calibB) = (flux[band], ivar[band], ext[band], calib[band])
+		# Compute magnitudes and related quantities for all bands
+		for pos, band in enumerate('ugriz'):
+			(fluxB, ivarB, extB, calibB) = (flux[pos], ivar[pos], ext[pos], calib[pos])
 
 			# Compute magnitude from flux
 			fluxB[fluxB <= 0] = 0.001
@@ -110,9 +128,8 @@ def import_from_sweeps_aux(file, cat):
 			magErr = (1.08574 / fluxB) / np.sqrt(ivarB)
 
 			# Append these to the list of columns
-			bands = 'ugriz'
-			for name, col in izip(['', 'Err', 'Ext', 'Calib'], [mag, magErr, extB, calibB]):
-				cols[bands[band] + name] = col
+			for suffix, col in izip(['', 'Err', 'Ext', 'Calib'], [mag, magErr, extB, calibB]):
+				cols[band + suffix] = col
 
 		# Add computed columns
 		(ra, dec) = cols['ra'], cols['dec']
@@ -123,13 +140,8 @@ def import_from_sweeps_aux(file, cat):
 		cols['l']      = l
 		cols['b']      = b
 
-		# sanity check
-		for (name, _, _) in astromCols + surveyCols + photoCols:
-			assert name in cols or name in ['id', 'cached'], name
-
 		ids = cat.append(cols)
 	else:
 		ids = []
 
-	return (file, len(ids), len(ok))
-
+	yield (file, len(ids), len(ok))

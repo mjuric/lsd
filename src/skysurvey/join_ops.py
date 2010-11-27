@@ -840,7 +840,7 @@ class DB(object):
 		schema = copy.deepcopy(schema)
 
 		# Remove any extra fields off schema['column']
-		schema['columns'] = [ (name, type) for (name, type, _, _) in schema['columns'] ]
+		schema['columns'] = [ v[:2] for v in schema['columns'] ]
 
 		cat.create_table(tname, schema)
 
@@ -882,11 +882,11 @@ class DB(object):
 		#		type:	indirect		"type": "indirect"
 		#		m1:	(cat1, col1)		"m1:":	["ps1_obj2det", "id1"]
 		#		m2:	(cat2, col2)		"m2:":	["ps1_obj2det", "id2"]
-		#	- equijoins:				Example: ps1_det:ps1_exp.join
+		#	- equijoins:				Example: ps1_det:ps1_exp.join		(!!!NOT IMPLEMENTED!!!)
 		#		type:	equi			"type": "equijoin"
 		#		id1:	colA			"id1":	"exp_id"
 		#		id2:	colB			"id2":	"exp_id"
-		#	- direct joins:				Example: ps1_obj:ps1_calib.join.json
+		#	- direct joins:				Example: ps1_obj:ps1_calib.join.json	(!!!NOT IMPLEMENTED!!!)
 		#		type:	direct			"type": "direct"
 
 		fname = '%s/%s.join' % (self.path, name)

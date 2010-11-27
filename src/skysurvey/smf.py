@@ -298,7 +298,7 @@ def import_from_smf(db, det_catname, exp_catname, smf_files, create=False):
 
 	det_c2f = gen_cat2fits(det_cat_def)
 	exp_c2f = gen_cat2fits(exp_cat_def)
-	
+
 	t0 = time.time()
 	at = 0; ntot = 0
 	pool = pool2.Pool()

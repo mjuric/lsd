@@ -10,7 +10,7 @@ import skysurvey as lsd
 from   skysurvey.utils import *
 
 def usage():
-	print "Usage: %s [-c|--create] <cat_dir> <sweep_file_dir>" % sys.argv[0]
+	print "Usage: %s [-c|--create] <db> <cat_dir> <sweep_file_dir>" % sys.argv[0]
 
 try:
 	optlist, args = getopt.getopt(sys.argv[1:], 'c', ['create'])
@@ -19,17 +19,19 @@ except getopt.GetoptError, err:
 	usage()
 	exit(-1)
 
-if len(args) != 2:
+if len(args) != 3:
 	print "Error: Not enough command line arguments."
 	usage()
 	exit(-1)
-
-cat_dir, sweep_dir = args
 
 create = False
 for (o, a) in optlist:
 	if o == '-c' or o == '--create':
 		create = True
+
+dbdir, cat_dir, sweep_dir = args
+
+db = lsd.DB(dbdir)
 
 #
 # Actual work
@@ -37,15 +39,14 @@ for (o, a) in optlist:
 files = shell('find "' + sweep_dir + '" -name "*star*.fits.gz" -o -name "*gal*.fits.gz" ').splitlines()
 
 print "Importing SDSS catalog:"
-sdss.import_from_sweeps(cat_dir, files, create)
+sdss.import_from_sweeps(db, cat_dir, files, create)
 print " done."
 
-cat = lsd.Catalog(cat_dir)
 print "Building neighbor cache ",
-cat.build_neighbor_cache()
+db.build_neighbor_cache(cat_dir)
 print " done."
 
 print "Computing summary statistics ",
-cat.compute_summary_stats()
+db.compute_summary_stats(cat_dir)
 print " done."
-print "Total number of objects in catalog: ", cat.nrows()
+print "Total number of objects in catalog: ", db.catalog(cat_dir).nrows()
