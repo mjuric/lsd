@@ -58,7 +58,14 @@ class TableCache:
 		tcache = self.cache[cell_id][cat.name][include_cached]
 		if table not in tcache:
 			# Load and cache the tablet
-			rows = tcache[table] = cat.fetch_tablet(cell_id, table, include_cached=include_cached)
+			rows = cat.fetch_tablet(cell_id, table, include_cached=include_cached)
+
+			# Ensure it's as long as the primary table
+			if table != cat.primary_table:
+				nrows = len(self.load_column(cell_id, cat.primary_key.name, cat))
+				rows.resize(nrows)
+
+			tcache[table] = rows
 		else:
 			rows = tcache[table]
 
@@ -485,6 +492,7 @@ class QueryInstance(object):
 
 				# Attach metadata
 				rows.cell_id = self.cell_id
+				rows.where__ = in_
 
 				yield rows
 
@@ -539,9 +547,8 @@ class QueryInstance(object):
 		(into_cat, dtype, key) = into_clause
 		cat = self.db.catalog(into_cat)
 		if key is not None:
-			tmp = Table(rows)
-			tmp.add_column('_ID', self[key])
-			ids = cat.update(rows)
+			rows.add_column('_ID', self[key][rows.where__])
+			ids = cat.append(rows, _update=True)
 		else:
 			rows.add_column('_ID', rows.cell_id, 'u8')
 			ids = cat.append(rows)
