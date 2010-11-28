@@ -13,6 +13,7 @@ def parse(query):
 	where_clause = 'True'
 	select_clause = []
 	from_clause = []
+	into_clause = None
 	try:
 		for (id, token, _, _, _) in g:
 			if id == tokenize.ENDMARKER:
@@ -49,11 +50,11 @@ def parse(query):
 				newcols = [(name, col)]
 
 			# Column delimiter or end of SELECT clause
-			if token.lower() in ['', ',', 'where', 'from']:
+			if token.lower() in ['', ',', 'from']:
 				select_clause += newcols
 				if token.lower() == "from":
 					# FROM clause
-					while token.lower() not in ['', 'where']:
+					while token.lower() not in ['', 'where', 'into']:
 						# Slurp the table path
 						(_, table, _, _, _) = next(g)				# table path
 
@@ -68,7 +69,7 @@ def parse(query):
 						# ... (inner/outer) AS asname
 						join_type = 'inner'					# default JOIN type
 						astable = table
-						for _dummy in xrange(2):
+						for _ in xrange(2):
 							(_, token, _, _, _) = next(g)
 							if token == '(':
 								(_, join_type, _, _, _) = next(g)	# inner/outer
@@ -82,22 +83,47 @@ def parse(query):
 
 						from_clause += [ (astable, table, join_type) ]
 
-				if token.lower() == 'where':
-					# WHERE clause
-					where_clause = ''
-					while token != '':
+					# WHERE clause (optional)
+					if token.lower() == 'where':
+						# WHERE clause
+						where_clause = ''
 						(_, token, _, _, _) = next(g)
-						where_clause = where_clause + token
-					break
-				else:
-					continue
+						while token.lower() not in ['', 'into']:
+							where_clause = where_clause + token
+							(_, token, _, _, _) = next(g)
 
-			raise Exception('Syntax error')
+					# INTO clause (optional)
+					if token.lower() == 'into':
+						(_, table, _, _, _) = next(g)
+						(_, token, _, _, _) = next(g)
+						dtype = key = None
+
+						# Look for explicit dtype in parenthesis
+						if token == '(':
+							dtype = ''
+							(_, token, _, _, _) = next(g)
+							while token not in [')']:
+								dtype += token
+								(_, token, _, _, _) = next(g)
+
+							(_, token, _, _, _) = next(g)
+
+						# Look for AT keyword (update key specification)
+						if token.lower() == 'at':
+							(_, key, _, _, _) = next(g)
+							(_, token, _, _, _) = next(g)
+
+						into_clause = (table, dtype, key)
+					
+					if token != '':
+						raise Exception('Syntax error near "%s"', token)
+
+					break
 	except list as dummy:
 	#except StopIteration:
 		pass
 
-	return (select_clause, where_clause, from_clause)
+	return (select_clause, where_clause, from_clause, into_clause)
 
 def resolve_wildcards(select_clause, tablecols):
 	# Resolve all .* columns, given a dict-like variable
@@ -127,8 +153,9 @@ if __name__ == '__main__':
 	}
 #	print parse("sdss.ra as ra, sdss.dec FROM sdss AS s")
 #	exit()
-	(select_clause, where_clause, from_clause) = parse("*, sdss.* FROM '/w sdss' as sx WHERE aa == bb");
-	print (select_clause, where_clause, from_clause)
+	(select_clause, where_clause, from_clause, into_clause) = parse("* from exp where _TIME < 55248.25 into exp2");
+#	(select_clause, where_clause, from_clause, into_clause) = parse("*, sdss.* FROM '/w sdss' as sx WHERE aa == bb INTO blabar(i4,f8) AT _ID");
+	print (select_clause, where_clause, from_clause, into_clause)
 	print resolve_wildcards(select_clause, tablecols)
 	exit()
 	print parse("ra, dec");

@@ -123,6 +123,43 @@ def is_scalar_of_type(v, t):
 	s = np.array([], v).dtype.type
 	return s == t
 
+def str_dtype(dtype):
+	""" Return a comma-separated dtype string given a dtype
+	    object.
+
+	    Note: This will NOT work for any dtype object. Example of one:
+
+	    	dtype(('i8,f4', (64,)))
+
+	    See http://docs.scipy.org/doc/numpy/reference/arrays.dtypes.html for details
+	"""
+	if not dtype.subdtype:
+		if dtype.fields is None:
+			kind = dtype.kind if dtype.kind != 'S' else 'a'
+			itemsize = str(dtype.itemsize)	
+			assert len(dtype.shape) == 0
+
+			return kind + itemsize
+		else:
+			s = ''
+			for f in dtype.names:
+				if len(s): s += ','
+				s += str_dtype(dtype[f])
+			return s
+	else:
+		# Fetch info from subtype
+		s = str_dtype(dtype.subdtype[0])
+
+		assert len(dtype.shape) != 0
+		assert s.find(',') == -1, "Arrays of structured arrays cannot be represented as comma-separated strings"
+
+		if len(dtype.shape) == 1:
+			s = str(dtype.shape[0]) + s
+		else:
+			s = str(dtype.shape) + s
+
+		return s
+
 def full_dtype(arr):
 	""" Return the dtype string of the ndarray that includes
 	    the array shape. Useful when merging multiple ndarray
@@ -131,7 +168,7 @@ def full_dtype(arr):
 	    See http://docs.scipy.org/doc/numpy/reference/arrays.dtypes.html for details
 	"""
 	shape = arr.shape[1:]
-	dtype = str(shape) + str(arr.dtype) if len(shape) else str(arr.dtype)
+	dtype = str(shape) + str_dtype(arr.dtype) if len(shape) else str_dtype(arr.dtype)
 	return dtype
 
 def as_tuple(row):

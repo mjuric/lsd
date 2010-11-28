@@ -17,6 +17,7 @@ from pixelization import Pixelization
 from collections import OrderedDict
 from contextlib import contextmanager
 from table import Table
+import copy
 
 # Special return type used in _mapper() and Catalog.map_reduce
 # to denote that the returned value should not be yielded to
@@ -337,7 +338,18 @@ class Catalog:
 		if self._is_pseudotable(table):
 			raise Exception("Tables beginning with '_' are reserved for system use.")
 
-		self._tables[table] = schema
+		schema = copy.deepcopy(schema)
+
+		# convert all dtypes with type='O8' to blobrefs (type='i8')
+		for (pos, (name, dtype)) in enumerate(schema['columns']):
+			s0 = dtype
+			s1 = s0.replace('O8', 'i8')
+			if s0 != s1:
+				schema['columns'][pos] = (name, s1)
+				# Add it to blobs array, if not already there
+				if 'blobs' not in schema: schema['blobs'] = {}
+				if name not in schema['blobs']:
+					schema['blobs'][name] = {}
 
 		if 'spatial_keys' in schema and 'primary_key' not in schema:
 			raise Exception('Trying to create spatial keys in a non-primary table!')
@@ -351,6 +363,8 @@ class Catalog:
 			cols = dict(schema['columns'])
 			for blobcol in schema['blobs']:
 				assert is_scalar_of_type(cols[blobcol], np.int64)
+
+		self._tables[table] = schema
 
 		self._rebuild_internal_schema()
 		self._store_schema()
@@ -558,6 +572,13 @@ class Catalog:
 		key = self.get_primary_key()
 		if key not in cols:
 			cols[key] = np.zeros(len(cols), dtype=self.columns[key].dtype)
+		else:
+			cid = self.pix.is_cell_id(cols[key])
+			assert cid.all() or cell_id is not None, "If keys are given, they must refer to the cell only."
+
+			x, y, t = self.pix._xyt_from_cell_id(cols[key])
+			cols[key] = self.pix._id_from_xyti(x, y, t, 0)
+
 #		assert cols[key].dtype == np.uint64
 #		if sys.byteorder == 'little':
 #			keyCI = cols[key].view(dtype=[('row_part', np.uint32), ('cell_part', np.uint32)])
@@ -579,13 +600,15 @@ class Catalog:
 			# Explicit vector (or scalar) of destination cell(s) has been provided
 			# Overrides anything that would've been computed from primary_key or spatial_keys
 			# Shouldn't be used EVER (unless you really, really, really know what you're doing.)
+			assert group != 'main'
 			cells = np.array(cell_id, copy=False, ndmin=1)
 			if len(cells) == 1:
 				cells = np.resize(cells, len(cols))
 		else:
 			# Deduce any unset keys from spatial_keys
 			if not cols[key].all():
-				assert group == 'main'	# TODO: I think we could remove this restriction...
+				assert group == 'main'
+
 				need_key = cols[key] == 0
 
 				# Deduce remaining cells from spatial and temporal keys

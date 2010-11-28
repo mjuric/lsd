@@ -500,7 +500,7 @@ class QueryInstance(object):
 		return globals_
 
 	def eval_where(self, globals_ = None):
-		(_, where_clause, _) = self.query_clauses
+		(_, where_clause, _, _) = self.query_clauses
 
 		if globals_ is None:
 			globals_ = self.prep_globals()
@@ -512,7 +512,7 @@ class QueryInstance(object):
 		return in_
 
 	def eval_select(self, globals_ = None):
-		(select_clause, _, _) = self.query_clauses
+		(select_clause, _, _, _) = self.query_clauses
 
 		if globals_ is None:
 			globals_ = self.prep_globals()
@@ -527,16 +527,47 @@ class QueryInstance(object):
 			rows.add_column(asname, col)
 
 		return rows
-	
+
+	def postprocess(self, rows):
+		# This handles INTO clauses. Stores the data into
+		# destination catalog, returning the IDs of stored rows.
+		(_, _, _, into_clause) = self.query_clauses
+		if into_clause is None:
+			return rows
+
+		# Insert into the destination catalog
+		(into_cat, dtype, key) = into_clause
+		cat = self.db.catalog(into_cat)
+		if key is not None:
+			tmp = Table(rows)
+			tmp.add_column('_ID', self[key])
+			ids = cat.update(rows)
+		else:
+			rows.add_column('_ID', rows.cell_id, 'u8')
+			ids = cat.append(rows)
+
+		# Return IDs only
+		for col in rows.keys():
+			rows.drop_column(col)
+		rows.add_column('_ID', ids)
+#		print "HERE", rows; exit()
+		
+		return rows
+
 	#################
 
 	def load_column(self, name, catname):
 		# If we're just peeking, construct the column from schema
 		if self.cell_id is None:
 			assert self.bounds is None
+			cdef = self.catalogs[catname].cat.columns[name]
+			dtype = np.dtype(cdef.dtype)
 
-			dtype = self.catalogs[catname].cat.columns[name].dtype
-			col = np.empty(0, dtype=dtype)
+			# Handle blobs
+			if cdef.is_blob:
+				col = np.empty(0, dtype=np.dtype(('O', dtype.shape)))
+			else:
+				col = np.empty(0, dtype=dtype)
 		else:
 			# Load the column from table 'table' of the catalog 'catname'
 			# Also cache the loaded tablet, for future reuse
@@ -647,14 +678,66 @@ class QueryEngine(object):
 
 	def __init__(self, db, query, locals = {}):
 		self.db = db
+
 		# parse query
-		(select_clause, where_clause, from_clause) = qp.parse(query)
+		(select_clause, where_clause, from_clause, into_clause) = qp.parse(query)
 
 		self.root, self.catalogs = db.construct_join_tree(from_clause);
 		select_clause            = qp.resolve_wildcards(select_clause, TableColsProxy(self.root.name, self.catalogs))
-		self.query_clauses       = (select_clause, where_clause, from_clause)
+
+		self.query_clauses       = (select_clause, where_clause, from_clause, into_clause)
 
 		self.locals = locals
+
+	def create_into_catalog(self):
+		# Called from Query.execute
+		_, _, _, into_clause = self.query_clauses
+		if into_clause is None:
+			return
+
+		(catname, dtype, key) = into_clause
+		assert dtype is None, "User-supplied dtype not supported yet."
+
+		db = self.db
+		dtype = self.peek().dtype
+		schema = { 'columns': [] }
+		if db.catalog_exists(catname):
+			# Must have a designated key for updating to work
+			if key is None:
+				raise Exception('If updating into an existing catalog (%s), you must specify the column with IDs that will be updated (" ... INTO ... AT keycol") construct).' % catname)
+
+			cat = db.catalog(catname)
+
+			# Find any new columns we'll need to create
+			for name in dtype.names:
+				rname = cat.resolve_alias(name)
+				if rname not in cat.columns:
+					schema['columns'].append((name, utils.str_dtype(dtype[name])))
+		else:
+			cat = db.catalog(catname, True)
+
+			# Create all columns
+			schema['columns'] = [ (name, utils.str_dtype(dtype[name])) for name in dtype.names ]
+			schema['primary_key'] = '_id'
+
+		# Adding columns starting with '_' is prohibited. Enforce it here
+		for (col, _) in schema['columns']:
+			if col[0] == '_':
+				raise Exception('Storing columns starting with "_" is prohibited. Use the "col AS alias" construct to rename the offending column ("%s")' % col)
+
+		# Add a primary key column (if needed)
+		if 'primary_key' in schema and schema['primary_key'] not in dict(schema['columns']):
+			schema['columns'].insert(0, (schema['primary_key'], 'u8'))
+
+		# Create a new cgroup (if needed)
+		if schema['columns']:
+			for x in xrange(1, 100000):
+				tname = 'auto%03d' % x
+				if tname not in cat._tables:
+					break
+			cat.create_table(tname, schema)
+
+		#print "XXX:", tname, schema; exit()
 
 	def on_cell(self, cell_id, bounds=None, include_cached=False):
 		return QueryInstance(self, cell_id, bounds, include_cached)
@@ -708,6 +791,9 @@ class Query(object):
 		# Insert our mapper into the kernel chain
 		kernels = list(kernels)
 		kernels[0] = (_mapper, kernels[0], self.qengine, include_cached)
+
+		# Create the destination for INTO queries (if needed)
+		self.qengine.create_into_catalog()
 
 		# start and run the workers
 		pool = pool2.Pool(nworkers)
@@ -1101,7 +1187,9 @@ def _mapper(partspec, mapper, qengine, include_cached, _pass_empty=False):
 	mapper, mapper_args = utils.unpack_callable(mapper)
 
 	# Pass on to mapper (and yield its results)
-	for result in mapper(qengine.on_cell(cell_id, bounds, include_cached), *mapper_args):
+	qresult = qengine.on_cell(cell_id, bounds, include_cached)
+	for result in mapper(qresult, *mapper_args):
+		result = qresult.postprocess(result)
 		yield result
 
 ###############################

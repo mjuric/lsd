@@ -151,7 +151,7 @@ class Table(object):
 			cols = cols.items()
 
 		for (name, col) in cols:
-			self.add_column(name, col, supress_row_update=True)
+			self.add_column(name, col)
 
 #		self._mk_row()
 
@@ -159,7 +159,12 @@ class Table(object):
 		for name, col in cols:
 			self.add_column(name, col)
 
-	def add_column(self, name, col, supress_row_update=False):
+	def add_column(self, name, col, dtype=None):
+		if not isinstance(col, np.ndarray):
+			# permit scalars to initialize new columns
+			col = np.array([col], dtype=dtype, ndmin=1)
+			col = np.resize(col, (len(self),) + col.shape[1:]) # This will resize, replicating the first element everywhere
+
 		# sanity check: require numpy arrays
 		assert isinstance(col, np.ndarray)
 		assert self.ncols() == 0 or (len(col) == self.nrows()), str(len(col)) + " != " + str(self.nrows())
