@@ -36,7 +36,7 @@ class TableCache:
 		self.root = root
 		self.include_cached = include_cached
 
-	def load_column(self, cell_id, name, cat):
+	def load_column(self, cell_id, name, cat, autoexpand = True):
 		# Return the column 'name' from table 'table' of the catalog 'cat'.
 		# Load the tablet if necessary, and cache it for further reuse.
 		#
@@ -60,8 +60,8 @@ class TableCache:
 			# Load and cache the tablet
 			rows = cat.fetch_tablet(cell_id, table, include_cached=include_cached)
 
-			# Ensure it's as long as the primary table
-			if table != cat.primary_table:
+			# Ensure it's as long as the primary table (this allows us to support "sparse" tablets)
+			if autoexpand and table != cat.primary_table:
 				nrows = len(self.load_column(cell_id, cat.primary_key.name, cat))
 				rows.resize(nrows)
 
@@ -536,7 +536,41 @@ class QueryInstance(object):
 
 		return rows
 
-	def postprocess(self, rows):
+	def _find_into_dest_rows(self, cell_id, cat, into_col, vals):
+		""" Return the keys of rows in cat whose 'into_col' value
+		    matches vals. Return zero for vals that have no match.
+		"""
+		into_col = cat.resolve_alias(into_col)
+		col = self.tcache.load_column(cell_id, into_col, cat, autoexpand=False)
+#		print "XX:", col, vals;
+
+		# Find corresponding rows
+		ii = col.argsort()
+		scol = col[ii]
+		idx = np.searchsorted(scol, vals)
+#		print "XX:", scol, ii
+
+		idx[idx == len(col)] = 0
+		app = scol[idx] != vals
+#		print "XX:", idx, app
+
+		# Reorder to original ordering
+		idx = ii[idx]
+#		print "XX:", idx, app
+
+		# TODO: Verify (debugging, remove when happy)
+		in2 = np.in1d(vals, col)
+#		print "XX:", in2
+		assert np.all(in2 == ~app)
+
+		id = self.tcache.load_column(cell_id, cat.primary_key.name, cat, autoexpand=False)
+		id = id[idx]		# Get the values of row indices that we have
+		id[app] = 0		# Mark empty indices with 0
+#		print "XX:", id;
+
+		return id
+
+	def eval_into(self, rows):
 		# This handles INTO clauses. Stores the data into
 		# destination catalog, returning the IDs of stored rows.
 		(_, _, _, into_clause) = self.query_clauses
@@ -544,14 +578,34 @@ class QueryInstance(object):
 			return rows
 
 		# Insert into the destination catalog
-		(into_cat, dtype, key) = into_clause
+		(into_cat, dtype, into_col, keyexpr, kind) = into_clause
 		cat = self.db.catalog(into_cat)
-		if key is not None:
-			rows.add_column('_ID', self[key][rows.where__])
-			ids = cat.append(rows, _update=True)
-		else:
+		if kind == 'append':
 			rows.add_column('_ID', rows.cell_id, 'u8')
 			ids = cat.append(rows)
+		elif kind == 'update':
+			# Evaluate the key expression
+			globals_ = self.prep_globals()
+			vals = eval(keyexpr, globals_, self)[rows.where__]
+
+			# Match rows
+			id = self._find_into_dest_rows(rows.cell_id, cat, into_col, vals)
+
+			# Remove rows that don't exist, and update existing
+			rows.add_column('_ID', id)
+			rows = rows[id != 0]
+			ids = cat.append(rows, _update=True)
+#			print rows['_ID'], ids
+
+			assert np.all(id[id != 0] == ids)
+		elif kind == 'insert':	# Insert/update new rows (the expression give the key)
+			# Evaluate the key expression
+			globals_ = self.prep_globals()
+			id = eval(keyexpr, globals_, self)[rows.where__]
+
+			# Update and/or add new rows
+			rows.add_column('_ID', id)
+			ids = cat.append(rows, _update=True)
 
 		# Return IDs only
 		for col in rows.keys():
@@ -702,7 +756,7 @@ class QueryEngine(object):
 		if into_clause is None:
 			return
 
-		(catname, dtype, key) = into_clause
+		(catname, dtype, key) = into_clause[:3]
 		assert dtype is None, "User-supplied dtype not supported yet."
 
 		db = self.db
@@ -711,7 +765,7 @@ class QueryEngine(object):
 		if db.catalog_exists(catname):
 			# Must have a designated key for updating to work
 			if key is None:
-				raise Exception('If updating into an existing catalog (%s), you must specify the column with IDs that will be updated (" ... INTO ... AT keycol") construct).' % catname)
+				raise Exception('If selecting into an existing catalog (%s), you must specify the column with IDs that will be updated (" ... INTO ... AT keycol") construct).' % catname)
 
 			cat = db.catalog(catname)
 
@@ -1196,7 +1250,7 @@ def _mapper(partspec, mapper, qengine, include_cached, _pass_empty=False):
 	# Pass on to mapper (and yield its results)
 	qresult = qengine.on_cell(cell_id, bounds, include_cached)
 	for result in mapper(qresult, *mapper_args):
-		result = qresult.postprocess(result)
+		result = qresult.eval_into(result)
 		yield result
 
 ###############################

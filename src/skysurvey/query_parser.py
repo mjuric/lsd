@@ -96,7 +96,8 @@ def parse(query):
 					if token.lower() == 'into':
 						(_, table, _, _, _) = next(g)
 						(_, token, _, _, _) = next(g)
-						dtype = key = None
+						dtype = into_col = keyexpr = None
+						kind = 'append'
 
 						# Look for explicit dtype in parenthesis
 						if token == '(':
@@ -108,12 +109,29 @@ def parse(query):
 
 							(_, token, _, _, _) = next(g)
 
-						# Look for AT keyword (update key specification)
-						if token.lower() == 'at':
-							(_, key, _, _, _) = next(g)
-							(_, token, _, _, _) = next(g)
+						# Look for WHERE xx = expr clause (update key specification)
+						# or for AT idexpr clause (insert with given IDs)
+						if token.lower() in ['where', 'at']:
+							if token.lower() == 'where':
+								# WHERE xx = expr construct
+								(_, into_col, _, _, _) = next(g)	# column against which to mach in the INTO table
+								(_, token, _, _, _) = next(g)	# must be '='
+								if token != '==':
+									raise Exception('Syntax error in INTO clause near "%s" (expected "==")', token)
+								kind = 'update'
+							else:
+								# AT expr construct
+								into_col = '_ID'
+								kind = 'insert'
 
-						into_clause = (table, dtype, key)
+							# slurp up everything to the end -- this will be the expr giving the keys
+							tokens = []
+							while token != '':
+								(_, token, _, _, _) = next(g)
+								tokens.append(token)
+							keyexpr = ''.join(tokens)
+
+						into_clause = (table, dtype, into_col, keyexpr, kind)
 					
 					if token != '':
 						raise Exception('Syntax error near "%s"', token)
@@ -153,8 +171,9 @@ if __name__ == '__main__':
 	}
 #	print parse("sdss.ra as ra, sdss.dec FROM sdss AS s")
 #	exit()
-	(select_clause, where_clause, from_clause, into_clause) = parse("* from exp where _TIME < 55248.25 into exp2");
-#	(select_clause, where_clause, from_clause, into_clause) = parse("*, sdss.* FROM '/w sdss' as sx WHERE aa == bb INTO blabar(i4,f8) AT _ID");
+#	(select_clause, where_clause, from_clause, into_clause) = parse("* from exp where _TIME < 55248.25 into exp2");
+#	(select_clause, where_clause, from_clause, into_clause) = parse("*, sdss.* FROM '/w sdss' as sx WHERE aa == bb INTO blabar(i4,f8) WHERE _ID == sdss._ID");
+	(select_clause, where_clause, from_clause, into_clause) = parse("*, sdss.* FROM '/w sdss' as sx WHERE aa == bb INTO blabar(i4,f8)");
 	print (select_clause, where_clause, from_clause, into_clause)
 	print resolve_wildcards(select_clause, tablecols)
 	exit()
