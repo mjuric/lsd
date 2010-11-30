@@ -28,20 +28,20 @@ class TableCache:
 	"""
 	cache = {}		# Cache of loaded tables, in the form of cache[cell_id][include_cached][catname][tablename] = rows
 
-	root = None		# The root catalog (Catalog instance). Used for figuring out if _not_ to load the cached rows.
+	root_name = None	# The name of the root catalog (string). Used for figuring out if _not_ to load the cached rows.
 	include_cached = False	# Should we load the cached object from the root catalog
 
-	def __init__(self, root, include_cached = False):
+	def __init__(self, root_name, include_cached = False):
 		self.cache = {}
-		self.root = root
+		self.root_name = root_name
 		self.include_cached = include_cached
 
-	def load_column(self, cell_id, name, cat, autoexpand = True):
+	def load_column(self, cell_id, name, cat, autoexpand=True, resolve_blobs=False):
 		# Return the column 'name' from table 'table' of the catalog 'cat'.
 		# Load the tablet if necessary, and cache it for further reuse.
 		#
-		# NOTE: This method DOES NOT resolve blobrefs to BLOBs
-		include_cached = self.include_cached if cat.name == self.root.name else True
+		# NOTE: Unless resolve_blobs=True, this method DOES NOT resolve blobrefs to BLOBs
+		include_cached = self.include_cached if cat.name == self.root_name else True
 
 		# Figure out which table contains this column
 		table = cat.columns[name].table
@@ -70,6 +70,11 @@ class TableCache:
 			rows = tcache[table]
 
 		col = rows[name]
+		
+		# resolve blobs, if requested
+		if resolve_blobs:
+			col = self.resolve_blobs(cell_id, col, name, cat)
+
 		return col
 
 	def resolve_blobs(self, cell_id, col, name, cat):
@@ -77,7 +82,7 @@ class TableCache:
 		# will not be cached.
 
 		if cat.columns[name].is_blob:
-			include_cached = self.include_cached if cat.name == self.root.name else True
+			include_cached = self.include_cached if self.root and cat.name == self.root_name else True
 			col = cat.fetch_blobs(cell_id, column=name, refs=col, include_cached=include_cached)
 
 		return col
@@ -459,7 +464,7 @@ class QueryInstance(object):
 		self.cell_id	= cell_id
 		self.bounds	= bounds
 
-		self.tcache	= TableCache(self.root, include_cached)
+		self.tcache	= TableCache(self.root.name, include_cached)
 		self.columns	= {}
 		
 	def peek(self):
@@ -534,85 +539,6 @@ class QueryInstance(object):
 			self[asname] = col
 			rows.add_column(asname, col)
 
-		return rows
-
-	def _find_into_dest_rows(self, cell_id, cat, into_col, vals):
-		""" Return the keys of rows in cat whose 'into_col' value
-		    matches vals. Return zero for vals that have no match.
-		"""
-		into_col = cat.resolve_alias(into_col)
-		col = self.tcache.load_column(cell_id, into_col, cat, autoexpand=False)
-#		print "XX:", col, vals;
-
-		# Find corresponding rows
-		ii = col.argsort()
-		scol = col[ii]
-		idx = np.searchsorted(scol, vals)
-#		print "XX:", scol, ii
-
-		idx[idx == len(col)] = 0
-		app = scol[idx] != vals
-#		print "XX:", idx, app
-
-		# Reorder to original ordering
-		idx = ii[idx]
-#		print "XX:", idx, app
-
-		# TODO: Verify (debugging, remove when happy)
-		in2 = np.in1d(vals, col)
-#		print "XX:", in2
-		assert np.all(in2 == ~app)
-
-		id = self.tcache.load_column(cell_id, cat.primary_key.name, cat, autoexpand=False)
-		id = id[idx]		# Get the values of row indices that we have
-		id[app] = 0		# Mark empty indices with 0
-#		print "XX:", id;
-
-		return id
-
-	def eval_into(self, rows):
-		# This handles INTO clauses. Stores the data into
-		# destination catalog, returning the IDs of stored rows.
-		(_, _, _, into_clause) = self.query_clauses
-		if into_clause is None:
-			return rows
-
-		# Insert into the destination catalog
-		(into_cat, dtype, into_col, keyexpr, kind) = into_clause
-		cat = self.db.catalog(into_cat)
-		if kind == 'append':
-			rows.add_column('_ID', rows.cell_id, 'u8')
-			ids = cat.append(rows)
-		elif kind == 'update':
-			# Evaluate the key expression
-			globals_ = self.prep_globals()
-			vals = eval(keyexpr, globals_, self)[rows.where__]
-
-			# Match rows
-			id = self._find_into_dest_rows(rows.cell_id, cat, into_col, vals)
-
-			# Remove rows that don't exist, and update existing
-			rows.add_column('_ID', id)
-			rows = rows[id != 0]
-			ids = cat.append(rows, _update=True)
-#			print rows['_ID'], ids
-
-			assert np.all(id[id != 0] == ids)
-		elif kind == 'insert':	# Insert/update new rows (the expression give the key)
-			# Evaluate the key expression
-			globals_ = self.prep_globals()
-			id = eval(keyexpr, globals_, self)[rows.where__]
-
-			# Update and/or add new rows
-			rows.add_column('_ID', id)
-			ids = cat.append(rows, _update=True)
-
-		# Return IDs only
-		for col in rows.keys():
-			rows.drop_column(col)
-		rows.add_column('_ID', ids)
-#		print "HERE", rows; exit()
-		
 		return rows
 
 	#################
@@ -729,6 +655,209 @@ class QueryInstance(object):
 
 		self.columns[key] = val
 
+class IntoWriter(object):
+	into_clause = None
+	_tcache = None
+	rows = None
+	locals = None
+	db = None
+	pix = None
+	cat = None
+
+	def __init__(self, db, into_clause, locals):
+		# This handles INTO clauses. Stores the data into
+		# destination catalog, returning the IDs of stored rows.
+		self.db          = db
+		self.into_clause = into_clause
+		self.locals      = locals
+
+	@property
+	def tcache(self):
+		# Auto-create a table cache if needed
+		if self._tcache is None:
+			into_cat     = self.into_clause[0]
+			self._tcache = TableCache(into_cat, False)
+		return self._tcache
+
+	#########
+	def __getitem__(self, name):
+		# Do we have this column in the query result rows?
+		if name in self.rows:
+			return self.rows[name]
+
+		# Is this one of the local variables passed in by the user?
+		if name in self.locals:
+			return self.locals[name]
+
+		# This object is unknown to us -- let it fall through, it may
+		# be a global variable or function
+		raise KeyError(name)
+
+	#################
+
+	def peek(self, rows):
+		# We always return uint64 arrays
+		return np.empty(0, dtype='u8')
+
+	def write(self, cell_id, rows):
+		assert isinstance(rows, Table)
+		self.rows = rows
+
+		# The catalog may have been created on previous pass
+		if self.cat is None:
+			self.cat  = self.create_into_catalog()
+
+		rows = self.eval_into(cell_id, rows)
+		return (cell_id, rows)
+
+	def _find_into_dest_rows(self, cell_id, cat, into_col, vals):
+		""" Return the keys of rows in cat whose 'into_col' value
+		    matches vals. Return zero for vals that have no match.
+		"""
+		into_col = cat.resolve_alias(into_col)
+		col = self.tcache.load_column(cell_id, into_col, cat, autoexpand=False, resolve_blobs=True)
+#		print "XX:", col, vals;
+
+		# Find corresponding rows
+		ii = col.argsort()
+		scol = col[ii]
+		idx = np.searchsorted(scol, vals)
+#		print "XX:", scol, ii
+
+		idx[idx == len(col)] = 0
+		app = scol[idx] != vals
+#		print "XX:", idx, app
+
+		# Reorder to original ordering
+		idx = ii[idx]
+#		print "XX:", idx, app
+
+		# TODO: Verify (debugging, remove when happy)
+		in2 = np.in1d(vals, col)
+#		print "XX:", in2
+		assert np.all(in2 == ~app)
+
+		id = self.tcache.load_column(cell_id, cat.primary_key.name, cat, autoexpand=False)
+		id = id[idx]		# Get the values of row indices that we have
+		id[app] = 0		# Mark empty indices with 0
+#		print "XX:", id;
+
+		return id
+
+	def prep_globals(self):
+		globals_ = globals()
+
+		# Add implicit global objects present in queries
+		globals_['_PIX'] = self.cat.pix
+		globals_['_DB']  = self.db
+		
+		return globals_
+
+	def eval_into(self, cell_id, rows):
+		# Insert into the destination catalog
+		(into_cat, dtype, into_col, keyexpr, kind) = self.into_clause
+
+		cat = self.db.catalog(into_cat)
+		if kind == 'append':
+			rows.add_column('_ID', cell_id, 'u8')
+			ids = cat.append(rows)
+		elif kind == 'update':
+			# Evaluate the key expression
+			globals_ = self.prep_globals()
+			vals = eval(keyexpr, globals_, self)
+#			print rows['mjd_obs'], rows['mjdorig'], keyexpr, vals; exit()
+
+			# Match rows
+			id = self._find_into_dest_rows(cell_id, cat, into_col, vals)
+			if cat.primary_key.name not in rows:
+				rows.add_column('_ID', id)
+			else:
+				assert np.all(rows[cat.primary_key.name] == id)
+				rows[cat.primary_key.name] = id
+
+			# Remove rows that don't exist, and update existing
+			rows = rows[id != 0]
+			ids = cat.append(rows, _update=True)
+#			print rows['_ID'], ids
+
+			assert np.all(id[id != 0] == ids)
+		elif kind == 'insert':	# Insert/update new rows (the expression give the key)
+			# Evaluate the key expression
+			globals_ = self.prep_globals()
+			id = eval(keyexpr, globals_, self)
+
+			if cat.primary_key.name not in rows:
+				rows.add_column('_ID', id)
+			else:
+				assert np.all(rows[cat.primary_key.name] == id)
+				rows[cat.primary_key.name] = id
+
+			# Update and/or add new rows
+			ids = cat.append(rows, _update=True)
+
+		# Return IDs only
+		for col in rows.keys():
+			rows.drop_column(col)
+		rows.add_column('_ID', ids)
+#		print "HERE", rows; exit()
+		
+		return rows
+
+	def create_into_catalog(self):
+		# called to auto-create the destination catalog
+		(catname, dtype, into_col, keyexpr) = self.into_clause[:4]
+		assert dtype is None, "User-supplied dtype not supported yet."
+
+		db = self.db
+		dtype = self.rows.dtype
+		schema = { 'columns': [] }
+		with db.lock():
+			if db.catalog_exists(catname):
+				# Must have a designated key for updating to work
+				if into_col is None:
+					raise Exception('If selecting into an existing catalog (%s), you must specify the column with IDs that will be updated (" ... INTO ... AT keycol") construct).' % catname)
+
+				cat = db.catalog(catname)
+
+				# Find any new columns we'll need to create
+				for name in dtype.names:
+					rname = cat.resolve_alias(name)
+					if rname not in cat.columns:
+						schema['columns'].append((name, utils.str_dtype(dtype[name])))
+			else:
+				# Creating a new catalog
+				cat = db.catalog(catname, True)
+
+				# Create all columns
+				schema['columns'] = [ (name, utils.str_dtype(dtype[name])) for name in dtype.names ]
+				
+				# If key is specified, and is a column name from self.rows, name the primary
+				# key after it
+				if keyexpr is not None and keyexpr in self.rows:
+					schema['primary_key'] = keyexpr
+				else:
+					schema['primary_key'] = '_id'
+
+			# Adding columns starting with '_' is prohibited. Enforce it here
+			for (col, _) in schema['columns']:
+				if col[0] == '_':
+					raise Exception('Storing columns starting with "_" is prohibited. Use the "col AS alias" construct to rename the offending column ("%s")' % col)
+
+			# Add a primary key column (if needed)
+			if 'primary_key' in schema and schema['primary_key'] not in dict(schema['columns']):
+				schema['columns'].insert(0, (schema['primary_key'], 'u8'))
+
+			# Create a new cgroup (if needed)
+			if schema['columns']:
+				for x in xrange(1, 100000):
+					tname = 'auto%03d' % x
+					if tname not in cat._tables:
+						break
+				cat.create_table(tname, schema)
+
+		#print "XXX:", tname, schema; exit()
+		return cat
+
 class QueryEngine(object):
 	db       = None		# The controlling database instance
 
@@ -750,56 +879,6 @@ class QueryEngine(object):
 
 		self.locals = locals
 
-	def create_into_catalog(self):
-		# Called from Query.execute
-		_, _, _, into_clause = self.query_clauses
-		if into_clause is None:
-			return
-
-		(catname, dtype, key) = into_clause[:3]
-		assert dtype is None, "User-supplied dtype not supported yet."
-
-		db = self.db
-		dtype = self.peek().dtype
-		schema = { 'columns': [] }
-		if db.catalog_exists(catname):
-			# Must have a designated key for updating to work
-			if key is None:
-				raise Exception('If selecting into an existing catalog (%s), you must specify the column with IDs that will be updated (" ... INTO ... AT keycol") construct).' % catname)
-
-			cat = db.catalog(catname)
-
-			# Find any new columns we'll need to create
-			for name in dtype.names:
-				rname = cat.resolve_alias(name)
-				if rname not in cat.columns:
-					schema['columns'].append((name, utils.str_dtype(dtype[name])))
-		else:
-			cat = db.catalog(catname, True)
-
-			# Create all columns
-			schema['columns'] = [ (name, utils.str_dtype(dtype[name])) for name in dtype.names ]
-			schema['primary_key'] = '_id'
-
-		# Adding columns starting with '_' is prohibited. Enforce it here
-		for (col, _) in schema['columns']:
-			if col[0] == '_':
-				raise Exception('Storing columns starting with "_" is prohibited. Use the "col AS alias" construct to rename the offending column ("%s")' % col)
-
-		# Add a primary key column (if needed)
-		if 'primary_key' in schema and schema['primary_key'] not in dict(schema['columns']):
-			schema['columns'].insert(0, (schema['primary_key'], 'u8'))
-
-		# Create a new cgroup (if needed)
-		if schema['columns']:
-			for x in xrange(1, 100000):
-				tname = 'auto%03d' % x
-				if tname not in cat._tables:
-					break
-			cat.create_table(tname, schema)
-
-		#print "XXX:", tname, schema; exit()
-
 	def on_cell(self, cell_id, bounds=None, include_cached=False):
 		return QueryInstance(self, cell_id, bounds, include_cached)
 
@@ -809,12 +888,17 @@ class QueryEngine(object):
 class Query(object):
 	db      = None
 	qengine = None
+	qwriter = None
 
 	def __init__(self, db, query, locals = {}):
 		self.db		 = db
 		self.qengine = QueryEngine(db, query, locals=locals)
 
-	def execute(self, kernels, bounds=None, include_cached=False, cells=[], testbounds=True, nworkers=None, progress_callback=None, yield_empty=False):
+		(_, _, _, into_clause) = qp.parse(query)
+		if into_clause:
+			self.qwriter = IntoWriter(db, into_clause, locals)
+
+	def execute(self, kernels, bounds=None, include_cached=False, cells=[], testbounds=True, nworkers=None, progress_callback=None, _yield_empty=False):
 		""" A MapReduce implementation, where rows from individual cells
 		    get mapped by the mapper, with the result reduced by the reducer.
 		    
@@ -853,8 +937,9 @@ class Query(object):
 		kernels = list(kernels)
 		kernels[0] = (_mapper, kernels[0], self.qengine, include_cached)
 
-		# Create the destination for INTO queries (if needed)
-		self.qengine.create_into_catalog()
+		# Append a writer mapper if the query has an INTO clause
+		if self.qwriter:
+			kernels.append((_into_writer, self.qwriter))
 
 		# start and run the workers
 		pool = pool2.Pool(nworkers)
@@ -864,10 +949,14 @@ class Query(object):
 			yielded = True
 
 		# Yield an empty row, if requested
-		if not yielded and yield_empty:
-			yield self.qengine.peek()
+		# WARNING: This is NOT a flag designed for use by users -- it is only to be used from .fetch()!
+		if not yielded and _yield_empty:
+			if self.qwriter:
+				yield self.qwriter.peek()
+			else:
+				yield self.qengine.peek()
 
-	def iterate(self, bounds=None, include_cached=False, cells=[], return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None, yield_empty=False):
+	def iterate(self, bounds=None, include_cached=False, cells=[], return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None, _yield_empty=False):
 		""" Yield rows (either on a row-by-row basis if return_blocks==False
 		    or in chunks (numpy structured array)) within a
 		    given footprint. Calls 'filter' callable (if given) to filter
@@ -879,10 +968,10 @@ class Query(object):
 
 		mapper = filter if filter is not None else _iterate_mapper
 
-		for rows in self.execute(
+		for (cell_id, rows) in self.execute(
 				[mapper], bounds, include_cached,
 				cells=cells, testbounds=testbounds, nworkers=nworkers, progress_callback=progress_callback,
-				yield_empty=yield_empty):
+				_yield_empty=_yield_empty):
 			if return_blocks:
 				yield rows
 			else:
@@ -915,7 +1004,7 @@ class Query(object):
 		for rows in self.iterate(
 				bounds, include_cached,
 				cells=cells, return_blocks=True, filter=filter, testbounds=testbounds,
-				yield_empty=True,
+				_yield_empty=True,
 				nworkers=nworkers, progress_callback=progress_callback):
 			# ensure enough memory has been allocated (and do it
 			# intelligently if not)
@@ -953,6 +1042,19 @@ class DB(object):
 			raise Exception('"%s" is not an acessible directory.' % (path))
 
 		self.catalogs = dict()	# A cache of catalog instances
+
+	@contextmanager
+	def lock(self, retries=-1):
+		""" Lock the database for reading/writing """
+		# create a lock file
+		lockfile = self.path + '/dblock.lock'
+		utils.shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, lockfile) )
+
+		# yield self
+		yield self
+
+		# unlock
+		os.unlink(lockfile)
 
 	def resolve_uri(self, uri):
 		""" Resolve the given URI into something that can be
@@ -1223,15 +1325,6 @@ def _cache_maker_reducer(kv, db, cat_path):
 ###############################################################
 # Aux. functions implementing Query.iterate() and
 # Query.fetch()
-def _iterate_mapper(qresult):
-	for rows in qresult:
-		if len(rows):	# Don't return empty sets
-#			print qresult.bounds
-#			bounds = qresult.root.cat.pix.cell_bounds(qresult.cell_id)
-#			(x, y) = bhpix.proj_bhealpix(rows['_LON'], rows['_LAT'])
-#			print "INSIDE:", bounds[0].isInsideV(x, y), bounds[1].isInside(rows['mjd_obs'])
-			yield rows
-
 class CatProxy:
 	coldict = None
 	prefix = None
@@ -1243,15 +1336,25 @@ class CatProxy:
 	def __getattr__(self, name):
 		return self.coldict[self.prefix + '.' + name]
 
-def _mapper(partspec, mapper, qengine, include_cached, _pass_empty=False):
+def _mapper(partspec, mapper, qengine, include_cached):
 	(cell_id, bounds) = partspec
 	mapper, mapper_args = utils.unpack_callable(mapper)
 
 	# Pass on to mapper (and yield its results)
 	qresult = qengine.on_cell(cell_id, bounds, include_cached)
 	for result in mapper(qresult, *mapper_args):
-		result = qresult.eval_into(result)
 		yield result
+
+def _iterate_mapper(qresult):
+	for rows in qresult:
+		if len(rows):	# Don't return empty sets. TODO: Do we need this???
+			yield (rows.cell_id, rows)
+
+def _into_writer(kw, qwriter):
+	cell_id, irows = kw
+	for rows in irows:
+		rows = qwriter.write(cell_id, rows)
+		yield rows
 
 ###############################
 
