@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 	Common tasks needed when dealing with survey datasets.
 """
@@ -229,5 +230,49 @@ def xmatch(db, cat_from_dir, cat_to_dir, radius=1./3600.):
 				assert nfrom == nmatch
 
 	print "Matched a total of %d sources." % (ntot)
+
+###################################################################
+
+def _accumulator(qresult, key, val, oval):
+	from collections import defaultdict
+
+	static_cell = None
+
+	accum = defaultdict(list)
+	for rows in qresult:
+		kdtype = rows[key].dtype
+		vdtype = rows[val].dtype
+		cell_id = rows.cell_id
+
+		if static_cell == None:
+			static_cell = qresult.pix.static_cell_for_cell(cell_id)
+		else:
+			assert qresult.pix.static_cell_for_cell(cell_id) == static_cell
+
+		for k, v in izip(rows[key], rows[val]):
+			accum[k].append(v)
+
+	if accum:
+		# Convert to jagged object array
+		keys = np.fromiter(accum.iterkeys(), dtype=kdtype, count=len(accum))
+		vals = np.empty(len(accum), dtype=object)
+		for (i, v) in enumerate(accum.itervalues()):
+			vals[i] = np.array(v, dtype=vdtype)
+#			vals[i] = v
+
+		# Return it as a Table(), keyed to this static cell_id
+		yield static_cell, Table([(key, keys), (oval, vals)])
+
+if __name__ == '__main__':
+	from join_ops import DB
+	db = DB('db2')
+	q = db.query("obj_id, ap_mag, filterid FROM obj, det WHERE filterid == 'y.0000' INTO magbase")
+	for rows in q.execute([(_accumulator, 'obj_id', 'ap_mag', 'ap_mag')], group_by_static_cell=True):
+		print len(rows)
+#	for static_cell, rows in q.execute([(_accumulator, 'obj_id', 'ap_mag', 'ap_mag')], group_by_static_cell=True):
+#		print static_cell, type(rows), len(rows)
+#		(key, val) = rows.as_columns()
+#		for k, v in izip(key, val):
+#			print k, v
 
 ###################################################################

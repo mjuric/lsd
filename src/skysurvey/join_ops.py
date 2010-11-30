@@ -12,6 +12,8 @@ import sys
 import copy
 import urlparse
 from contextlib import contextmanager
+from collections import defaultdict
+from intervalset import intervalset
 
 #
 # The result is a J = Table() with id, idx, isnull columns for each joined catalog
@@ -82,7 +84,7 @@ class TableCache:
 		# will not be cached.
 
 		if cat.columns[name].is_blob:
-			include_cached = self.include_cached if self.root and cat.name == self.root_name else True
+			include_cached = self.include_cached if cat.name == self.root_name else True
 			col = cat.fetch_blobs(cell_id, column=name, refs=col, include_cached=include_cached)
 
 		return col
@@ -114,6 +116,14 @@ class CatalogEntry:
 		# Fetch our populated cells
 		pix = self.cat.pix
 		cells = self.cat.get_cells(bounds, return_bounds=True)
+
+		# Autodetect if we're a static or temporal catalog
+		self.static = True
+		for cell_id in cells:
+			if self.cat.pix.is_temporal_cell(cell_id):
+				self.static = False
+				break
+		#print self.cat.name, ":", self.static
 
 		# Fetch the children's populated cells
 		for ce in self.joins:
@@ -177,7 +187,7 @@ class CatalogEntry:
 		      -- If the col[<catname>] would be == col, there'll be no
 		         <catname> column.
 		"""
-		hasBounds = bounds != [(None, None)]
+		hasBounds = bounds != [(None, None)] and bounds != [(None, intervalset((-np.inf, np.inf)))]
 		if len(bounds) > 1:
 			pass;
 		# Skip everything if this is a single-table read with no bounds
@@ -761,7 +771,7 @@ class IntoWriter(object):
 		if kind == 'append':
 			rows.add_column('_ID', cell_id, 'u8')
 			ids = cat.append(rows)
-		elif kind == 'update':
+		elif kind in ['update/ignore', 'update/insert']:
 			# Evaluate the key expression
 			globals_ = self.prep_globals()
 			vals = eval(keyexpr, globals_, self)
@@ -771,12 +781,18 @@ class IntoWriter(object):
 			id = self._find_into_dest_rows(cell_id, cat, into_col, vals)
 			if cat.primary_key.name not in rows:
 				rows.add_column('_ID', id)
+				key = _ID
 			else:
-				assert np.all(rows[cat.primary_key.name] == id)
+				assert np.all(rows[cat.primary_key.name][id != 0] == id[id != 0])
 				rows[cat.primary_key.name] = id
+				key = cat.primary_key.name
 
-			# Remove rows that don't exist, and update existing
-			rows = rows[id != 0]
+			if kind == 'update/ignore':
+				# Remove rows that don't exist, and update existing
+				rows = rows[id != 0]
+			else:
+				# Append the rows that don't exist.
+				rows[key][id == 0] = cell_id
 			ids = cat.append(rows, _update=True)
 #			print rows['_ID'], ids
 
@@ -814,8 +830,8 @@ class IntoWriter(object):
 		with db.lock():
 			if db.catalog_exists(catname):
 				# Must have a designated key for updating to work
-				if into_col is None:
-					raise Exception('If selecting into an existing catalog (%s), you must specify the column with IDs that will be updated (" ... INTO ... AT keycol") construct).' % catname)
+#				if into_col is None:
+#					raise Exception('If selecting into an existing catalog (%s), you must specify the column with IDs that will be updated (" ... INTO ... AT keycol") construct).' % catname)
 
 				cat = db.catalog(catname)
 
@@ -824,6 +840,10 @@ class IntoWriter(object):
 					rname = cat.resolve_alias(name)
 					if rname not in cat.columns:
 						schema['columns'].append((name, utils.str_dtype(dtype[name])))
+
+				# Disallow creating new columns
+				if into_col is None and schema['columns']:
+					raise Exception('If selecting into an existing catalog (%s) with no INTO ... WHERE clause, all columns present in the query must already exist in the catalog' % catname)
 			else:
 				# Creating a new catalog
 				cat = db.catalog(catname, True)
@@ -855,12 +875,13 @@ class IntoWriter(object):
 						break
 				cat.create_table(tname, schema)
 
-		#print "XXX:", tname, schema; exit()
+		##print "XXX:", tname, schema;# exit()
 		return cat
 
 class QueryEngine(object):
+	# These are a part of the mappers' public API
 	db       = None		# The controlling database instance
-
+	pix      = None         # Pixelization object (TODO: this should be moved to class DB)
 	catalogs = None		# A name:Catalog dict() with all the catalogs listed on the FROM line.
 	root	 = None		# CatalogEntry instance with the primary (root) catalog
 	query_clauses  = None	# Parsed query clauses
@@ -879,8 +900,25 @@ class QueryEngine(object):
 
 		self.locals = locals
 
+		# Aux variables that mappers can access
+		self.pix = self.root.cat.pix
+
 	def on_cell(self, cell_id, bounds=None, include_cached=False):
 		return QueryInstance(self, cell_id, bounds, include_cached)
+
+	def on_cells(self, partspecs, include_cached=False):
+		# Set up the args for __iter__
+		self._partspecs = partspecs
+		self._include_cached = include_cached
+		return self
+
+	def __iter__(self):
+		# Generate a single stream of row blocks for a list of cells+bounds
+		partspecs, include_cached = self._partspecs, self._include_cached
+
+		for cell_id, bounds in partspecs:
+			for rows in QueryInstance(self, cell_id, bounds, include_cached):
+				yield rows
 
 	def peek(self):
 		return QueryInstance(self, None, None, None).peek()
@@ -898,7 +936,7 @@ class Query(object):
 		if into_clause:
 			self.qwriter = IntoWriter(db, into_clause, locals)
 
-	def execute(self, kernels, bounds=None, include_cached=False, cells=[], testbounds=True, nworkers=None, progress_callback=None, _yield_empty=False):
+	def execute(self, kernels, bounds=None, include_cached=False, cells=[], group_by_static_cell=False, testbounds=True, nworkers=None, progress_callback=None, _yield_empty=False):
 		""" A MapReduce implementation, where rows from individual cells
 		    get mapped by the mapper, with the result reduced by the reducer.
 		    
@@ -922,18 +960,49 @@ class Query(object):
 		    return value of the mapper is passed to the user.
 		"""
 		partspecs = dict()
+
 		# Add explicitly requested cells
 		for cell_id in cells:
 			partspecs[cell_id] = [(None, None)]
+
 		# Add cells within bounds
 		if len(cells) == 0 or bounds is not None:
 			partspecs.update(self.qengine.root.get_cells(bounds))
 
-		# tell _mapper not to test spacetime boundaries if the user requested so
+		# Tell _mapper not to test spacetime boundaries if the user requested so
 		if not testbounds:
-			partspecs = dict([ (part_id, None) for (part_id, _) in partspecs ])
+			partspecs = dict([ (cell_id, None) for (cell_id, _) in partspecs.iteritems() ])
 
-		# Insert our mapper into the kernel chain
+		# Reorganize cells to a per-static-cell basis, if requested
+		if group_by_static_cell:
+			pix = self.qengine.root.cat.pix
+			p2 = defaultdict(list)
+			for cell_id, bounds in partspecs.iteritems():
+				if pix.is_temporal_cell(cell_id):
+					cell_id2 = pix.static_cell_for_cell(cell_id)
+				else:
+					cell_id2 = cell_id
+				p2[cell_id2].append((cell_id, bounds))
+			partspecs = p2
+
+			# Resort by time, but make the static cell (if any) be at the end
+			def order_by_time(part):
+				cell_id, _ = part
+				_, _, t = pix._xyt_from_cell_id(cell_id)
+				if t == pix.t0:
+					t = +np.inf
+				return t
+			for cell_id, parts in partspecs.iteritems():
+				parts.sort(key=order_by_time)
+
+			#for cell_id, parts in partspecs.iteritems():
+			#	parts = [ pix._xyt_from_cell_id(cell_id)[2] for cell_id, _ in parts ]
+			#	print cell_id, parts
+			#exit()
+		else:
+			partspecs = dict([ (cell_id, [(cell_id, bounds)]) for (cell_id, bounds) in partspecs.iteritems() ])
+
+		# Insert our feeder mapper into the kernel chain
 		kernels = list(kernels)
 		kernels[0] = (_mapper, kernels[0], self.qengine, include_cached)
 
@@ -1337,11 +1406,11 @@ class CatProxy:
 		return self.coldict[self.prefix + '.' + name]
 
 def _mapper(partspec, mapper, qengine, include_cached):
-	(cell_id, bounds) = partspec
+	(group_cell_id, cell_list) = partspec
 	mapper, mapper_args = utils.unpack_callable(mapper)
 
 	# Pass on to mapper (and yield its results)
-	qresult = qengine.on_cell(cell_id, bounds, include_cached)
+	qresult = qengine.on_cells(cell_list, include_cached)
 	for result in mapper(qresult, *mapper_args):
 		yield result
 

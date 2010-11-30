@@ -116,9 +116,12 @@ def parse(query):
 								# WHERE xx = expr construct
 								(_, into_col, _, _, _) = next(g)	# column against which to mach in the INTO table
 								(_, token, _, _, _) = next(g)	# must be '='
-								if token != '==':
+								if token == '==':
+									kind = 'update/ignore'	# update if exists, ignore otherwise
+								elif token == '|=':
+									kind = 'update/insert' # update if exists, insert otherwise
+								else:
 									raise Exception('Syntax error in INTO clause near "%s" (expected "==")', token)
-								kind = 'update'
 							else:
 								# AT expr construct
 								into_col = '_ID'

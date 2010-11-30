@@ -34,8 +34,8 @@ class RowIter:
 
 		for i, name in enumerate(self.column_map):
 			val = self.column_data[i][self.at]
-			# Special care for vector columns
-			if isinstance(val, np.ndarray):
+			# Special care for multidimensional columns
+			if isinstance(val, np.ndarray) and self.row.dtype[name] != object:
 				self.row[name][:] = val
 			else:
 				self.row[name] = val

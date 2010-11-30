@@ -764,10 +764,13 @@ class Catalog:
 				# the rows, every time (even when updating).
 				for colname in colsB:
 					# BLOB column - find unique objects, insert them
-					# into the BLOB VLArray, and put the indices to these
+					# into the BLOB VLArray, and put the indices to those
 					# into the actual table
 					assert colsB[colname].dtype == object
-					uobjs, _, ito = np.unique(colsB[colname], return_index=True, return_inverse=True)	# Note: implicitly flattens multi-D input arrays
+					flatB = colsB[colname].reshape(colsB[colname].size)
+					idents = np.fromiter(( id(v) for v in flatB ), dtype=np.uint64, count=len(colsB[colname]))
+					_, idx, ito = np.unique(idents, return_index=True, return_inverse=True)	# Note: implicitly flattens multi-D input arrays
+					uobjs = flatB[idx]
 					ito = ito.reshape(rows[colname].shape)	# De-flatten the output indices
 
 					# Offset indices
