@@ -674,9 +674,13 @@ class IntoWriter(object):
 	pix = None
 	cat = None
 
-	def __init__(self, db, into_clause, locals):
+	def __init__(self, db, into_clause, locals = {}):
 		# This handles INTO clauses. Stores the data into
 		# destination catalog, returning the IDs of stored rows.
+		if isinstance(into_clause, str):
+			query = "_ FROM _ INTO %s" % into_clause
+			_, _, _, into_clause = qp.parse(query)
+
 		self.db          = db
 		self.into_clause = into_clause
 		self.locals      = locals
@@ -727,6 +731,9 @@ class IntoWriter(object):
 		into_col = cat.resolve_alias(into_col)
 		col = self.tcache.load_column(cell_id, into_col, cat, autoexpand=False, resolve_blobs=True)
 #		print "XX:", col, vals;
+
+		if len(col) == 0:
+			return np.zeros(len(vals), dtype=np.uint64)
 
 		# Find corresponding rows
 		ii = col.argsort()
@@ -781,18 +788,18 @@ class IntoWriter(object):
 			id = self._find_into_dest_rows(cell_id, cat, into_col, vals)
 			if cat.primary_key.name not in rows:
 				rows.add_column('_ID', id)
-				key = _ID
+				key = '_ID'
 			else:
-				assert np.all(rows[cat.primary_key.name][id != 0] == id[id != 0])
-				rows[cat.primary_key.name] = id
 				key = cat.primary_key.name
+				assert np.all(rows[key][id != 0] == id[id != 0])
+				#rows[key] = id
 
 			if kind == 'update/ignore':
 				# Remove rows that don't exist, and update existing
 				rows = rows[id != 0]
 			else:
-				# Append the rows that don't exist.
-				rows[key][id == 0] = cell_id
+				# Append the rows whose IDs are unspecified
+				rows[key][ rows[key] == 0 ] = cell_id
 			ids = cat.append(rows, _update=True)
 #			print rows['_ID'], ids
 
@@ -826,7 +833,10 @@ class IntoWriter(object):
 
 		db = self.db
 		dtype = self.rows.dtype
-		schema = { 'columns': [] }
+		schema = {
+			'columns': [],
+			'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+		}
 		with db.lock():
 			if db.catalog_exists(catname):
 				# Must have a designated key for updating to work
@@ -853,10 +863,11 @@ class IntoWriter(object):
 				
 				# If key is specified, and is a column name from self.rows, name the primary
 				# key after it
-				if keyexpr is not None and keyexpr in self.rows:
-					schema['primary_key'] = keyexpr
-				else:
-					schema['primary_key'] = '_id'
+				#if keyexpr is not None and keyexpr in self.rows:
+				#	schema['primary_key'] = keyexpr
+				#else:
+				#	schema['primary_key'] = '_id'
+				schema['primary_key'] = '_id'
 
 			# Adding columns starting with '_' is prohibited. Enforce it here
 			for (col, _) in schema['columns']:

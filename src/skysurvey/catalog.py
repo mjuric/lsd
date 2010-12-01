@@ -414,8 +414,20 @@ class Catalog:
 					filters          = blobdef.get('filters', filters)
 					expectedsizeinMB = blobdef.get('expectedsizeinMB', 1.0)
 
-					fp.createVLArray('/' + group +'/blobs', blobcol, BLOBAtom(), "BLOBs", createparents=True, filters=tables.Filters(**filters), expectedsizeinMB=expectedsizeinMB)
-					getattr(g.blobs, blobcol).append(None)	# ref=0 always points to None
+					# Decide what type of VLArray to create
+					type = blobdef.get('type', 'object')
+					if type == 'object':
+						atom = BLOBAtom()
+					else:
+						atom = tables.Atom.from_dtype(np.dtype(type))
+
+					fp.createVLArray('/' + group +'/blobs', blobcol, atom, "BLOBs", createparents=True, filters=tables.Filters(**filters), expectedsizeinMB=expectedsizeinMB)
+					
+					b = getattr(g.blobs, blobcol)
+					if isinstance(atom, BLOBAtom):
+						b.append(None)	# ref=0 always points to None (for BLOBs)
+					else:
+						b.append([]) # ref=0 points to an empty array for other BLOB types
 		return g
 
 	def drop_row_group(self, cell_id, group):
@@ -679,7 +691,7 @@ class Catalog:
 					id0 = id_seq[0] = max(id_seq[0], np.max(i)+1)
 
 					if not i.all():
-						assert not _update, "Shouldn't pass here"
+						#assert not _update, "Shouldn't pass here"
 						assert cell_id is None
 						need_keys = i == 0
 						nnk = need_keys.sum()
@@ -728,11 +740,14 @@ class Catalog:
 					# Resolve blobs, merge them with ours (and immediately delete)
 					for colname in colsB:
 						bb = self._fetch_blobs_fp(fp, colname, rows[colname])
-						bb = np.resize(bb, (len(rows) + nnew,) + bb.shape[1:])
+						len0 = len(bb)
+						bb = np.resize(bb, (nrows + nnew,) + bb.shape[1:])
+						# Since np.resize fills the newly allocated part with zeros, change it to None
+						bb[len0:] = None
 						bb[idx] = colsB[colname]
 						colsB[colname] = bb
 
-						getattr(g.blobs, colname).truncate(1) # Leave 'None' BLOB
+						getattr(g.blobs, colname).truncate(1) # Leave the 'None' BLOB
 
 					# Close and reopen (otherwise truncate appears to have no effect)
 					# -- bug in PyTables ??
@@ -794,6 +809,8 @@ class Catalog:
 
 					# Do the storing
 					for obj in uobjs:
+						if obj is None and not isinstance(barray.atom, tables.ObjectAtom):
+							obj = []
 						barray.append(obj)
 
 #					print 'LEN:', colname, bsize, len(barray), ito

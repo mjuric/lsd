@@ -10,6 +10,7 @@ import bhpix
 import catalog
 from utils import as_columns, gnomonic, gc_dist, unpack_callable
 from table import Table
+from join_ops import IntoWriter
 
 ###################################################################
 ## Sky-coverage computation
@@ -235,6 +236,8 @@ def xmatch(db, cat_from_dir, cat_to_dir, radius=1./3600.):
 
 def _accumulator(qresult, key, val, oval):
 	from collections import defaultdict
+#	yield 0, [1]
+#	return
 
 	static_cell = None
 
@@ -263,12 +266,30 @@ def _accumulator(qresult, key, val, oval):
 		# Return it as a Table(), keyed to this static cell_id
 		yield static_cell, Table([(key, keys), (oval, vals)])
 
+def _accumulate_and_write(qresult, qwriter, key, val, oval):
+	for static_cell, rows in _accumulator(qresult, key, val, oval):
+		result = qwriter.write(static_cell, rows)
+		yield result
+#		yield 0, [1, 2]
+
 if __name__ == '__main__':
 	from join_ops import DB
+	ntot = 0
 	db = DB('db2')
-	q = db.query("obj_id, ap_mag, filterid FROM obj, det WHERE filterid == 'y.0000' INTO magbase")
-	for rows in q.execute([(_accumulator, 'obj_id', 'ap_mag', 'ap_mag')], group_by_static_cell=True):
-		print len(rows)
+	writer = IntoWriter(db, "magbase WHERE obj_id |= obj_id")
+	for band in 'grizy':
+#	for band in 'g':
+		nband = 0
+		q = db.query("obj_id, ap_mag, filterid FROM obj, det WHERE filterid == '%s.0000'" % band)
+		for static_cell, rows in q.execute([(_accumulate_and_write, writer, 'obj_id', 'ap_mag', band)], group_by_static_cell=True):
+			nband += len(rows)
+##		q = db.query("obj_id, ap_mag, filterid FROM obj, det WHERE filterid == 'y.0000' INTO magbase")
+##		for static_cell, rows in q.execute([(_accumulator, 'obj_id', 'ap_mag', 'ap_mag')], group_by_static_cell=True):
+##			nband += len(rows)
+		ntot += nband
+		print "%s objects in band %s" % (nband, band)
+	db.compute_summary_stats('magbase')
+	print "%s insertions for %s objects." % (ntot, db.catalog('magbase').nrows())
 #	for static_cell, rows in q.execute([(_accumulator, 'obj_id', 'ap_mag', 'ap_mag')], group_by_static_cell=True):
 #		print static_cell, type(rows), len(rows)
 #		(key, val) = rows.as_columns()

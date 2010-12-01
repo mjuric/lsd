@@ -78,7 +78,7 @@ def parse(query):
 								(_, astable, _, _, _) = next(g)
 								(_, token, _, _, _) = next(g)		# next token
 								break
-							elif token.lower() in ['', ',', 'where']:
+							elif token.lower() in ['', ',', 'where', 'into']:
 								break
 
 						from_clause += [ (astable, table, join_type) ]
@@ -174,9 +174,10 @@ if __name__ == '__main__':
 	}
 #	print parse("sdss.ra as ra, sdss.dec FROM sdss AS s")
 #	exit()
+	(select_clause, where_clause, from_clause, into_clause) = parse("_ from _ into exp2 where aa |= bb");
 #	(select_clause, where_clause, from_clause, into_clause) = parse("* from exp where _TIME < 55248.25 into exp2");
 #	(select_clause, where_clause, from_clause, into_clause) = parse("*, sdss.* FROM '/w sdss' as sx WHERE aa == bb INTO blabar(i4,f8) WHERE _ID == sdss._ID");
-	(select_clause, where_clause, from_clause, into_clause) = parse("*, sdss.* FROM '/w sdss' as sx WHERE aa == bb INTO blabar(i4,f8)");
+#	(select_clause, where_clause, from_clause, into_clause) = parse("*, sdss.* FROM '/w sdss' as sx WHERE aa == bb INTO blabar(i4,f8)");
 	print (select_clause, where_clause, from_clause, into_clause)
 	print resolve_wildcards(select_clause, tablecols)
 	exit()
