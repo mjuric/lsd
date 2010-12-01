@@ -907,9 +907,10 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			# pixelation of the catalog later on, this will
 			# allow us to correctly split up the join table as
 			# well.
-			_, _, t    = pix._xyt_from_cell_id(det_cell)	# This row points to a detection in the temporal cell ...
-			x, y, _, _ = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
-			join['_ID'][:] = pix._id_from_xyti(x, y, t, 0) # This will make the new IDs have zeros in the object part (so Catalog.append will autogen them)
+			#_, _, t    = pix._xyt_from_cell_id(det_cell)	# This row points to a detection in the temporal cell ...
+			#x, y, _, _ = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
+			#join['_ID'][:] = pix._id_from_xyti(x, y, t, 0) # This will make the new IDs have zeros in the object part (so Catalog.append will autogen them)
+			join['_ID'][:] = det_cell
 
 			o2d_cat.append(join)
 

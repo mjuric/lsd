@@ -135,8 +135,9 @@ def _xmatch_mapper(qresult, cat_to_dir, radius, xm_catdir):
 			# pixelation of the catalog later on, this will
 			# allow us to correctly repixelize the join table as
 			# well.
-			x, y, t, _  = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
-			join['_ID'] = pix._id_from_xyti(x, y, t, 0)     # This will make the new IDs have zeros in the object part (so Catalog.append will autogen them)
+			#x, y, t, _  = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
+			#join['_ID'] = pix._id_from_xyti(x, y, t, 0)     # This will make the new IDs have zeros in the object part (so Catalog.append will autogen them)
+			join['_ID'] = pix.cell_for_id(join['_M1'])
 
 			# TODO: Debugging, remove when happy
 			cid = np.unique(pix.cell_for_id(join['_ID']))

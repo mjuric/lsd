@@ -1032,9 +1032,9 @@ class Query(object):
 		# WARNING: This is NOT a flag designed for use by users -- it is only to be used from .fetch()!
 		if not yielded and _yield_empty:
 			if self.qwriter:
-				yield self.qwriter.peek()
+				yield 0, self.qwriter.peek()
 			else:
-				yield self.qengine.peek()
+				yield 0, self.qengine.peek()
 
 	def iterate(self, bounds=None, include_cached=False, cells=[], return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None, _yield_empty=False):
 		""" Yield rows (either on a row-by-row basis if return_blocks==False

@@ -27,7 +27,6 @@ if len(args) != 3:
 dbdir, table, output = args
 
 bounds = None
-output = 'footprint.fits'
 query = '_LON, _LAT FROM "%s"' % table
 dx = 2.
 for o, a in optlist:
