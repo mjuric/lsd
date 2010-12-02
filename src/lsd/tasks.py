@@ -62,35 +62,34 @@ def compute_coverage(db, query, dx = 0.5, bounds=None, include_cached=False, fil
 ###################################################################
 
 ###################################################################
-## Count the number of objects in the entire catalog
+## Count the number of objects in the table
 def ls_mapper(qresult):
 	# return the number of rows in this chunk, keyed by the filename
 	for rows in qresult:
 		yield rows.cell_id, len(rows)
 
-def compute_counts(db, cat, include_cached=False):
+def compute_counts(db, table, include_cached=False):
 	ntotal = 0
-	for (_, nobjects) in db.query("_ID FROM '%s'" % cat).execute([ls_mapper], include_cached=include_cached):
+	for (_, nobjects) in db.query("_ID FROM %s" % table).execute([ls_mapper], include_cached=include_cached):
 		ntotal = ntotal + nobjects
 	return ntotal
 ###################################################################
 
 ###################################################################
-## Cross-match two catalogs
+## Cross-match two tables
 
-def _xmatch_mapper(qresult, cat_to_dir, radius, xm_catdir):
+def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm):
 	"""
 	    Mapper:
 	    	- given all objects in a cell, make an ANN tree
-	    	- load all objects in cat_to (including neighbors), make an ANN tree, find matches
+	    	- load all objects in tabname_to (including neighbors), make an ANN tree, find matches
 	    	- store the output into an index table
 	"""
 	from scikits.ann import kdtree
 
-	db     = qresult.db
-	pix    = qresult.pix
-	cat_to = db.catalog(cat_to_dir)
-	cat_xm = db.catalog(xm_catdir)
+	db       = qresult.db
+	pix      = qresult.pix
+	table_xm = db.table(tabname_xm)
 
 	for rows in qresult:
 		cell_id  = rows.cell_id
@@ -98,7 +97,7 @@ def _xmatch_mapper(qresult, cat_to_dir, radius, xm_catdir):
 		join = ColGroup()
 
 		(id1, ra1, dec1) = rows.as_columns()
-		(id2, ra2, dec2) = db.query('_ID, _LON, _LAT FROM %s' % cat_to_dir).fetch_cell(cell_id, include_cached=True).as_columns()
+		(id2, ra2, dec2) = db.query('_ID, _LON, _LAT FROM %s' % tabname_to).fetch_cell(cell_id, include_cached=True).as_columns()
 
 		if len(id2) != 0:
 			# Project to tangent plane around the center of the cell. We
@@ -109,8 +108,8 @@ def _xmatch_mapper(qresult, cat_to_dir, radius, xm_catdir):
 			xy1 = np.column_stack(gnomonic(ra1, dec1, clon, clat))
 			xy2 = np.column_stack(gnomonic(ra2, dec2, clon, clat))
 
-			# Construct kD-tree to find an object in cat_to that is nearest
-			# to an object in cat_from, for every object in cat_from
+			# Construct kD-tree to find an object in table_to that is nearest
+			# to an object in table_from, for every object in table_from
 			tree = kdtree(xy2)
 			match_idx, match_d2 = tree.knn(xy1, 1)
 			del tree
@@ -131,11 +130,13 @@ def _xmatch_mapper(qresult, cat_to_dir, radius, xm_catdir):
 			# IDs. While this is unimportant now (as we could
 			# just set all of them equal to cell_id part of
 			# cell_id), if we ever decide to change the
-			# pixelation of the catalog later on, this will
+			# pixelation of the table later on, this will
 			# allow us to correctly repixelize the join table as
 			# well.
-			#x, y, t, _  = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
+			#x, y, t, _  = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object table.
 			#join['_ID'] = pix._id_from_xyti(x, y, t, 0)     # This will make the new IDs have zeros in the object part (so Table.append will autogen them)
+			
+			# TODO: Allow the stuff above (in Table.append)
 			join['_ID'] = pix.cell_for_id(join['_M1'])
 
 			# TODO: Debugging, remove when happy
@@ -144,26 +145,26 @@ def _xmatch_mapper(qresult, cat_to_dir, radius, xm_catdir):
 			assert cid[0] == cell_id, '%s %s' % (cid[0], cell_id)
 			####
 
-			cat_xm.append(join)
+			table_xm.append(join)
 
 			yield len(id1), len(id2), len(join)
 		else:
 			yield len(rows), 0, 0
 
-xm_cat_def = \
+xm_table_def = \
 {
 	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
 	'schema': {
 		'main': {
 			'columns': [
 				('xm_id',		'u8', '', 'Unique ID of this row'),
-				('m1',			'u8', '', 'ID in catalog one'),
-				('m2',			'u8', '', 'ID in catalog two'),
+				('m1',			'u8', '', 'ID in table one'),
+				('m2',			'u8', '', 'ID in table two'),
 				('dist',		'f4', '', 'Distance (in degrees)'),
 				# Not strictly necessary, but useful for creation of neighbor cache (needed for joins agains M2 table)
 				# TODO: split this off into a separate column group
-				('ra',			'f8', '', 'Position from catalog two'),
-				('dec',			'f8', '', 'Position from catalog two'),
+				('ra',			'f8', '', 'Position from table two'),
+				('dec',			'f8', '', 'Position from table two'),
 			],
 			'primary_key': 'xm_id',
 			'spatial_keys': ('ra', 'dec'),
@@ -176,58 +177,56 @@ xm_cat_def = \
 	}
 }
 
-def xmatch(db, cat_from_dir, cat_to_dir, radius=1./3600.):
-	""" Cross-match objects from cat_to with cat_from catalog and
-	    store the result into a cross-match table in cat_from.
+def xmatch(db, tabname_from, tabname_to, radius=1./3600.):
+	""" Cross-match objects from tabname_to with tabname_from table and
+	    store the result into a cross-match table in tabname_from.
 
 	    Typical usage:
 	    	xmatch(db, ps1_obj, sdss_obj)
 
 	   Note:
 	        - No attempt is being made to force the xmatch result to be a
-	          one-to-one map. In particular, more than one object from cat_from
-	          may be mapped to a same object in cat_to
+	          one-to-one map. In particular, more than one object from tabname_from
+	          may be mapped to a same object in tabname_to
 	"""
-	# Create the x-match table and setup the JOIN relationship
+	tabname_xm = '_%s_to_%s' % (tabname_from, tabname_to)
 
-	xm_catdir = '_%s_to_%s' % (cat_from_dir, cat_to_dir)
-
-	if not db.catalog_exists(xm_catdir):
+	if not db.table_exists(tabname_xm):
 		# Create the new linkage table if needed
-		xm_cat  = db.create_catalog(xm_catdir, xm_cat_def)
+		table_xm  = db.create_table(tabname_xm, xm_table_def)
 
-		if cat_from_dir != cat_to_dir: # If it's a self-join (useful only for debugging), setup no JOIN relations
-			# Set up a one-to-X join relationship between the two catalogs (join obj_cat:obj_id->det_cat:det_id)
-			db.define_default_join(cat_from_dir, cat_to_dir,
+		if tabname_from != tabname_to: # If it's a self-join (useful only for debugging), setup no JOIN relations
+			# Set up a one-to-X join relationship between the two tables (join obj_table:obj_id->det_table:det_id)
+			db.define_default_join(tabname_from, tabname_to,
 				type = 'indirect',
-				m1   = (xm_catdir, "m1"),
-				m2   = (xm_catdir, "m2")
+				m1   = (tabname_xm, "m1"),
+				m2   = (tabname_xm, "m2")
 			)
 
-			# Set up a join between the indirection table and cat_from (mostly for debugging)
-			db.define_default_join(cat_from_dir, xm_catdir,
+			# Set up a join between the indirection table and tabname_from (mostly for debugging)
+			db.define_default_join(tabname_from, tabname_xm,
 				type = 'indirect',
-				m1   = (xm_catdir, "m1"),
-				m2   = (xm_catdir, "xm_id")
+				m1   = (tabname_xm, "m1"),
+				m2   = (tabname_xm, "xm_id")
 			)
 
-			# Set up a join between the indirection table and cat_to (mostly for debugging)
-			db.define_default_join(cat_to_dir, xm_catdir,
+			# Set up a join between the indirection table and tabname_to (mostly for debugging)
+			db.define_default_join(tabname_to, tabname_xm,
 				type = 'indirect',
-				m1   = (xm_catdir, "m2"),
-				m2   = (xm_catdir, "xm_id")
+				m1   = (tabname_xm, "m2"),
+				m2   = (tabname_xm, "xm_id")
 			)
 
 	ntot = 0
-	for (nfrom, nto, nmatch) in db.query("_ID, _LON, _LAT from '%s'" % cat_from_dir).execute(
-					[ (_xmatch_mapper, cat_to_dir, radius, xm_catdir) ],
+	for (nfrom, nto, nmatch) in db.query("_ID, _LON, _LAT from '%s'" % tabname_from).execute(
+					[ (_xmatch_mapper, tabname_to, radius, tabname_xm) ],
 					progress_callback=pool2.progress_pass):
 		ntot += nmatch
 		if nfrom != 0 and nto != 0:
 			pctfrom = 100. * nmatch / nfrom
 			pctto   = 100. * nmatch / nto
 			print "  ===> %7d xmatch %7d -> %7d matched (%6.2f%%, %6.2f%%)" % (nfrom, nto, nmatch, pctfrom, pctto)
-			if cat_from_dir == cat_to_dir:	# debugging: sanity check when xmatching to self
+			if tabname_from == tabname_to:	# debugging: sanity check when xmatching to self
 				assert nfrom == nmatch
 
 	print "Matched a total of %d sources." % (ntot)
@@ -289,7 +288,7 @@ if __name__ == '__main__':
 		ntot += nband
 		print "%s objects in band %s" % (nband, band)
 	db.compute_summary_stats('magbase')
-	print "%s insertions for %s objects." % (ntot, db.catalog('magbase').nrows())
+	print "%s insertions for %s objects." % (ntot, db.table('magbase').nrows())
 #	for static_cell, rows in q.execute([(_accumulator, 'obj_id', 'ap_mag', 'ap_mag')], group_by_static_cell=True):
 #		print static_cell, type(rows), len(rows)
 #		(key, val) = rows.as_columns()

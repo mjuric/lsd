@@ -5,19 +5,14 @@ import pool2
 import time
 import numpy as np
 from slalib import sla_eqgal
-from itertools import imap, izip
-import copy
 import itertools as it
 import bhpix
 from utils import gnomonic, gc_dist
 from colgroup import ColGroup
 import sys, os
 
-# ra, dec, g, r, i, exposure.mjd_obs, chip.T XMATCH chip, exposure
-# ra, dec, g, r, i, hdr.ctype1 XMATCH exposure
-
-# Table defs for exposure catalog
-exp_cat_def = \
+# Table defs for exposure table
+exp_table_def = \
 {
 	'fgroups': {
 		'hdr': {
@@ -110,7 +105,7 @@ exp_cat_def = \
 	}
 }
 
-det_cat_def = \
+det_table_def = \
 {
 	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
 	'schema': {
@@ -120,7 +115,7 @@ det_cat_def = \
 		'astrometry': {
 			'columns': [
 				('det_id',		'u8', '',		'Unique LSD ID of this detection'),
-				('exp_id',		'u8', '',		'Exposure ID, joined to the image catalog'),
+				('exp_id',		'u8', '',		'Exposure ID, joined to the image table'),
 				('chip_id',		'u1', '',		'Index of the OTA where this object was detected (integer, 0-63)'),
 				('ra',			'f8', 'ra_psf',		''),
 				('dec',			'f8', 'dec_psf',	''),
@@ -204,7 +199,7 @@ det_cat_def = \
 	}
 }
 
-obj_cat_def = \
+obj_table_def = \
 {
 	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
 	'schema': {
@@ -225,7 +220,7 @@ obj_cat_def = \
 	}
 }
 
-o2d_cat_def = \
+o2d_table_def = \
 {
 	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
 	'schema': {
@@ -249,58 +244,57 @@ o2d_cat_def = \
 	}
 }
 
-def gen_cat2fits(catdef):
-	""" Returns a mapping from catalog columns to
+def gen_tab2fits(tabdef):
+	""" Returns a mapping from table columns to
 	    FITS columns:
 		
-		cat2fits[catcol] -> fitscol
+		tab2fits[tabcol] -> fitscol
 	"""
-	cat2fits = {}
+	tab2fits = {}
 
-	for tname, schema in catdef['schema'].iteritems():
-		cat2fits.update( dict(( (colname, fitscol) for colname, _, fitscol, _ in schema['columns'] if fitscol != '' )) )
+	for tname, schema in tabdef['schema'].iteritems():
+		tab2fits.update( dict(( (colname, fitscol) for colname, _, fitscol, _ in schema['columns'] if fitscol != '' )) )
 
-	return cat2fits
+	return tab2fits
 
-def gen_cat2type(catdef):
+def gen_tab2type(tabdef):
 	""" Returns a mapping from column name to dtype
 	"""
 	
-	cat2type = {}
-	for tname, schema in catdef['schema'].iteritems():
-		cat2type.update( dict(( (colname, dtype) for colname, dtype, _, _ in schema['columns'] )) )
+	tab2type = {}
+	for tname, schema in tabdef['schema'].iteritems():
+		tab2type.update( dict(( (colname, dtype) for colname, dtype, _, _ in schema['columns'] )) )
 		
-	return cat2type
+	return tab2type
 
-def import_from_smf(db, det_catname, exp_catname, smf_files, create=False):
-	""" Import a PS1 catalog from DVO
+def import_from_smf(db, det_tabname, exp_tabname, smf_files, create=False):
+	""" Import a PS1 table from DVO
 
-	    Note: Assumes underlying shared storage for all catalog
+	    Note: Assumes underlying shared storage for all table
 	          cells (i.e., any worker is able to write to any cell).
 	"""
 	if create:
 		# Create the new database
-		det_cat  = db.create_catalog(det_catname, det_cat_def)
-		exp_cat  = db.create_catalog(exp_catname, exp_cat_def)
+		det_table  = db.create_table(det_tabname, det_table_def)
+		exp_table  = db.create_table(exp_tabname, exp_table_def)
 
-		# Set up a one-to-X join relationship between the two catalogs (join det_cat:exp_id->exp_cat:exp_id)
-		db.define_default_join(det_catname, exp_catname,
+		# Set up a one-to-X join relationship between the two tables (join det_table:exp_id->exp_table:exp_id)
+		db.define_default_join(det_tabname, exp_tabname,
 			type = 'indirect',
-			m1   = (det_catname, "det_id"),
-			m2   = (det_catname, "exp_id")
+			m1   = (det_tabname, "det_id"),
+			m2   = (det_tabname, "exp_id")
 			)
 	else:
-		det_cat = db.catalog(det_catname)
-		exp_cat = db.catalog(exp_catname)
+		det_table = db.table(det_tabname)
+		exp_table = db.table(exp_tabname)
 
-	det_c2f = gen_cat2fits(det_cat_def)
-	exp_c2f = gen_cat2fits(exp_cat_def)
+	det_c2f = gen_tab2fits(det_table_def)
+	exp_c2f = gen_tab2fits(exp_table_def)
 
 	t0 = time.time()
 	at = 0; ntot = 0
 	pool = pool2.Pool()
-	for (file, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_cat, exp_cat, det_c2f, exp_c2f), progress_callback=pool2.progress_pass):
-	#for (file, nloaded, nin) in imap(lambda file: import_from_smf_aux(file, cat), smf_files):
+	for (file, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_table, exp_table, det_c2f, exp_c2f), progress_callback=pool2.progress_pass):
 		at = at + 1
 		ntot = ntot + nloaded
 		t1 = time.time()
@@ -365,9 +359,9 @@ def all_chips():
 
 		yield chip_id, chip_xy
 
-def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
-	det_c2t = gen_cat2type(det_cat_def)
-	exp_c2t = gen_cat2type(exp_cat_def)
+def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f):
+	det_c2t = gen_tab2type(det_table_def)
+	exp_c2t = gen_tab2type(exp_table_def)
 
 	# Load the .smf file
 	hdus = pyfits.open(file)
@@ -392,8 +386,8 @@ def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
 	exp_cols['smf_fn'][:] = fn
 
 	# Store the primary and all chip headers in external linked files
-	uri = 'lsd:%s:hdr:%s/primary.txt' % (exp_cat.name, fn)
-	with exp_cat.open_uri(uri, mode='w', clobber=False) as f:
+	uri = 'lsd:%s:hdr:%s/primary.txt' % (exp_table.name, fn)
+	with exp_table.open_uri(uri, mode='w', clobber=False) as f:
 		f.write(str(imhdr) + '\n')
 		exp_cols['hdr']	= np.array([uri], dtype=object)
 
@@ -411,8 +405,8 @@ def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
 		else:
 			hdr = hdus[i].header
 			
-			uri = 'lsd:%s:hdr:%s/%s.txt' % (exp_cat.name, fn, chip_xy)
-			with exp_cat.open_uri(uri, mode='w', clobber=False) as f:
+			uri = 'lsd:%s:hdr:%s/%s.txt' % (exp_table.name, fn, chip_xy)
+			with exp_table.open_uri(uri, mode='w', clobber=False) as f:
 				f.write(str(hdr) + '\n')
 				exp_cols['chip_hdr'][0][chip_id] = uri
 
@@ -461,31 +455,31 @@ def import_from_smf_aux(file, det_cat, exp_cat, det_c2f, exp_c2f):
 		at = at + len(det_cols['exp_id'])
 	assert at == nrows
 
-	(exp_id,) = exp_cat.append(exp_cols)
+	(exp_id,) = exp_table.append(exp_cols)
 	det_cols_all['exp_id'][:] = exp_id
 
-	ids = det_cat.append(det_cols_all)
+	ids = det_table.append(det_cols_all)
 
 	yield (file, len(ids), len(ids))
 
 #########
 
 # image cache creator kernels
-# 1) stream through entire detection catalog, recording exp_ids of images
+# 1) stream through entire detection table, recording exp_ids of images
 #    from other cells. Key these by their cell_id, our cell_id, and return.
-# 2) stream through the image catalog, collecting rows of images that are
+# 2) stream through the image table, collecting rows of images that are
 #    referenced out of their cells. Return the rows keyed by destination
 #    cells.
 # 3) store the copies into the cache of each cell.
 
-def make_image_cache(db, det_cat_path, exp_cat_path):
+def make_image_cache(db, det_tabname, exp_tabname):
 	# Entry point for creation of image cache
 
-	query = "_EXP FROM '%s'" % (det_cat_path)
+	query = "_EXP FROM '%s'" % (det_tabname)
 	for _ in db.query(query).execute([
 					_exp_id_gather,
-					(_exp_id_load,    db, exp_cat_path),
-					(_exp_store_rows, db, exp_cat_path)
+					(_exp_id_load,    db, exp_tabname),
+					(_exp_store_rows, db, exp_tabname)
 				      ],
 				      include_cached=True):
 		pass;
@@ -511,8 +505,8 @@ def _exp_id_gather(qresult):
 
 			yield (exp_cell, (cell_id, exps))
 
-def _exp_id_load(kv, db, exp_cat_path):
-	#-- This kernel is called once for each exp_cat cell referenced from det_cat
+def _exp_id_load(kv, db, exp_tabname):
+	#-- This kernel is called once for each exp_tab cell referenced from det_table
 	#
 	# kv = (exp_cell, detexps) with
 	#    detexps = [ (det_cell1, exps1), (det_cell, exps2), ... ]
@@ -523,7 +517,7 @@ def _exp_id_load(kv, db, exp_cat_path):
 	exp_cell, detexps = kv
 
 	# Load the entire cell
-	rows = db.query("_ID, * FROM '%s'" % exp_cat_path).fetch_cell(exp_cell)
+	rows = db.query("_ID, * FROM '%s'" % exp_tabname).fetch_cell(exp_cell)
 	if rows is None:
 		return
 	exp_id = rows['_ID']
@@ -540,9 +534,9 @@ def _exp_id_load(kv, db, exp_cat_path):
 			yield cache_cell, ret[i:i+1]
 		#yield cache_cell, ret
 
-	#print exp_cell, " -> ", [ (cache_cell, len(rows[exp_cat.primary_table]['rows'])) for (det_cellt, rows) in ret ]
+	#print exp_cell, " -> ", [ (cache_cell, len(rows[exp_tab.primary_table]['rows'])) for (det_cellt, rows) in ret ]
 
-def _store_rows(cell_id, exp_cat, rowlist):
+def _store_rows(cell_id, exp_table, rowlist):
 	# Helper for _exp_store_rows
 	if len(rowlist) == 0:
 		return 0
@@ -559,16 +553,16 @@ def _store_rows(cell_id, exp_cat, rowlist):
 		at += len(rows)
 	assert at == n, '%d %d' % (at, n)
 
-	exp_cat.append(arows, cell_id=cell_id, group='cached')
+	exp_table.append(arows, cell_id=cell_id, group='cached')
 	return len(arows)
 
-def _exp_store_rows(kv, db, exp_cat_path):
+def _exp_store_rows(kv, db, exp_tabname):
 	# Cache all rows to be cached in this cell
 	cell_id, rowblocks = kv
 
 	# Delete existing neighbors
-	exp_cat = db.catalog(exp_cat_path)
-	exp_cat.drop_row_group(cell_id, 'cached')
+	exp_table = db.table(exp_tabname)
+	exp_table.drop_row_group(cell_id, 'cached')
 
 	# Accumulate a few blocks, then add them to cache (appending
 	# bit-by-bit is expensive because of the all the fsyncs() invloved)
@@ -580,62 +574,62 @@ def _exp_store_rows(kv, db, exp_cat_path):
 		rowlist.append(rows)
 
 		if len(rowlist) >= 50:
-			ncached += _store_rows(cell_id, exp_cat, rowlist)
+			ncached += _store_rows(cell_id, exp_table, rowlist)
 			rowlist = [ ]
-	ncached += _store_rows(cell_id, exp_cat, rowlist)
+	ncached += _store_rows(cell_id, exp_table, rowlist)
 	assert chk == ncached
 
 	# Return the number of new rows cached into this cell
 	yield cell_id, ncached
 
 ###############
-# object catalog creator
+# object table creator
 
-def make_object_catalog(db, obj_catdir, det_catdir, radius=1./3600., create=True):
+def make_object_catalog(db, obj_tabname, det_tabname, radius=1./3600., create=True):
 	# Entry point for creation of image cache
 
 	# For debugging -- a simple check to see if matching works is to rerun
-	# the match across a just matched catalog. In this case, we expect
+	# the match across a just matched table. In this case, we expect
 	# all detections to be matched to existing objects, and no new ones added.
 	_rematching = int(os.getenv('REMATCHING', False))
 	if _rematching:
 		create = False
 
-	det_cat = db.catalog(det_catdir)
+	det_table = db.table(det_tabname)
 
-	o2d_catdir = '_%s_to_%s' % (obj_catdir, det_catdir)
+	o2d_tabname = '_%s_to_%s' % (obj_tabname, det_tabname)
 
 	if create:
 		# Create the new object database
-		obj_cat = db.create_catalog(obj_catdir, obj_cat_def)
-		o2d_cat = db.create_catalog(o2d_catdir, o2d_cat_def)
+		obj_table = db.create_table(obj_tabname, obj_table_def)
+		o2d_table = db.create_table(o2d_tabname, o2d_table_def)
 
-		# Set up a one-to-X join relationship between the two catalogs (join obj_cat:obj_id->det_cat:det_id)
-		db.define_default_join(obj_catdir, det_catdir,
+		# Set up a one-to-X join relationship between the two tables (join obj_table:obj_id->det_table:det_id)
+		db.define_default_join(obj_tabname, det_tabname,
 			type = 'indirect',
-			m1   = (o2d_catdir, "obj_id"),
-			m2   = (o2d_catdir, "det_id")
+			m1   = (o2d_tabname, "obj_id"),
+			m2   = (o2d_tabname, "det_id")
 			)
-		# Set up a join between the indirection table and detections catalog (det_cat:det_id->o2d_cat:o2d_id)
-		db.define_default_join(det_catdir, o2d_catdir,
+		# Set up a join between the indirection table and detections table (det_table:det_id->o2d_table:o2d_id)
+		db.define_default_join(det_tabname, o2d_tabname,
 			type = 'indirect',
-			m1   = (o2d_catdir, "det_id"),
-			m2   = (o2d_catdir, "o2d_id")
+			m1   = (o2d_tabname, "det_id"),
+			m2   = (o2d_tabname, "o2d_id")
 			)
-		# Set up a join between the indirection table and detections catalog (det_cat:det_id->o2d_cat:o2d_id)
-		db.define_default_join(obj_catdir, o2d_catdir,
+		# Set up a join between the indirection table and detections table (det_table:det_id->o2d_table:o2d_id)
+		db.define_default_join(obj_tabname, o2d_tabname,
 			type = 'indirect',
-			m1   = (o2d_catdir, "obj_id"),
-			m2   = (o2d_catdir, "o2d_id")
+			m1   = (o2d_tabname, "obj_id"),
+			m2   = (o2d_tabname, "o2d_id")
 			)
 	else:
-		obj_cat = db.catalog(obj_catdir)
-		o2d_cat = db.catalog(o2d_catdir)
+		obj_table = db.table(obj_tabname)
+		o2d_table = db.table(o2d_tabname)
 
 	# Fetch all non-empty cells with detections. Group them by the same spatial
 	# cell ID. This will be the list over which the first kernel will map.
-	det_cells = det_cat.get_cells()
-	det_cells_grouped = det_cat.pix.group_cells_by_spatial(det_cells).items()
+	det_cells = det_table.get_cells()
+	det_cells_grouped = det_table.pix.group_cells_by_spatial(det_cells).items()
 
 	t0 = time.time()
 	pool = pool2.Pool()
@@ -644,7 +638,7 @@ def make_object_catalog(db, obj_catdir, det_catdir, radius=1./3600., create=True
 	at = 0
 	for (nexp, nobj, ndet, nnew, nmatch, ndetnc) in pool.map_reduce_chain(det_cells_grouped,
 					      [
-						(_obj_det_match, db, obj_catdir, det_catdir, o2d_catdir, radius, _rematching),
+						(_obj_det_match, db, obj_tabname, det_tabname, o2d_tabname, radius, _rematching),
 					      ],
 					      progress_callback=pool2.progress_pass):
 		at += 1
@@ -663,21 +657,21 @@ def make_object_catalog(db, obj_catdir, det_catdir, radius=1./3600., create=True
 		print "  match %7d det to %7d obj (%3d exps): %7d new (%6.2f%%), %7d matched (%6.2f%%)  [%.0f/%.0f min.]" % (ndet, nobj, nexp, nnew, pctnew, nmatch, pctmatch, time_pass, time_tot)
 
 	print >> sys.stderr, "Building neighbor cache for static sky: ",
-	db.build_neighbor_cache(obj_catdir)
+	db.build_neighbor_cache(obj_tabname)
 	print >> sys.stderr, "Building neighbor cache for indirection table: ",
-	db.build_neighbor_cache(o2d_catdir)
+	db.build_neighbor_cache(o2d_tabname)
 
-	# Compute summary stats for object catalog
+	# Compute summary stats for object table
 	print >> sys.stderr, "Computing summary statistics for static sky: ",
-	db.compute_summary_stats(obj_catdir)
+	db.compute_summary_stats(obj_tabname)
 	print >> sys.stderr, "Computing summary statistics for indirection table: ",
-	db.compute_summary_stats(o2d_catdir)
+	db.compute_summary_stats(o2d_tabname)
 
 	print "Matched a total of %d sources." % (ntot)
 	print "Total of %d objects added." % (ntotobj)
-	print "Rows in the object catalog: %d." % (obj_cat.nrows())
-	print "Rows in the detection catalog: %d." % (det_cat.nrows())
-	assert not _rematching or det_cat.nrows() == ntot
+	print "Rows in the object table: %d." % (obj_table.nrows())
+	print "Rows in the detection table: %d." % (det_table.nrows())
+	assert not _rematching or det_table.nrows() == ntot
 
 def reserve_space(arr, minsize):
 	l = len(arr)
@@ -687,13 +681,13 @@ def reserve_space(arr, minsize):
 	arr.resize(l, refcheck=False)
 
 # Single-pass detections->objects mapper.
-def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _rematching=False):
+def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, _rematching=False):
 	"""
 	This kernel assumes:
-	   a) det_cat and obj_cat have equal partitioning (equally
+	   a) det_table and obj_table have equal partitioning (equally
 	      sized/enumerated spatial cells)
-	   b) both det_cat and obj_cat have up-to-date neighbor caches
-	   c) temporal det_cat cells within this spatial cell are stored
+	   b) both det_table and obj_table have up-to-date neighbor caches
+	   c) temporal det_table cells within this spatial cell are stored
 	      local to this process (relevant for shared-nothing setups)
 	   d) exposures don't stretch across temporal cells
 
@@ -755,20 +749,21 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 	assert len(det_cells)
 
 	# Fetch the frequently used bits
-	obj_cat = db.catalog(obj_catdir)
-	det_cat = db.catalog(det_catdir)
-	o2d_cat = db.catalog(o2d_catdir)
-	pix = obj_cat.pix
+	obj_table = db.table(obj_tabname)
+	det_table = db.table(det_tabname)
+	o2d_table = db.table(o2d_tabname)
+	pix = obj_table.pix
 
 	# locate cell center (for gnomonic projection)
 	(bounds, tbounds)  = pix.cell_bounds(obj_cell)
 	(clon, clat) = bhpix.deproj_bhealpix(*bounds.center())
 
 	# fetch existing static sky, convert to gnomonic
-	objs  = db.query('_ID, _LON, _LAT FROM %s' % obj_catdir).fetch_cell(obj_cell, include_cached=True)
+	objs  = db.query('_ID, _LON, _LAT FROM %s' % obj_tabname).fetch_cell(obj_cell, include_cached=True)
 	xyobj = np.column_stack(gnomonic(objs['_LON'], objs['_LAT'], clon, clat))
 	nobj  = len(objs)	# Total number of static sky objects
 	tree  = None
+	nobj_old = 0
 
 	# for sanity checks/debugging (see below)
 	expseen = set()
@@ -778,7 +773,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 	##print "Det cells: ", det_cells
 
 	# Loop, xmatch, and store
-	det_query = db.query('_ID, _LON, _LAT, _EXP, _CACHED FROM %s' % det_catdir)
+	det_query = db.query('_ID, _LON, _LAT, _EXP, _CACHED FROM %s' % det_tabname)
 	for det_cell in sorted(det_cells):
 		# fetch detections in this cell, convert to gnomonic coordinates
 		detections = det_query.fetch_cell(det_cell, include_cached=True)
@@ -795,7 +790,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			continue;
 
 		# prep join table
-		join  = ColGroup(dtype=o2d_cat.dtype_for(['_ID', '_M1', '_M2', '_DIST', '_LON', '_LAT']))
+		join  = ColGroup(dtype=o2d_table.dtype_for(['_ID', '_M1', '_M2', '_DIST', '_LON', '_LAT']))
 		njoin = 0;
 		nobj0 = nobj;
 
@@ -806,7 +801,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		# to belong to the same object
 		uexposures = set(exposures)
 		for exposure in sorted(uexposures):
-			# Sanity check: a consistent catalog cannot have two
+			# Sanity check: a consistent table cannot have two
 			# exposures stretching over more than one cell
 			assert exposure not in expseen
 			expseen.add(exposure);
@@ -882,9 +877,9 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		ids = objs['_ID']
 		nobjadded = innew.sum()
 		if nobjadded:
-			# Append the new objects to the object catalog, obtaining their IDs.
+			# Append the new objects to the object table, obtaining their IDs.
 			assert not _rematching, 'cell_id=%s, nnew=%s\n%s' % (det_cell, nobjadded, objs[innew])
-			ids[innew] = obj_cat.append(objs[('_LON', '_LAT')][innew])
+			ids[innew] = obj_table.append(objs[('_LON', '_LAT')][innew])
 
 		# Set the indices of objects not in this cell to zero (== a value
 		# no valid object in the database can have). Therefore, all
@@ -898,21 +893,21 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 		# 2) Keep only the joins to objects inside the cell
 		join = join[ np.in1d(join['_M1'], ids[in_]) ]
 
-		# Append to the join table, in *dec_cell* of obj_cat (!important!)
+		# Append to the join table, in *dec_cell* of obj_table (!important!)
 		if len(join) != 0:
 			# compute the cell_id part of the join table's
 			# IDs.While this is unimportant now (as we could
 			# just set all of them equal to cell_id part of
 			# cell_id), if we ever decide to change the
-			# pixelation of the catalog later on, this will
+			# pixelation of the table later on, this will
 			# allow us to correctly split up the join table as
 			# well.
 			#_, _, t    = pix._xyt_from_cell_id(det_cell)	# This row points to a detection in the temporal cell ...
-			#x, y, _, _ = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object catalog.
+			#x, y, _, _ = pix._xyti_from_id(join['_M1'])	# ... but at the spatial location given by the object table.
 			#join['_ID'][:] = pix._id_from_xyti(x, y, t, 0) # This will make the new IDs have zeros in the object part (so Table.append will autogen them)
 			join['_ID'][:] = det_cell
 
-			o2d_cat.append(join)
+			o2d_table.append(join)
 
 		assert not cachedonly or (nobjadded == 0 and len(join) == 0)
 

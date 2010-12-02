@@ -1,12 +1,11 @@
-import catalog
 import pyfits
 import pool2
 import numpy as np
 from slalib import sla_eqgal
-from itertools import imap, izip
+from itertools import izip
 import time
 
-sdss_cat_def = \
+sdss_table_def = \
 {
 	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
 	'schema': {
@@ -73,22 +72,22 @@ F1_EDGE			 = (2**2)
 F2_DEBLENDED_AS_MOVING	 = (2**0)
 RS_SURVEY_PRIMARY	 = (2**8)
 
-def import_from_sweeps(db, sdss_catname, sweep_files, create=False):
-	""" Import SDSS catalog from a collection of SDSS sweep files.
+def import_from_sweeps(db, sdss_tabname, sweep_files, create=False):
+	""" Import an SDSS catalog from a collection of SDSS sweep files.
 
-	    Note: Assumes underlying shared storage for all catalog
+	    Note: Assumes underlying shared storage for all output table
 	          cells (i.e., any worker is able to write to any cell).
 	"""
 	if create:
 		# Create the new database
-		sdss_cat = db.create_catalog(sdss_catname, sdss_cat_def)
+		sdss_table = db.create_table(sdss_tabname, sdss_table_def)
 	else:
-		sdss_cat = db.catalog(sdss_catname)
+		sdss_table = db.table(sdss_tabname)
 
 	t0 = time.time()
 	at = 0; ntot = 0
 	pool = pool2.Pool()
-	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (db, sdss_catname), progress_callback=pool2.progress_pass):
+	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (db, sdss_tabname), progress_callback=pool2.progress_pass):
 		at = at + 1
 		ntot = ntot + nloaded
 		t1 = time.time()
@@ -98,10 +97,10 @@ def import_from_sweeps(db, sdss_catname, sweep_files, create=False):
 		print('  ===> Imported %-70s [%d/%d, %5.2f%%] +%-6d %9d (%.0f/%.0f min.)' % (sfile, at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot, time_pass, time_tot))
 	del pool
 
-def import_from_sweeps_aux(file, db, catname):
+def import_from_sweeps_aux(file, db, tabname):
 	# import an SDSS run
-	dat = pyfits.getdata(file, 1)
-	cat = db.catalog(catname)
+	dat   = pyfits.getdata(file, 1)
+	table = db.table(tabname)
 
 	F1 = F1_BRIGHT | F1_SATURATED | F1_NODEBLEND | F1_EDGE;	# these must not be set for an object to qualify
 	F2 = F2_DEBLENDED_AS_MOVING				# these must not be set for an object to qualify	# Compute which objects pass flag cuts
@@ -114,7 +113,7 @@ def import_from_sweeps_aux(file, db, catname):
 	# Import objects passing some basic quality cuts
 	if any(ok != 0):
 		# Load the data, cutting on flags
-		coldefs = sdss_cat_def['schema']['main']['columns'] + sdss_cat_def['schema']['survey']['columns']
+		coldefs = sdss_table_def['schema']['main']['columns'] + sdss_table_def['schema']['survey']['columns']
 		cols    = dict(( (name, dat.field(fitsname)[ok])   for (name, _, fitsname) in coldefs if fitsname != ''))
 		(ext, flux, ivar, calib) = [ dat.field(col)[ok].transpose()    for col in ['extinction', 'modelflux', 'modelflux_ivar', 'calib_status'] ]
 
@@ -140,7 +139,7 @@ def import_from_sweeps_aux(file, db, catname):
 		cols['l']      = l
 		cols['b']      = b
 
-		ids = cat.append(cols)
+		ids = table.append(cols)
 	else:
 		ids = []
 

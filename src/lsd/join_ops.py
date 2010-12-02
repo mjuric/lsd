@@ -1,129 +1,125 @@
 #!/usr/bin/env python
-from table import Table
-import query_parser as qp
+import os, json, glob, copy
 import numpy as np
-from colgroup import ColGroup
+import cPickle
+import pyfits
+
+from contextlib  import contextmanager
+from collections import defaultdict
+
+import query_parser as qp
 import bhpix
 import utils
 import pool2
 import native
-import os, json, glob
-import sys
-import copy
-import urlparse
-from contextlib import contextmanager
-from collections import defaultdict
-from interval import intervalset
 
-#
-# The result is a J = ColGroup() with id, idx, isnull columns for each joined catalog
-# To resolve a column from table X, load its tablet and do rows[J['X.idx']]
-#
-# Table should contain:
-#	- idx to subtable rows, isnull for subtable rows, for each joined subtable
-#	- the primary key against which to join a table one level up in the hierarchy
-#
+from interval    import intervalset
+from colgroup    import ColGroup
+from table       import Table
 
-class TableCache:
-	""" An object caching loaded tablets.
+class TabletCache:
+	""" An cache of tablets loaded while performing a Query.
+
 		TODO: Perhaps merge it with DB? Or make it a global?
 	"""
-	cache = {}		# Cache of loaded tables, in the form of cache[cell_id][include_cached][catname][tablename] = rows
+	cache = {}		# Cache of loaded tables, in the form of cache[cell_id][include_cached][table][cgroup] = rows
 
-	root_name = None	# The name of the root catalog (string). Used for figuring out if _not_ to load the cached rows.
-	include_cached = False	# Should we load the cached object from the root catalog
+	root_name = None	# The name of the root table (string). Used for figuring out if _not_ to load the cached rows.
+	include_cached = False	# Should we load the cached rows from the root table?
 
 	def __init__(self, root_name, include_cached = False):
 		self.cache = {}
 		self.root_name = root_name
 		self.include_cached = include_cached
 
-	def load_column(self, cell_id, name, cat, autoexpand=True, resolve_blobs=False):
-		# Return the column 'name' from table 'table' of the catalog 'cat'.
-		# Load the tablet if necessary, and cache it for further reuse.
+	def load_column(self, cell_id, name, table, autoexpand=True, resolve_blobs=False):
+		# Return the column 'name' from table 'table'.
+		# Load its tablet if necessary, and cache it for further reuse.
 		#
 		# NOTE: Unless resolve_blobs=True, this method DOES NOT resolve blobrefs to BLOBs
-		include_cached = self.include_cached if cat.name == self.root_name else True
+		include_cached = self.include_cached if table.name == self.root_name else True
 
 		# Figure out which table contains this column
-		table = cat.columns[name].table
+		cgroup = table.columns[name].cgroup
 
-		# Create self.cache[cell_id][cat.name] hierarchy if needed
+		# Create self.cache[cell_id][table.name][include_cached][cgroup] hierarchy if needed
 		if  cell_id not in self.cache:
 			self.cache[cell_id] = {}
-		if cat.name not in self.cache[cell_id]:
-			self.cache[cell_id][cat.name] = {}
-		if include_cached not in self.cache[cell_id][cat.name]:		# This bit is to support (in the future) self-joins. Note that (yes) this can be implemented in a much smarter way.
-			self.cache[cell_id][cat.name][include_cached] = {}
+		if table.name not in self.cache[cell_id]:
+			self.cache[cell_id][table.name] = {}
+		if include_cached not in self.cache[cell_id][table.name]:		# This bit is to support (in the future) self-joins. Note that (yes) this can be implemented in a much smarter way.
+			self.cache[cell_id][table.name][include_cached] = {}
 
 		# See if we have already loaded the required tablet
-		tcache = self.cache[cell_id][cat.name][include_cached]
-		if table not in tcache:
+		tcache = self.cache[cell_id][table.name][include_cached]
+		if cgroup not in tcache:
 			# Load and cache the tablet
-			rows = cat.fetch_tablet(cell_id, table, include_cached=include_cached)
+			rows = table.fetch_tablet(cell_id, cgroup, include_cached=include_cached)
 
 			# Ensure it's as long as the primary table (this allows us to support "sparse" tablets)
-			if autoexpand and table != cat.primary_table:
-				nrows = len(self.load_column(cell_id, cat.primary_key.name, cat))
+			if autoexpand and cgroup != table.primary_cgroup:
+				nrows = len(self.load_column(cell_id, table.primary_key.name, table))
 				rows.resize(nrows)
 
-			tcache[table] = rows
+			tcache[cgroup] = rows
 		else:
-			rows = tcache[table]
+			rows = tcache[cgroup]
 
 		col = rows[name]
 		
 		# resolve blobs, if requested
 		if resolve_blobs:
-			col = self.resolve_blobs(cell_id, col, name, cat)
+			col = self.resolve_blobs(cell_id, col, name, table)
 
 		return col
 
-	def resolve_blobs(self, cell_id, col, name, cat):
+	def resolve_blobs(self, cell_id, col, name, table):
 		# Resolve blobs (if blob column). NOTE: the resolved blobs
 		# will not be cached.
 
-		if cat.columns[name].is_blob:
-			include_cached = self.include_cached if cat.name == self.root_name else True
-			col = cat.fetch_blobs(cell_id, column=name, refs=col, include_cached=include_cached)
+		if table.columns[name].is_blob:
+			include_cached = self.include_cached if table.name == self.root_name else True
+			col = table.fetch_blobs(cell_id, column=name, refs=col, include_cached=include_cached)
 
 		return col
 
 class TableEntry:
-	cat      = None	# Table instance
-	name     = None # Table name, as named in the query (may be different from cat.name, if 'cat AS other' construct was used)
+	""" A table that is a member of a Query. See DB.construct_join_tree() for details.
+	"""
+	table    = None	# A Table() instance
+	name     = None # Table name, as named in the query (may be different from table.name, if 'table AS other' construct was used)
 	relation = None	# Relation to use to join with the parent
 	joins    = None	# List of JoinEntries
 
-	def __init__(self, cat, name):
-		self.cat   = cat
+	def __init__(self, table, name):
+		self.table = table
 		self.name  = name if name is not None else name
 		self.joins = []
 
 	def get_cells(self, bounds):
-		""" Get populated cells of catalog self.cat that overlap
+		""" Get populated cells of self.table that overlap
 			the requested bounds. Do it recursively.
 			
 			The bounds can be either a list of (Polygon, intervalset) tuples,
 			or None.
 			
-			For a static cell_id, a dynamic catalog will return all
+			For a static cell_id, a dynamic table will return all
 			temporal cells within the same spatial cell. For a dynamic
-			cell_id, a static catalog will return the overlapping
+			cell_id, a static table will return the overlapping
 			static cell_id.
 		"""
 
 		# Fetch our populated cells
-		pix = self.cat.pix
-		cells = self.cat.get_cells(bounds, return_bounds=True)
+		pix = self.table.pix
+		cells = self.table.get_cells(bounds, return_bounds=True)
 
-		# Autodetect if we're a static or temporal catalog
+		# Autodetect if we're a static or temporal table
 		self.static = True
 		for cell_id in cells:
-			if self.cat.pix.is_temporal_cell(cell_id):
+			if self.table.pix.is_temporal_cell(cell_id):
 				self.static = False
 				break
-		#print self.cat.name, ":", self.static
+		#print self.table.name, ":", self.static
 
 		# Fetch the children's populated cells
 		for ce in self.joins:
@@ -131,10 +127,11 @@ class TableEntry:
 			if   op == 'and':
 				ret = dict()
 				for cell_id, cbounds in cc.iteritems():
-					if not (cell_id not in cells or cells[cell_id] == cbounds): # TODO: Debugging -- make sure the timespace constraints are the same
-						aa = cells[cell_id]
-						bb = cbounds
-						pass
+					assert cell_id not in cells or cells[cell_id] == cbounds
+#					if not (cell_id not in cells or cells[cell_id] == cbounds): # TODO: Debugging -- make sure the timespace constraints are the same
+#						aa = cells[cell_id]
+#						bb = cbounds
+#						pass
 					assert cell_id not in cells or cells[cell_id] == cbounds # TODO: Debugging -- make sure the timespace constraints are the same
 					if cell_id in cells:
 						ret[cell_id] = cbounds
@@ -146,10 +143,11 @@ class TableEntry:
 			elif op == 'or':
 				ret = cells
 				for cell_id, cbounds in cc.iteritems():
-					if not (cell_id not in cells or cells[cell_id] == cbounds): # TODO: Debugging -- make sure the timespace constraints are the same
-						aa = cells[cell_id]
-						bb = cbounds
-						pass
+					assert cell_id not in cells or cells[cell_id] == cbounds # TODO: Debugging -- make sure the timespace constraints are the same
+#					if not (cell_id not in cells or cells[cell_id] == cbounds): # TODO: Debugging -- make sure the timespace constraints are the same
+#						aa = cells[cell_id]
+#						bb = cbounds
+#						pass
 					assert cell_id not in cells or cells[cell_id] == cbounds # Debugging -- make sure the timespace constraints are the same
 					ret[cell_id] = cbounds
 			cells = ret
@@ -171,21 +169,21 @@ class TableEntry:
 		      that _CAN_ (but DOESN'T HAVE TO; see below) have the 
 		      following columns:
 
-		    	<catname> : the index array that will materialize
+		    	<tabname> : the index array that will materialize
 				    the JOIN result when applied to the corresponding
-				    catalog's column as:
+				    table's column as:
 				    
-				    	res = col[<catname>]
+				    	res = col[<tabname>]
 
-		    	<catname>._NULL : a boolean array indicating whether
-		    	            the <catname> index is a dummy (zero) and
+		    	<tabname>._NULL : a boolean array indicating whether
+		    	            the <tabname> index is a dummy (zero) and
 		    	            actually the column has JOINed to NULL
 		    	            (this only happens with outer joins)
 
-		      -- If the result of a JOIN for a particular catalog leaves
-		         no NULLs, there'll be no <catname>._NULL column.
-		      -- If the col[<catname>] would be == col, there'll be no
-		         <catname> column.
+		      -- If the result of a JOIN for a particular table leaves
+		         no NULLs, there'll be no <tabname>._NULL column.
+		      -- If the col[<tabname>] would be == col, there'll be no
+		         <tabname> column.
 		"""
 		hasBounds = bounds != [(None, None)] and bounds != [(None, intervalset((-np.inf, np.inf)))]
 		if len(bounds) > 1:
@@ -196,12 +194,12 @@ class TableEntry:
 			return ColGroup()
 
 		# Load ourselves
-		id = tcache.load_column(cell_id, self.cat.get_primary_key(), self.cat)
+		id = tcache.load_column(cell_id, self.table.get_primary_key(), self.table)
 		s = ColGroup()
 		mykey = '%s._ID' % self.name
 
-		s.add_column(mykey, id)						# The key on which we'll do the joins
-		s.add_column(self.name, np.arange(len(id)))	# The index into the rows of this tablet, as loaded from disk
+		s.add_column(mykey, id)				# The key on which we'll do the joins
+		s.add_column(self.name, np.arange(len(id)))	# The index into rows of this tablet, as loaded from disk
 
 		if self.relation is None:
 			# We are root.
@@ -209,13 +207,13 @@ class TableEntry:
 
 			# Setup spatial bounds filter
 			if hasBounds:
-				ra, dec = self.cat.get_spatial_keys()
-				lon = tcache.load_column(cell_id,  ra, self.cat)
-				lat = tcache.load_column(cell_id, dec, self.cat)
+				ra, dec = self.table.get_spatial_keys()
+				lon = tcache.load_column(cell_id,  ra, self.table)
+				lat = tcache.load_column(cell_id, dec, self.table)
 
 				r = self.filter_space(r, lon, lat, bounds)	# Note: this will add the _INBOUNDS column to r
 		else:
-			# We're a child. Join with the parent catalog
+			# We're a child. Join with the parent table
 			idx1, idx2, isnull = self.relation.join(cell_id, r[key], s[mykey], r[idxkey], s[self.name], tcache)
 
 			# Handle the special case of OUTER JOINed empty 's'
@@ -235,9 +233,9 @@ class TableEntry:
 		# Perform spacetime cuts, if we have a time column
 		# (and the JOIN didn't result in all NULLs)
 		if hasBounds:
-			tk = self.cat.get_temporal_key()
+			tk = self.table.get_temporal_key()
 			if tk is not None:
-				t = tcache.load_column(cell_id,  tk, self.cat)
+				t = tcache.load_column(cell_id,  tk, self.table)
 				if len(t):
 					r = self.filter_spacetime(r, t[idx2], bounds)
 
@@ -312,11 +310,15 @@ class TableEntry:
 
 class JoinRelation:
 	kind   = 'inner'
-	def __init__(self, db, catR, catS, kind, **joindef):
-		self.db   = db
-		self.kind = kind
-		self.catR = catR
-		self.catS = catS
+	db     = None	# Controlling database instance
+	tableR = None	# Right-hand side table of the relation
+	tableS = None	# Left-hand side table of the relation
+	
+	def __init__(self, db, tableR, tableS, kind, **joindef):
+		self.db     = db
+		self.kind   = kind
+		self.tableR = tableR
+		self.tableS = tableS
 
 	def join_op(self):	# Returns 'and' if the relation has an inner join-like effect, and 'or' otherwise
 		return 'and' if self.kind == 'inner' else 'or'
@@ -325,31 +327,29 @@ class JoinRelation:
 		raise NotImplementedError('You must override this method from a derived class')
 
 class IndirectJoin(JoinRelation):
-	m1_colspec = None	# (cat, table, column) tuple giving the location of m1
-	m2_colspec = None	# (cat, table, column) tuple giving the location of m2
+	m1_colspec = None	# (table, column) tuple giving the location of m1
+	m2_colspec = None	# (table, column) tuple giving the location of m2
 
 	def fetch_join_map(self, cell_id, m1_colspec, m2_colspec, tcache):
 		"""
 			Return a list of crossmatches corresponding to ids
 		"""
-		cat1, column_from = m1_colspec
-		cat2, column_to   = m2_colspec
+		table1, column_from = m1_colspec
+		table2, column_to   = m2_colspec
 		
-		# This allows joins from static to temporal catalogs where
-		# the join table is in a static cell (not implemented yet). 
-		# However, it also support an (implemented) case of tripple
+		# This allows tripple
 		# joins of the form static-static-temporal, where the cell_id
 		# will be temporal even when fetching the static-static join
-		# table for the two other catalogs.
-		cell_id_from = cat1.static_if_no_temporal(cell_id)
-		cell_id_to   = cat2.static_if_no_temporal(cell_id)
+		# table for the two other table.
+		cell_id_from = table1.static_if_no_temporal(cell_id)
+		cell_id_to   = table2.static_if_no_temporal(cell_id)
 
-		if    not cat1.tablet_exists(cell_id_from) \
-		   or not cat2.tablet_exists(cell_id_to):
+		if    not table1.tablet_exists(cell_id_from) \
+		   or not table2.tablet_exists(cell_id_to):
 			return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64)
 
-		m1 = tcache.load_column(cell_id_from, column_from, cat1)
-		m2 = tcache.load_column(cell_id_to  , column_to  , cat2)
+		m1 = tcache.load_column(cell_id_from, column_from, table1)
+		m2 = tcache.load_column(cell_id_to  , column_to  , table2)
 		assert len(m1) == len(m2)
 
 		return m1, m2
@@ -357,19 +357,19 @@ class IndirectJoin(JoinRelation):
 	def join(self, cell_id, id1, id2, idx1, idx2, tcache):
 		"""
 		    Perform a JOIN on id1, id2, that were obtained by
-		    indexing their origin catalogs with idx1, idx2.
+		    indexing their origin tables with idx1, idx2.
 		"""
 		(m1, m2) = self.fetch_join_map(cell_id, self.m1_colspec, self.m2_colspec, tcache)
 		return native.table_join(id1, id2, m1, m2, self.kind)
 
-	def __init__(self, db, catR, catS, kind, **joindef):
-		JoinRelation.__init__(self, db, catR, catS, kind, **joindef)
+	def __init__(self, db, tableR, tableS, kind, **joindef):
+		JoinRelation.__init__(self, db, tableR, tableS, kind, **joindef)
 
-		m1_catname, m1_colname = joindef['m1']
-		m2_catname, m2_colname = joindef['m2']
+		m1_tabname, m1_colname = joindef['m1']
+		m2_tabname, m2_colname = joindef['m2']
 
-		self.m1_colspec = (db.catalog(m1_catname), m1_colname)
-		self.m2_colspec = (db.catalog(m2_catname), m2_colname)
+		self.m1_colspec = (db.table(m1_tabname), m1_colname)
+		self.m2_colspec = (db.table(m2_tabname), m2_colname)
 
 	def __str__(self):
 		return "%s indirect via [%s.%s, %s.%s]" % (
@@ -379,20 +379,20 @@ class IndirectJoin(JoinRelation):
 		)
 
 #class EquijoinJoin(IndirectJoin):
-#	def __init__(self, db, catR, catS, kind, **joindef):
-#		JoinRelation.__init__(self, db, catR, catS, kind, **joindef)
+#	def __init__(self, db, tableR, tableS, kind, **joindef):
+#		JoinRelation.__init__(self, db, tableR, tableS, kind, **joindef)
 #
 #		# Emulating direct join with indirect one
 #		# TODO: Write a specialized direct join routine
-#		self.m1_colspec = catR, joindef['id1']
-#		self.m2_colspec = catS, joindef['id2']
+#		self.m1_colspec = tableR, joindef['id1']
+#		self.m2_colspec = tableS, joindef['id2']
 
-def create_join(db, fn, jkind, catR, catS):
+def create_join(db, fn, jkind, tableR, tableS):
 	data = json.loads(file(fn).read())
 	assert 'type' in data
 
 	jclass = data['type'].capitalize() + 'Join'
-	return globals()[jclass](db, catR, catS, jkind, **data)
+	return globals()[jclass](db, tableR, tableS, jkind, **data)
 
 class iarray(np.ndarray):
 	""" Subclass of ndarray allowing per-row indexing.
@@ -432,24 +432,26 @@ class iarray(np.ndarray):
 		return self.__getitem__(idx)
 
 class TableColsProxy:
-	catalogs = None
-	root_catalog = None
+	""" A dict-like object for query_parser.resolve_wildcards()
+	"""
+	tables = None
+	root_table = None
 
-	def __init__(self, root_catalog, catalogs):
-		self.root_catalog = root_catalog
-		self.catalogs = catalogs
+	def __init__(self, root_table, tables):
+		self.root_table = root_table
+		self.tables = tables
 
-	def __getitem__(self, catname):
-		# Return a list of columns in catalog catname, unless
+	def __getitem__(self, tabname):
+		# Return a list of columns in table tabname, unless
 		# they're pseudocolumns
-		if catname == '':
-			catname = self.root_catalog
-		cat = self.catalogs[catname].cat
-		return [ name for (name, coldef) in cat.columns.iteritems() if not cat._is_pseudotable(coldef.table) ]
+		if tabname == '':
+			tabname = self.root_table
+		table = self.tables[tabname].table
+		return [ name for (name, coldef) in table.columns.iteritems() if not table._is_pseudotablet(coldef.cgroup) ]
 
 class QueryInstance(object):
 	# Internal working state variables
-	tcache   = None		# TableCache() instance
+	tcache   = None		# TabletCache() instance
 	columns  = None		# Cache of already referenced and evaluated columns (dict)
 	cell_id  = None		# cell_id on which we're operating
 	jmap 	 = None		# index map used to materialize the JOINs
@@ -457,24 +459,24 @@ class QueryInstance(object):
 
 	# These will be filled in from a QueryEngine instance
 	db       = None		# The controlling database instance
-	catalogs = None		# A name:Table dict() with all the catalogs listed on the FROM line.
-	root	 = None		# TableEntry instance with the primary (root) catalog
+	tables   = None		# A name:Table dict() with all the tables listed on the FROM line.
+	root	 = None		# TableEntry instance with the primary (root) table
 	query_clauses = None	# Tuple with parsed query clauses
 	pix      = None         # Pixelization object (TODO: this should be moved to class DB)
 	locals   = None		# Extra local variables to be made available within the query
 
 	def __init__(self, q, cell_id, bounds, include_cached):
 		self.db            = q.db
-		self.catalogs	   = q.catalogs
+		self.tables	   = q.tables
 		self.root	   = q.root
 		self.query_clauses = q.query_clauses
-		self.pix           = q.root.cat.pix
+		self.pix           = q.root.table.pix
 		self.locals        = q.locals
 
 		self.cell_id	= cell_id
 		self.bounds	= bounds
 
-		self.tcache	= TableCache(self.root.name, include_cached)
+		self.tcache	= TabletCache(self.root.name, include_cached)
 		self.columns	= {}
 		
 	def peek(self):
@@ -523,7 +525,7 @@ class QueryInstance(object):
 			globals_[i] = np.__dict__[i]
 
 		# Add implicit global objects present in queries
-		globals_['_PIX'] = self.root.cat.pix
+		globals_['_PIX'] = self.root.table.pix
 		globals_['_DB']  = self.db
 
 		return globals_
@@ -559,11 +561,11 @@ class QueryInstance(object):
 
 	#################
 
-	def load_column(self, name, catname):
+	def load_column(self, name, tabname):
 		# If we're just peeking, construct the column from schema
 		if self.cell_id is None:
 			assert self.bounds is None
-			cdef = self.catalogs[catname].cat.columns[name]
+			cdef = self.tables[tabname].table.columns[name]
 			dtype = np.dtype(cdef.dtype)
 
 			# Handle blobs
@@ -572,23 +574,23 @@ class QueryInstance(object):
 			else:
 				col = np.empty(0, dtype=dtype)
 		else:
-			# Load the column from table 'table' of the catalog 'catname'
+			# Load the column from cgroup 'cgroup' of table 'tabname'
 			# Also cache the loaded tablet, for future reuse
-			cat = self.catalogs[catname].cat
+			table = self.tables[tabname].table
 
 			# Load the column (via cache)
-			col = self.tcache.load_column(self.cell_id, name, cat)
+			col = self.tcache.load_column(self.cell_id, name, table)
 
 			# Join/filter if needed
-			if catname in self.jmap:
-				isnullKey  = catname + '._NULL'
-				idx			= self.jmap[catname]
+			if tabname in self.jmap:
+				isnullKey  = tabname + '._NULL'
+				idx			= self.jmap[tabname]
 				if len(col):
 					col         = col[idx]
 	
 					if isnullKey in self.jmap:
 						isnull		= self.jmap[isnullKey]
-						col[isnull] = cat.NULL
+						col[isnull] = table.NULL
 				elif len(idx):
 					# This tablet is empty, but columns show up here because of an OUTER join.
 					# Just return NULLs of proper dtype
@@ -597,7 +599,7 @@ class QueryInstance(object):
 					col = np.zeros(shape=(len(idx),) + col.shape[1:], dtype=col.dtype)
 
 			# Resolve blobs (if a blobref column)
-			col = self.tcache.resolve_blobs(self.cell_id, col, name, cat)
+			col = self.tcache.resolve_blobs(self.cell_id, col, name, table)
 
 		# Return the column as an iarray
 		col = col.view(iarray)
@@ -627,25 +629,24 @@ class QueryInstance(object):
 		if name in self.columns:
 			return self.columns[name]
 
-		# A yet unloaded column from one of the joined catalogs
-		# (including the primary)? Try to find it in tables of
-		# joined catalogs. It may be prefixed by catalog name, in
-		# which case we force the lookup of that catalog only.
+		# A yet unloaded column from one of the joined tables
+		# (including the primary)? Try to find it in cgroups of
+		# joined tables. It may be prefixed by the table name, in
+		# which case we force the lookup of that table only.
 		if name.find('.') == -1:
-			# Do this to ensure the primary catalog is the first
+			# Do this to ensure the primary table is the first
 			# to get looked up when resolving column names.
-			cats = [ (self.root.name, self.catalogs[self.root.name]) ]
-			cats.extend(( (name, cat) for name, cat in self.catalogs.iteritems() if name != self.root.name ))
+			tables = [ (self.root.name, self.tables[self.root.name]) ]
+			tables.extend(( (name, table) for name, table in self.tables.iteritems() if name != self.root.name ))
 			colname = name
 		else:
-			# Force lookup of a specific catalog
-			(catname, colname) = name.split('.')
-			cats = [ (catname, self.catalogs[catname]) ]
-		for (catname, e) in cats:
-			colname = e.cat.resolve_alias(colname)
-			if colname in e.cat.columns:
-				self[name] = self.load_column(colname, catname)
-				#print "Loaded column %s.%s.%s for %s (len=%s)" % (catname, table, colname2, name, len(self.columns[name]))
+			# Force lookup of a specific table
+			(tabname, colname) = name.split('.')
+			tables = [ (tabname, self.tables[tabname]) ]
+		for (tabname, e) in tables:
+			colname = e.table.resolve_alias(colname)
+			if colname in e.table.columns:
+				self[name] = self.load_column(colname, tabname)
 				return self.columns[name]
 
 		# A query pseudocolumn?
@@ -653,8 +654,8 @@ class QueryInstance(object):
 			col = self[name] = self.load_pseudocolumn(name)
 			return col
 
-		# A name of a catalog? Return a proxy object
-		if name in self.catalogs:
+		# A name of a table? Return a proxy object
+		if name in self.tables:
 			return TableProxy(self, name)
 
 		# Is this one of the local variables passed in by the user?
@@ -672,17 +673,19 @@ class QueryInstance(object):
 		self.columns[key] = val
 
 class IntoWriter(object):
+	""" Implementation of the writing logic for '... INTO ...' query clause
+	"""
 	into_clause = None
 	_tcache = None
 	rows = None
 	locals = None
 	db = None
 	pix = None
-	cat = None
+	table = None
 
 	def __init__(self, db, into_clause, locals = {}):
 		# This handles INTO clauses. Stores the data into
-		# destination catalog, returning the IDs of stored rows.
+		# destination table, returning the IDs of stored rows.
 		if isinstance(into_clause, str):
 			query = "_ FROM _ INTO %s" % into_clause
 			_, _, _, into_clause = qp.parse(query)
@@ -693,10 +696,10 @@ class IntoWriter(object):
 
 	@property
 	def tcache(self):
-		# Auto-create a table cache if needed
+		# Auto-create a tablet cache if needed
 		if self._tcache is None:
-			into_cat     = self.into_clause[0]
-			self._tcache = TableCache(into_cat, False)
+			into_table   = self.into_clause[0]
+			self._tcache = TabletCache(into_table, False)
 		return self._tcache
 
 	#########
@@ -723,19 +726,19 @@ class IntoWriter(object):
 		assert isinstance(rows, ColGroup)
 		self.rows = rows
 
-		# The catalog may have been created on previous pass
-		if self.cat is None:
-			self.cat  = self.create_into_catalog()
+		# The table may have been created on previous pass
+		if self.table is None:
+			self.table  = self.create_into_table()
 
 		rows = self.eval_into(cell_id, rows)
 		return (cell_id, rows)
 
-	def _find_into_dest_rows(self, cell_id, cat, into_col, vals):
-		""" Return the keys of rows in cat whose 'into_col' value
+	def _find_into_dest_rows(self, cell_id, table, into_col, vals):
+		""" Return the keys of rows in table whose 'into_col' value
 		    matches vals. Return zero for vals that have no match.
 		"""
-		into_col = cat.resolve_alias(into_col)
-		col = self.tcache.load_column(cell_id, into_col, cat, autoexpand=False, resolve_blobs=True)
+		into_col = table.resolve_alias(into_col)
+		col = self.tcache.load_column(cell_id, into_col, table, autoexpand=False, resolve_blobs=True)
 #		print "XX:", col, vals;
 
 		if len(col) == 0:
@@ -760,7 +763,7 @@ class IntoWriter(object):
 #		print "XX:", in2
 		assert np.all(in2 == ~app)
 
-		id = self.tcache.load_column(cell_id, cat.primary_key.name, cat, autoexpand=False)
+		id = self.tcache.load_column(cell_id, table.primary_key.name, table, autoexpand=False)
 		id = id[idx]		# Get the values of row indices that we have
 		id[app] = 0		# Mark empty indices with 0
 #		print "XX:", id;
@@ -771,19 +774,19 @@ class IntoWriter(object):
 		globals_ = globals()
 
 		# Add implicit global objects present in queries
-		globals_['_PIX'] = self.cat.pix
+		globals_['_PIX'] = self.table.pix
 		globals_['_DB']  = self.db
 		
 		return globals_
 
 	def eval_into(self, cell_id, rows):
-		# Insert into the destination catalog
-		(into_cat, dtype, into_col, keyexpr, kind) = self.into_clause
+		# Insert into the destination table
+		(into_table, _, into_col, keyexpr, kind) = self.into_clause
 
-		cat = self.db.catalog(into_cat)
+		table = self.db.table(into_table)
 		if kind == 'append':
 			rows.add_column('_ID', cell_id, 'u8')
-			ids = cat.append(rows)
+			ids = table.append(rows)
 		elif kind in ['update/ignore', 'update/insert']:
 			# Evaluate the key expression
 			globals_ = self.prep_globals()
@@ -791,12 +794,12 @@ class IntoWriter(object):
 #			print rows['mjd_obs'], rows['mjdorig'], keyexpr, vals; exit()
 
 			# Match rows
-			id = self._find_into_dest_rows(cell_id, cat, into_col, vals)
-			if cat.primary_key.name not in rows:
+			id = self._find_into_dest_rows(cell_id, table, into_col, vals)
+			if table.primary_key.name not in rows:
 				rows.add_column('_ID', id)
 				key = '_ID'
 			else:
-				key = cat.primary_key.name
+				key = table.primary_key.name
 				assert np.all(rows[key][id != 0] == id[id != 0])
 				#rows[key] = id
 
@@ -806,7 +809,7 @@ class IntoWriter(object):
 			else:
 				# Append the rows whose IDs are unspecified
 				rows[key][ rows[key] == 0 ] = cell_id
-			ids = cat.append(rows, _update=True)
+			ids = table.append(rows, _update=True)
 #			print rows['_ID'], ids
 
 			assert np.all(id[id != 0] == ids)
@@ -815,14 +818,14 @@ class IntoWriter(object):
 			globals_ = self.prep_globals()
 			id = eval(keyexpr, globals_, self)
 
-			if cat.primary_key.name not in rows:
+			if table.primary_key.name not in rows:
 				rows.add_column('_ID', id)
 			else:
-				assert np.all(rows[cat.primary_key.name] == id)
-				rows[cat.primary_key.name] = id
+				assert np.all(rows[table.primary_key.name] == id)
+				rows[table.primary_key.name] = id
 
 			# Update and/or add new rows
-			ids = cat.append(rows, _update=True)
+			ids = table.append(rows, _update=True)
 
 		# Return IDs only
 		for col in rows.keys():
@@ -832,9 +835,9 @@ class IntoWriter(object):
 		
 		return rows
 
-	def create_into_catalog(self):
-		# called to auto-create the destination catalog
-		(catname, dtype, into_col, keyexpr) = self.into_clause[:4]
+	def create_into_table(self):
+		# called to auto-create the destination table
+		(tabname, dtype, into_col, keyexpr) = self.into_clause[:4]
 		assert dtype is None, "User-supplied dtype not supported yet."
 
 		db = self.db
@@ -844,25 +847,25 @@ class IntoWriter(object):
 			'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
 		}
 		with db.lock():
-			if db.catalog_exists(catname):
+			if db.table_exists(tabname):
 				# Must have a designated key for updating to work
 #				if into_col is None:
-#					raise Exception('If selecting into an existing catalog (%s), you must specify the column with IDs that will be updated (" ... INTO ... AT keycol") construct).' % catname)
+#					raise Exception('If selecting into an existing table (%s), you must specify the column with IDs that will be updated (" ... INTO ... AT keycol") construct).' % tabname)
 
-				cat = db.catalog(catname)
+				table = db.table(tabname)
 
 				# Find any new columns we'll need to create
 				for name in dtype.names:
-					rname = cat.resolve_alias(name)
-					if rname not in cat.columns:
+					rname = table.resolve_alias(name)
+					if rname not in table.columns:
 						schema['columns'].append((name, utils.str_dtype(dtype[name])))
 
 				# Disallow creating new columns
 				if into_col is None and schema['columns']:
-					raise Exception('If selecting into an existing catalog (%s) with no INTO ... WHERE clause, all columns present in the query must already exist in the catalog' % catname)
+					raise Exception('If selecting into an existing table (%s) with no INTO ... WHERE clause, all columns present in the query must already exist in the table' % tabname)
 			else:
-				# Creating a new catalog
-				cat = db.catalog(catname, True)
+				# Creating a new table
+				table = db.table(tabname, True)
 
 				# Create all columns
 				schema['columns'] = [ (name, utils.str_dtype(dtype[name])) for name in dtype.names ]
@@ -888,19 +891,19 @@ class IntoWriter(object):
 			if schema['columns']:
 				for x in xrange(1, 100000):
 					tname = 'auto%03d' % x
-					if tname not in cat._tables:
+					if tname not in table._cgroups:
 						break
-				cat.create_table(tname, schema)
+				table.create_cgroup(tname, schema)
 
 		##print "XXX:", tname, schema;# exit()
-		return cat
+		return table
 
 class QueryEngine(object):
 	# These are a part of the mappers' public API
 	db       = None		# The controlling database instance
 	pix      = None         # Pixelization object (TODO: this should be moved to class DB)
-	catalogs = None		# A name:Table dict() with all the catalogs listed on the FROM line.
-	root	 = None		# TableEntry instance with the primary (root) catalog
+	tables = None		# A name:Table dict() with all the tables listed on the FROM line.
+	root	 = None		# TableEntry instance with the primary (root) table
 	query_clauses  = None	# Parsed query clauses
 	locals   = None		# Extra variables to be made local to the query
 
@@ -910,15 +913,15 @@ class QueryEngine(object):
 		# parse query
 		(select_clause, where_clause, from_clause, into_clause) = qp.parse(query)
 
-		self.root, self.catalogs = db.construct_join_tree(from_clause);
-		select_clause            = qp.resolve_wildcards(select_clause, TableColsProxy(self.root.name, self.catalogs))
+		self.root, self.tables = db.construct_join_tree(from_clause);
+		select_clause            = qp.resolve_wildcards(select_clause, TableColsProxy(self.root.name, self.tables))
 
 		self.query_clauses       = (select_clause, where_clause, from_clause, into_clause)
 
 		self.locals = locals
 
 		# Aux variables that mappers can access
-		self.pix = self.root.cat.pix
+		self.pix = self.root.table.pix
 
 	def on_cell(self, cell_id, bounds=None, include_cached=False):
 		return QueryInstance(self, cell_id, bounds, include_cached)
@@ -992,7 +995,7 @@ class Query(object):
 
 		# Reorganize cells to a per-static-cell basis, if requested
 		if group_by_static_cell:
-			pix = self.qengine.root.cat.pix
+			pix = self.qengine.root.table.pix
 			p2 = defaultdict(list)
 			for cell_id, bounds in partspecs.iteritems():
 				if pix.is_temporal_cell(cell_id):
@@ -1119,7 +1122,7 @@ class Query(object):
 		return self.fetch(cells=[cell_id], include_cached=include_cached, nworkers=1, progress_callback=pool2.progress_pass)
 
 class DB(object):
-	path = None		# Root of the database, where all catalogs reside
+	path = None		# Root of the database, where all tables reside
 
 	def __init__(self, path):
 		self.path = path
@@ -1127,7 +1130,7 @@ class DB(object):
 		if not os.path.isdir(path):
 			raise Exception('"%s" is not an acessible directory.' % (path))
 
-		self.catalogs = dict()	# A cache of catalog instances
+		self.tables = dict()	# A cache of table instances
 
 	@contextmanager
 	def lock(self, retries=-1):
@@ -1149,8 +1152,8 @@ class DB(object):
 		if uri[:4] != 'lsd:':
 			return uri
 
-		_, catname, _ = uri.split(':', 2)
-		return catalog(catname).resolve_uri(uri)
+		_, tabname, _ = uri.split(':', 2)
+		return self.table(tabname).resolve_uri(uri)
 
 	@contextmanager
 	def open_uri(self, uri, mode='r', clobber=True):
@@ -1163,38 +1166,38 @@ class DB(object):
 
 			f.close()
 		else:
-			# Pass on to the controlling catalog
-			_, catname, _ = uri.split(':', 2)
-			with self.catalog(catname).open_uri(uri, mode, clobber) as f:
+			# Pass on to the controlling table
+			_, tabname, _ = uri.split(':', 2)
+			with self.table(tabname).open_uri(uri, mode, clobber) as f:
 				yield f
 
 	def query(self, query, locals={}):
 		return Query(self, query, locals=locals)
 
-	def _aux_create_table(self, cat, tname, schema):
+	def _aux_create_table(self, table, tname, schema):
 		schema = copy.deepcopy(schema)
 
 		# Remove any extra fields off schema['column']
 		schema['columns'] = [ v[:2] for v in schema['columns'] ]
 
-		cat.create_table(tname, schema)
+		table.create_cgroup(tname, schema)
 
-	def create_catalog(self, catname, catdef):
+	def create_table(self, tabname, tabdef):
 		"""
-			Creates the catalog given the extended schema description.
+			Creates the table given the extended schema description.
 		"""
-		cat = self.catalog(catname, create=True)
+		table = self.table(tabname, create=True)
 
 		# Add fgroups
-		if 'fgroups' in catdef:
-			for fgroup, fgroupdef in catdef['fgroups'].iteritems():
-				cat.define_fgroup(fgroup, fgroupdef)
+		if 'fgroups' in tabdef:
+			for fgroup, fgroupdef in tabdef['fgroups'].iteritems():
+				table.define_fgroup(fgroup, fgroupdef)
 
 		# Add filters
-		cat.set_default_filters(**catdef.get('filters', {}))
+		table.set_default_filters(**tabdef.get('filters', {}))
 
 		# Add column groups
-		tschema = catdef['schema']
+		tschema = tabdef['schema']
 
 		# Ensure we create the primary table first
 		schemas = []
@@ -1202,21 +1205,21 @@ class DB(object):
 			schemas.insert(np.where('primary_key' in schema, 0, len(schemas)), (tname, schema))
 		assert len(schemas) and 'primary_key' in schemas[0][1]
 		for tname, schema in schemas:
-			self._aux_create_table(cat, tname, schema)
+			self._aux_create_table(table, tname, schema)
 
 		# Add aliases (must do this last, as the aliased columns have to exist)
-		if 'aliases' in catdef:
-			for alias, colname in catdef['aliases'].iteritems():
-				cat.define_alias(alias, colname)
+		if 'aliases' in tabdef:
+			for alias, colname in tabdef['aliases'].iteritems():
+				table.define_alias(alias, colname)
 
-		return cat
+		return table
 
 	def define_join(self, name, type, **joindef):
 		#- .join file structure:
 		#	- indirect joins:			Example: ps1_obj:ps1_det.join
 		#		type:	indirect		"type": "indirect"
-		#		m1:	(cat1, col1)		"m1:":	["ps1_obj2det", "id1"]
-		#		m2:	(cat2, col2)		"m2:":	["ps1_obj2det", "id2"]
+		#		m1:	(tab1, col1)		"m1:":	["ps1_obj2det", "id1"]
+		#		m2:	(tab2, col2)		"m2:":	["ps1_obj2det", "id2"]
 		#	- equijoins:				Example: ps1_det:ps1_exp.join		(!!!NOT IMPLEMENTED!!!)
 		#		type:	equi			"type": "equijoin"
 		#		id1:	colA			"id1":	"exp_id"
@@ -1234,71 +1237,71 @@ class DB(object):
 		f.write(json.dumps(joindef, indent=4, sort_keys=True))
 		f.close()
 
-	def define_default_join(self, obj_catdir, o2d_catdir, type, **joindef):
-		return self.define_join('.%s:%s' % (obj_catdir, o2d_catdir), type, **joindef)
+	def define_default_join(self, tableA, tableB, type, **joindef):
+		return self.define_join('.%s:%s' % (tableA, tableB), type, **joindef)
 
-	def catalog_exists(self, catname):
+	def table_exists(self, tabname):
 		try:
-			self.catalog(catname)
+			self.table(tabname)
 			return True
 		except IOError:
 			return False
 
-	def catalog(self, catname, create=False):
-		""" Given the catalog name, returns a Table object.
+	def table(self, tabname, create=False):
+		""" Given the table name, returns a Table object.
 		"""
-		if catname not in self.catalogs:
-			catpath = '%s/%s' % (self.path, catname)
+		if tabname not in self.tables:
+			path = '%s/%s' % (self.path, tabname)
 			if not create:
-				self.catalogs[catname] = Table(catpath)
+				self.tables[tabname] = Table(path)
 			else:
-				self.catalogs[catname] = Table(catpath, name=catname, mode='c')
+				self.tables[tabname] = Table(path, name=tabname, mode='c')
 		else:
 			assert not create
 
-		return self.catalogs[catname]
+		return self.tables[tabname]
 
 	def construct_join_tree(self, from_clause):
-		catlist = []
+		tablist = []
 
-		# Instantiate the catalogs
-		for catname, catpath, jointype in from_clause:
-			catlist.append( ( catname, (TableEntry(self.catalog(catpath), catname), jointype) ) )
-		cats = dict(catlist)
+		# Instantiate the tables
+		for tabname, tabpath, jointype in from_clause:
+			tablist.append( ( tabname, (TableEntry(self.table(tabpath), tabname), jointype) ) )
+		tables = dict(tablist)
 
 		# Discover and set up JOIN links based on defined JOIN relations
 		# TODO: Expand this to allow the 'joined to via' and related syntax, once it becomes available in the parser
-		for catname, (e, _) in catlist:
-			# Check for catalogs that can be joined onto this one (where this one is on the right hand side of the relation)
-			# Look for default .join files named ".<catname>:*.join"
-			pattern = "%s/.%s:*.join" % (self.path, catname)
+		for tabname, (e, _) in tablist:
+			# Check for tables that can be joined onto this one (where this one is on the right hand side of the relation)
+			# Look for default .join files named ".<tabname>:*.join"
+			pattern = "%s/.%s:*.join" % (self.path, tabname)
 			for fn in glob.iglob(pattern):
-				jcatname = fn[fn.rfind(':')+1:fn.rfind('.join')]
-				if jcatname not in cats:
+				jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
+				if jtabname not in tables:
 					continue
 
-				je, jkind = cats[jcatname]
+				je, jkind = tables[jtabname]
 				if je.relation is not None:	# Already joined
 					continue
 
-				je.relation = create_join(self, fn, jkind, e.cat, je.cat)
+				je.relation = create_join(self, fn, jkind, e.table, je.table)
 				e.joins.append(je)
 	
-		# Discover the root (the one and only one catalog that has no links pointing to it)
+		# Discover the root (the one and only one table that has no links pointing to it)
 		root = None
-		for _, (e, jkind) in cats.iteritems():
+		for _, (e, jkind) in tables.iteritems():
 			if e.relation is None:
 				assert root is None	# Can't have more than one roots
-				assert jkind == 'inner'	# Can't have something like 'ps1_obj(outer)' on root catalog
+				assert jkind == 'inner'	# Can't have something like 'ps1_obj(outer)' on root table
 				root = e
 		assert root is not None			# Can't have zero roots
 	
-		# TODO: Verify all catalogs are reachable from the root (== there are no circular JOINs)
+		# TODO: Verify all tables are reachable from the root (== there are no circular JOINs)
 	
 		# Return the root of the tree, and a dict of all the Table instances
-		return root, dict((  (catname, cat) for (catname, (cat, _)) in cats.iteritems() ))
+		return root, dict((  (tabname, table) for (tabname, (table, _)) in tables.iteritems() ))
 
-	def build_neighbor_cache(self, cat_path, margin_x_arcsec=30):
+	def build_neighbor_cache(self, tabname, margin_x_arcsec=30):
 		""" Cache the objects found within margin_x (arcsecs) of
 		    each cell into neighboring cells as well, to support
 		    efficient nearest-neighbor lookups.
@@ -1310,31 +1313,31 @@ class DB(object):
 
 		ntotal = 0
 		ncells = 0
-		query = "_ID, _LON, _LAT FROM '%s'" % (cat_path)
+		query = "_ID, _LON, _LAT FROM %s" % (tabname)
 		for (_, ncached) in self.query(query).execute([
-						(_cache_maker_mapper,  margin_x, self, cat_path),
-						(_cache_maker_reducer, self, cat_path)
+						(_cache_maker_mapper,  margin_x, self, tabname),
+						(_cache_maker_reducer, self, tabname)
 					]):
 			ntotal = ntotal + ncached
 			ncells = ncells + 1
 			#print self._cell_prefix(cell_id), ": ", ncached, " cached objects"
 		print "Total %d cached objects in %d cells" % (ntotal, ncells)
 
-	def compute_summary_stats(self, *cat_paths):
+	def compute_summary_stats(self, *tables):
 		""" Compute frequently used summary statistics and
 		    store them into the dbinfo file. This should be called
 		    to refresh the stats after insertions.
 		"""
 		from tasks import compute_counts
-		for cat_path in cat_paths:
-			cat = self.catalog(cat_path)
-			cat._nrows = compute_counts(self, cat_path)
-			cat._store_schema()
+		for tabname in tables:
+			table = self.table(tabname)
+			table._nrows = compute_counts(self, tabname)
+			table._store_schema()
 
 ###################################################################
 ## Auxilliary functions implementing DB.build_neighbor_cache
 ## functionallity
-def _cache_maker_mapper(qresult, margin_x, db, cat_path):
+def _cache_maker_mapper(qresult, margin_x, db, tabname):
 	# Map: fetch all rows to be copied to adjacent cells,
 	# yield them keyed by destination cell ID
 	for rows in qresult:
@@ -1380,7 +1383,7 @@ def _cache_maker_mapper(qresult, margin_x, db, cat_path):
 
 		# Fetch only the rows that are within the margin
 		idsInMargin = rows['_ID'][inMargin]
-		q           = db.query("* FROM '%s' WHERE np.in1d(_ID, idsInMargin, assume_unique=True)" % cat_path, {'idsInMargin': idsInMargin} )
+		q           = db.query("* FROM '%s' WHERE np.in1d(_ID, idsInMargin, assume_unique=True)" % tabname, {'idsInMargin': idsInMargin} )
 		data        = q.fetch_cell(cell_id)
 
 		# Send these to neighbors
@@ -1388,22 +1391,22 @@ def _cache_maker_mapper(qresult, margin_x, db, cat_path):
 			for neighbor in qresult.pix.neighboring_cells(cell_id):
 				yield (neighbor, data)
 
-		##print "Scanned margins of %s*.h5 (%d objects)" % (db.catalog(cat_path)._cell_prefix(cell_id), len(data))
+		##print "Scanned margins of %s*.h5 (%d objects)" % (db.table(tabname)._cell_prefix(cell_id), len(data))
 
-def _cache_maker_reducer(kv, db, cat_path):
+def _cache_maker_reducer(kv, db, tabname):
 	# Cache all rows to be cached in this cell
 	cell_id, rowblocks = kv
 
 	# Delete existing neighbors
-	cat = db.catalog(cat_path)
-	cat.drop_row_group(cell_id, 'cached')
+	table = db.table(tabname)
+	table.drop_row_group(cell_id, 'cached')
 
 	# Add to cache
 	ncached = 0
 	for rows in rowblocks:
-		cat.append(rows, cell_id=cell_id, group='cached')
+		table.append(rows, cell_id=cell_id, group='cached')
 		ncached += len(rows)
-		##print cell_id, len(rows), cat.pix.path_to_cell(cell_id)
+		##print cell_id, len(rows), table.pix.path_to_cell(cell_id)
 
 	# Return the number of new rows cached into this cell
 	yield cell_id, ncached
@@ -1446,6 +1449,7 @@ def _into_writer(kw, qwriter):
 
 def _fitskw_dumb(hdrs, kw):
 	# Easy way
+	import StringIO
 	res = []
 	for ahdr in hdrs:
 		hdr = pyfits.Header( txtfile=StringIO(ahdr) )
@@ -1530,6 +1534,7 @@ def ffitskw(uris, kw, default = False, db=None):
 
 	if db is None:
 		# _DB is implicitly defined inside queries
+		global _DB
 		db = _DB
 
 	ret = []

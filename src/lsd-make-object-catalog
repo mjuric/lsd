@@ -5,11 +5,12 @@
 
 import sys
 import getopt
+import lsd
 import lsd.smf as smf
 from   lsd.utils import *
 
 def usage():
-	print "Usage: %s [-c|--create] <db> <obj_cat_dir> <det_cat_dir>" % sys.argv[0]
+	print "Usage: %s [-c|--create] <db> <obj_table> <det_table>" % sys.argv[0]
 
 try:
 	optlist, args = getopt.getopt(sys.argv[1:], 'c', ['create'])
@@ -23,7 +24,7 @@ if len(args) != 3:
 	usage()
 	exit(-1)
 
-(dbdir, obj_catdir, det_catdir) = args
+(dbdir, obj_tabname, det_tabname) = args
 
 create = False
 for (o, a) in optlist:
@@ -35,4 +36,4 @@ for (o, a) in optlist:
 #
 
 db = lsd.DB(dbdir)
-smf.make_object_catalog(db, obj_catdir, det_catdir, create=create)
+smf.make_object_catalog(db, obj_tabname, det_tabname, create=create)

@@ -12,17 +12,17 @@ def make_record(dtype):
 class RowIter:
 	""" Iterator to permit iteration over ColGroup by row
 	"""
-	def __init__(self, table):
-		self.table = table
+	def __init__(self, cgroup):
+		self.cgroup = cgroup
 		self.at = 0
-		self.end = table.nrows()
+		self.end = cgroup.nrows()
 
 		if self.at < self.end:
 			# Cache some useful data
-			self.column_data = table.column_data
-			self.column_map = table.keys()
-#			self.row = table.row.copy()
-			self.row = make_record(table.dtype)
+			self.column_data = cgroup.column_data
+			self.column_map = cgroup.keys()
+#			self.row = cgroup.row.copy()
+			self.row = make_record(cgroup.dtype)
 
 	# Iterator protocol methods
 	def __iter__(self):
@@ -48,7 +48,7 @@ class ColGroup(object):
 	column_map = None	# Map from name->pos and pos->name
 	column_data = None	# A list of columns (individual numpy arrays)
 
-	row = None		# A np.void instance with the correct dtype for a row in this table
+	row = None		# A np.void instance with the correct dtype for a row in this cgroup
 
 	##
 	## dict-like interface implementation
@@ -63,10 +63,10 @@ class ColGroup(object):
 		return items
 
 	def __getitem__(self, key):
-		# return a subtable if column names (or a tuple or
+		# return a subcgroup if column names (or a tuple or
 		# a list of them) were given
 		if isinstance(key, str) or isinstance(key, list) or isinstance(key, tuple):
-			return self.subtable(key)
+			return self.subset(key)
 
 		# Compute the slice
 		if len(self) == 0 and isinstance(key, np.ndarray):
@@ -102,8 +102,8 @@ class ColGroup(object):
 		self.column_map.update(( (pos, colname)    for (pos, (colname, _)) in enumerate(cols) ))
 
 	def __setitem__(self, key, value):
-		# Append a column to the table, or replace data
-		# in an existing column or entire table slice
+		# Append a column to the cgroup, or replace data
+		# in an existing column or entire cgroup slice
 		if isinstance(key, str):
 			if key in self.column_map:
 				self.column_data[self.column_map[key]][:] = value
@@ -126,7 +126,7 @@ class ColGroup(object):
 				self.column_data[pos][key] = val
 
 	def __contains__(self, column):
-		# Test if a column exists in the table
+		# Test if a column exists in the cgroup
 		return column in self.column_map
 
 	#############
@@ -190,8 +190,8 @@ class ColGroup(object):
 
 #	def append_rows(self, other):
 #		# Sanity checks:
-#		#	1. All columns from the cset must be in table
-#		#	2. No extra columns are allowed to be in table
+#		#	1. All columns from the cset must be in cgroup
+#		#	2. No extra columns are allowed to be in cgroup
 #		#	3. The lengths of all columns must be the same
 #		l = None
 #		for (pos, col) in enumerate(self.column_data):
@@ -217,14 +217,14 @@ class ColGroup(object):
 #
 #		return self
 
-	def subtable(self, key):
-		# Return a subtable or a column
+	def subset(self, key):
+		# Return a subset or a column
 
 		# Return a single column
 		if type(key) is str:
 			return self.column_data[self.column_map[key]]
 
-		# Return a subtable
+		# Return a subset cgroup
 		return ColGroup((   (name, self.column_data[self.column_map[name]]) for name in key ))
 
 	def nrows(self):
@@ -253,7 +253,7 @@ class ColGroup(object):
 		return rows
 
 	def __str__(self):
-		# Print head/tail of the table
+		# Print head/tail of the cgroup
 		if len(self.column_data) == 0:
 			return ''
 
@@ -264,7 +264,7 @@ class ColGroup(object):
 		return ret[:-1] if ret != '' else ''
 
 	def sort(self, cols=()):
-		""" Sort the table by one or more (or all) columns
+		""" Sort the cgroup by one or more (or all) columns
 		"""
 		if len(cols) == 0:
 			cols = self.keys()
@@ -278,7 +278,7 @@ class ColGroup(object):
 	def __eq__(self, y):
 		"""
 			Emulate ndarray per-element equality comparison
-			Works for comparing table-to-table and table-to-structured ndarray
+			Works for comparing cgroup-to-cgroup and cgroup-to-structured ndarray
 
 			Everything else returns False
 		"""

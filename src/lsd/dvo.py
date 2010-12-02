@@ -1,4 +1,5 @@
-import catalog
+assert False, "This module is out of date and shouldn't be used until updated!"
+
 import pyfits
 import pool2
 import time
@@ -47,9 +48,9 @@ def import_from_dvo(catdir, dvo_files, create=False):
 	if create:
 		# Create the new database
 		cat = catalog.Table(catdir, name='ps1', mode='c')
-		cat.create_table('astrometry', { 'columns': to_dtype(astromCols), 'primary_key': 'id', 'spatial_keys': ('ra', 'dec'), "cached_flag": "cached" })
-		cat.create_table('photometry', { 'columns': to_dtype(photoCols) })
-		cat.create_table('import',     { 'columns': [
+		cat.create_cgroup('astrometry', { 'columns': to_dtype(astromCols), 'primary_key': 'id', 'spatial_keys': ('ra', 'dec'), "cached_flag": "cached" })
+		cat.create_cgroup('photometry', { 'columns': to_dtype(photoCols) })
+		cat.create_cgroup('import',     { 'columns': [
 				('file_id', 'a20'),
 				('hdr', 'i8'),
 				('cksum', 'a32'),

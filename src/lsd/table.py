@@ -3,21 +3,16 @@
 import subprocess
 import tables
 import numpy as np
-import pyfits
-import bhpix
-import time
-import sys
 import os
 import json
 import utils
 import cPickle
-from utils import is_scalar_of_type
-from StringIO import StringIO
-from pixelization import Pixelization
-from collections import OrderedDict
-from contextlib import contextmanager
-from colgroup import ColGroup
 import copy
+from utils        import is_scalar_of_type
+from pixelization import Pixelization
+from collections  import OrderedDict
+from contextlib   import contextmanager
+from colgroup     import ColGroup
 
 # Special return type used in _mapper() and Table.map_reduce
 # to denote that the returned value should not be yielded to
@@ -37,27 +32,25 @@ Default = None
 All = []
 
 class BLOBAtom(tables.ObjectAtom):
+	""" Same as tables.ObjectAtom, except that it uses the highest available
+        pickle protocol to serialize the objects.
     """
-    Sema as tables.ObjectAtom, except that it uses the highest available
-    pickle protocol to serialize the objects.
-    """
-    def _tobuffer(self, object_):
-        return cPickle.dumps(object_, -1)
+	def _tobuffer(self, object_):
+		return cPickle.dumps(object_, -1)
 
 class ColumnType(object):
 	""" A simple record representing columns. Built at runtime
-	    from _tables entries, and stored in Table.columns
+	    from _cgroups entries, and stored in Table.columns
 	"""
 	name    = None
-	table   = None
+	cgroup  = None
 	dtype   = None
 	is_blob = False
 
 class Table:
-	""" A spatially and temporally partitioned object catalog.
-	
-	    The usual workhorses are Table.fetch, Table.iterate
-	    and Table.map_reduce methods.
+	""" A spatially and temporally partitioned table. Typically
+	    shouldn't be used directly, but queried indirectly
+	    with DB.query()
 	"""
 
 #	class TableSchema(object):
@@ -69,27 +62,27 @@ class Table:
 	path = '.'
 	pix  = Pixelization(level=7, t0=54335, dt=1)
 				# t0: default starting epoch (== 2pm HST, Aug 22 2007 (night of GPC1 first light))
-				# t1: default temporal resolution (in days)
+				# td: default temporal resolution (in days)
 	_nrows = 0
 
 	NULL = 0		# The value for NULL in JOINed rows that had no matches
 
-	_tables  = None		# Tables in catalog ( OrderedDict of lists of (tablename, schema, primary_key) tuples; the first table is the primary one)
+	_cgroups = None		# Column groups in the table ( OrderedDict of lists of (tablename, schema, primary_key) tuples; the first table is the primary one)
 	_fgroups = None		# Map of group name -> absolute path
 	_filters = None		# Default PyTables filters to be applied to every Leaf in the file (can be overridden on per-tablet and per-blob basis)
 
-	columns       = None	# OrderedDict of ColumnType objects representing the schema
-	primary_table = None	# Primary table of this catalog ( the one holding the IDs and spatial/temporal keys)
-	primary_key   = None
-	spatial_keys  = None
-	temporal_key  = None
+	columns        = None	# OrderedDict of ColumnType objects representing the schema
+	primary_cgroup = None	# Primary cgroup of this table ( the one holding the IDs and spatial/temporal keys)
+	primary_key    = None
+	spatial_keys   = None
+	temporal_key   = None
 
 	### File name/path related methods
-	def _get_table_data_path(self, table):
-		""" Allow individual tables to override where they're placed
-		    This comes in handy for direct JOINs.
+	def _get_cgroup_data_path(self, cgroup):
+		""" Allow individual cgroups to override where they're placed
+		    This may come in handy for direct JOINs (not used yet).
 		"""
-		schema = self._get_schema(table)
+		schema = self._get_schema(cgroup)
 		return schema.get('path', '%s/tablets' % (self.path))
 
 	def _get_fgroup_path(self, fgroup):
@@ -102,11 +95,11 @@ class Table:
 		return self._fgroups[fgroup]['path']
 
 	def resolve_uri(self, uri, return_parts=False):
-		""" Resolve an lsd: URI referring to this catalog
+		""" Resolve an lsd: URI referring to this table
 		"""
 		assert uri[:4] == 'lsd:'
 
-		_, catname, fgroup, fn = uri.split(':', 3)
+		_, tabname, fgroup, fn = uri.split(':', 3)
 
 		(file, args, suffix) = self._get_fgroup_filter(fgroup)
 		path = '%s/%s%s' % (self._get_fgroup_path(fgroup), fn, suffix)
@@ -114,7 +107,7 @@ class Table:
 		if not return_parts:
 			return path
 		else:
-			return path, (catname, fgroup, fn), (file, args, suffix)
+			return path, (tabname, fgroup, fn), (file, args, suffix)
 
 	def _get_fgroup_filter(self, fgroup):
 		# Check for any filters associated with this fgroup
@@ -146,7 +139,7 @@ class Table:
 		""" Open the resource (a file) at the given URI and
 		    return a file-like object.
 		"""
-		(fn, (_, fgroup, _), (file, kwargs, _)) = self.resolve_uri(uri, return_parts=True)
+		(fn, (_, _, _), (file, kwargs, _)) = self.resolve_uri(uri, return_parts=True)
 
 		if mode != 'r':
 			# Create directory to the file, if it
@@ -173,27 +166,27 @@ class Table:
 		self._fgroups[fgroup] = fgroupdef
 		self._store_schema()
 
-	def _tablet_filename(self, table):
-		""" The filename of a tablet in a cell """
-		return '%s.%s.h5' % (self.name, table)
+	def _tablet_filename(self, cgroup):
+		""" The filename of a tablet of given cgroup """
+		return '%s.%s.h5' % (self.name, cgroup)
 
-	def _tablet_file(self, cell_id, table):
-		return '%s/%s/%s' % (self._get_table_data_path(table), self.pix.path_to_cell(cell_id), self._tablet_filename(table))
+	def _tablet_file(self, cell_id, cgroup):
+		return '%s/%s/%s' % (self._get_cgroup_data_path(cgroup), self.pix.path_to_cell(cell_id), self._tablet_filename(cgroup))
 
-	def tablet_exists(self, cell_id, table=None):
+	def tablet_exists(self, cell_id, cgroup=None):
 		""" Return True if the given tablet exists in cell_id.
-		    For pseudo-tables check the existence of primary_table
+		    For pseudo-tables check the existence of primary_cgroup
 		"""
-		if table is None or self._is_pseudotable(table):
-			table = self.primary_table
+		if cgroup is None or self._is_pseudotablet(cgroup):
+			cgroup = self.primary_cgroup
 
-		assert table in self._tables
+		assert cgroup in self._cgroups
 
-		fn = self._tablet_file(cell_id, table)
+		fn = self._tablet_file(cell_id, cgroup)
 		return os.access(fn, os.R_OK)
 
 	def _cell_prefix(self, cell_id):
-		return '%s/%s/%s' % (self._get_table_data_path(self.primary_table), self.pix.path_to_cell(cell_id), self.name)
+		return '%s/%s/%s' % (self._get_cgroup_data_path(self.primary_cgroup), self.pix.path_to_cell(cell_id), self.name)
 
 	def static_if_no_temporal(self, cell_id):
 		""" See if we have data in cell_id. If not, return a
@@ -215,8 +208,8 @@ class Table:
 	def get_cells(self, bounds=None, return_bounds=False):
 		""" Return a list of cells
 		"""
-		data_path = self._get_table_data_path(self.primary_table)
-		pattern   = self._tablet_filename(self.primary_table)
+		data_path = self._get_cgroup_data_path(self.primary_cgroup)
+		pattern   = self._tablet_filename(self.primary_cgroup)
 
 		return self.pix.get_cells(data_path, pattern, bounds, return_bounds=return_bounds)
 
@@ -240,24 +233,24 @@ class Table:
 		level, t0, dt = data["level"], data["t0"], data["dt"]
 		self.pix = Pixelization(level, t0, dt)
 
-		# Load table definitions
-		if isinstance(data['tables'], dict):
+		# Load cgroup definitions
+		if isinstance(data['cgroups'], dict):
 			# Backwards compatibility, keeps ordering because of objecct_pairs_hook=OrderedDict above
-			self._tables = data["tables"]
+			self._cgroups = data["cgroups"]
 		else:
-			self._tables = OrderedDict(data['tables'])
+			self._cgroups = OrderedDict(data['cgroups'])
 
 		# Postprocessing: fix cases where JSON restores arrays instead
 		# of tuples, and tuples are required
-		for _, schema in self._tables.iteritems():
+		for _, schema in self._cgroups.iteritems():
 			schema['columns'] = [ tuple(val) for val in schema['columns'] ]
 
 		self._fgroups = data.get('fgroups', {})
 		self._filters = data.get('filters', {})
 		self._aliases = data.get('aliases', {})
 
-		# Add pseudocolumns table
-		self._tables['_PSEUDOCOLS'] = \
+		# Add pseudocolumns cgroup
+		self._cgroups['_PSEUDOCOLS'] = \
 		{
 			'columns': [
 				('_CACHED', 'bool'),
@@ -272,7 +265,7 @@ class Table:
 		data = dict()
 		data["level"], data["t0"], data["dt"] = self.pix.level, self.pix.t0, self.pix.dt
 		data["nrows"] = self._nrows
-		data["tables"] = [ (name, schema) for (name, schema) in self._tables.iteritems() if name[0] != '_' ]
+		data["cgroups"] = [ (name, schema) for (name, schema) in self._cgroups.iteritems() if name[0] != '_' ]
 		data["name"] = self.name
 		data["fgroups"] = self._fgroups
 		data["filters"] = self._filters
@@ -283,21 +276,21 @@ class Table:
 		f.close()
 
 	def _rebuild_internal_schema(self):
-		# Rebuild internal representation of the schema from self._tables
+		# Rebuild internal representation of the schema from self._cgroups
 		# OrderedDict
 		self.columns = OrderedDict()
-		self.primary_table = None
+		self.primary_cgroup = None
 
-		for table, schema in self._tables.iteritems():
+		for cgroup, schema in self._cgroups.iteritems():
 			for colname, dtype in schema['columns']:
 				assert colname not in self.columns
 				self.columns[colname] = ColumnType()
 				self.columns[colname].name  = colname
 				self.columns[colname].dtype = np.dtype(dtype)
-				self.columns[colname].table = table
+				self.columns[colname].cgroup = cgroup
 
-			if self.primary_table is None and not self._is_pseudotable(table):
-				self.primary_table = table
+			if self.primary_cgroup is None and not self._is_pseudotablet(cgroup):
+				self.primary_cgroup = cgroup
 				if 'primary_key'  in schema:
 					self.primary_key  = self.columns[schema['primary_key']]
 				if 'temporal_key' in schema:
@@ -307,7 +300,7 @@ class Table:
 					self.spatial_keys = (self.columns[lon], self.columns[lat])
 			else:
 				# If any of these are defined, they must be defined in the
-				# primary table
+				# primary cgroup
 				assert 'primary_key'  not in schema
 				assert 'spatial_keys' not in schema
 				assert 'temporak_key' not in schema
@@ -321,7 +314,7 @@ class Table:
 
 	@property
 	def dtype(self):
-		# Return the dtype of a row in this catalog
+		# Return the dtype of a row in this table
 		return np.dtype([ (name, coltype.dtype) for (name, coltype) in self.columns.iteritems() ])
 
 	def dtype_for(self, cols):
@@ -330,13 +323,13 @@ class Table:
 
 	#################
 
-	def create_table(self, table, schema, ignore_if_exists=False):
+	def create_cgroup(self, cgroup, schema, ignore_if_exists=False):
 		# Create a new table and set it as primary if it
 		# has a primary_key
-		if table in self._tables and not ignore_if_exists:
-			raise Exception('Trying to create a table that already exists!')
-		if self._is_pseudotable(table):
-			raise Exception("Tables beginning with '_' are reserved for system use.")
+		if cgroup in self._cgroups and not ignore_if_exists:
+			raise Exception('Trying to create a cgroup that already exists!')
+		if self._is_pseudotablet(cgroup):
+			raise Exception("cgroups beginning with '_' are reserved for system use.")
 
 		schema = copy.deepcopy(schema)
 
@@ -352,19 +345,19 @@ class Table:
 					schema['blobs'][name] = {}
 
 		if 'spatial_keys' in schema and 'primary_key' not in schema:
-			raise Exception('Trying to create spatial keys in a non-primary table!')
+			raise Exception('Trying to create spatial keys in a non-primary cgroup!')
 
 		if 'primary_key' in schema:
-			if self.primary_table is not None:
-				raise Exception('Trying to create a primary table ("%s") while one ("%s") already exists!' % (table, self.primary_table))
-			self.primary_table = table
+			if self.primary_cgroup is not None:
+				raise Exception('Trying to create a primary cgroup ("%s") while one ("%s") already exists!' % (cgroup, self.primary_cgroup))
+			self.primary_cgroup = cgroup
 
 		if 'blobs' in schema:
 			cols = dict(schema['columns'])
 			for blobcol in schema['blobs']:
 				assert is_scalar_of_type(cols[blobcol], np.int64)
 
-		self._tables[table] = schema
+		self._cgroups[cgroup] = schema
 
 		self._rebuild_internal_schema()
 		self._store_schema()
@@ -385,7 +378,7 @@ class Table:
 		os.unlink(lockfile)
 
 	#### Low level tablet creation/access routines. These employ no locking
-	def _get_row_group(self, fp, group, table):
+	def _get_row_group(self, fp, group, cgroup):
 		""" Obtain a handle to the given HDF5 node, autocreating
 		    it if necessary.
 		"""
@@ -394,9 +387,9 @@ class Table:
 		g = getattr(fp.root, group, None)
 
 		if g is None:
-			schema = self._get_schema(table)
+			schema = self._get_schema(cgroup)
 
-			# Table
+			# cgroup
 			filters      = schema.get('filters', self._filters)
 			expectedrows = schema.get('expectedrows', 20*1000*1000)
 
@@ -434,16 +427,16 @@ class Table:
 		""" Delete the given HDF5 group and all its children
 		    from all tablets of cell cell_id
 		"""
-		with self.get_cell(cell_id, mode='w') as cell:
-			for table in self._tables:
-				if self._is_pseudotable(table):
+		with self.lock_cell(cell_id, mode='w') as cell:
+			for cgroup in self._cgroups:
+				if self._is_pseudotablet(cgroup):
 					continue
-				with cell.open(table) as fp:
+				with cell.open(cgroup) as fp:
 					if group in fp.root:
 						fp.removeNode('/', group, recursive=True);
 
-	def _create_tablet(self, fn, table):
-		# Create a tablet at a given path, for table 'table'
+	def _create_tablet(self, fn, cgroup):
+		# Create a tablet at a given path, for cgroup 'cgroup'
 		assert os.access(fn, os.R_OK) == False
 
 		# Create the cell directory if it doesn't exist
@@ -455,23 +448,23 @@ class Table:
 		fp  = tables.openFile(fn, mode='w')
 
 		# Force creation of the main subgroup
-		self._get_row_group(fp, 'main', table)
+		self._get_row_group(fp, 'main', cgroup)
 
 		return fp
 
-	def _open_tablet(self, cell_id, table, mode='r'):
+	def _open_tablet(self, cell_id, cgroup, mode='r'):
 		""" Open a given tablet in read or write mode, autocreating
 		    if necessary.
 		    
 		    No locking of any kind.
 		"""
-		fn = self._tablet_file(cell_id, table)
+		fn = self._tablet_file(cell_id, cgroup)
 
 		if mode == 'r':
 			fp = tables.openFile(fn)
 		elif mode == 'w':
 			if not os.path.isfile(fn):
-				fp = self._create_tablet(fn, table)
+				fp = self._create_tablet(fn, cgroup)
 			else:
 				fp = tables.openFile(fn, mode='a')
 		else:
@@ -479,19 +472,19 @@ class Table:
 
 		return fp
 
-	def _drop_tablet(self, cell_id, table):
+	def _drop_tablet(self, cell_id, cgroup):
 		# Remove a tablet file. No locking of any kind.
 		#
-		if not self.tablet_exists(cell_id, table):
+		if not self.tablet_exists(cell_id, cgroup):
 			return
 
-		fn = self._tablet_file(cell_id, table)
+		fn = self._tablet_file(cell_id, cgroup)
 		os.unlink(fn)
 
-	def _append_tablet(self, cell_id, table, rows):
+	def _append_tablet(self, cell_id, cgroup, rows):
 		# Append a set of rows to a tablet. No locking of any kind
 		#
-		fp  = self._open_tablet(cell_id, mode='w', table=table)
+		fp  = self._open_tablet(cell_id, mode='w', cgroup=cgroup)
 
 		fp.root.main.table.append(rows)
 
@@ -501,23 +494,23 @@ class Table:
 	def __init__(self, path, mode='r', name=None, level=Automatic, t0=Automatic, dt=Automatic):
 		if mode == 'c':
 			assert name is not None
-			self.create_catalog(name, path, level, t0, dt)
+			self._create(name, path, level, t0, dt)
 		else:
 			self.path = path
 			if not os.path.isdir(self.path):
 				raise IOError('Cannot access table: "%s" is inexistant or not readable.' % (path))
 			self._load_schema()
 
-	def create_catalog(self, name, path, level, t0, dt):
-		""" Create a new catalog and store its definition.
+	def _create(self, name, path, level, t0, dt):
+		""" Create an empty table and store its definition.
 		"""
 		self.path = path
 
 		utils.mkdir_p(self.path)
 		if os.path.isfile(self.path + '/schema.cfg'):
-			raise Exception("Creating a new catalog in '%s' would overwrite an existing one." % self.path)
+			raise Exception("Creating a new table in '%s' would overwrite an existing one." % self.path)
 
-		self._tables = OrderedDict()
+		self._cgroups = OrderedDict()
 		self._fgroups = dict()
 		self._filters = dict()
 		self._aliases = dict()
@@ -532,9 +525,6 @@ class Table:
 		self._store_schema()
 		self._load_schema()	# This will trigger the addition of pseudotables
 
-	def update(self, table, keys, rows):
-		raise Exception('Not implemented')
-
 	def define_alias(self, alias, colname):
 		""" Defines an aliase for a column name
 		"""
@@ -547,7 +537,7 @@ class Table:
 		""" Return the real column name for special column
 		    aliases.
 		"""
-		schema = self._get_schema(self.primary_table);
+		schema = self._get_schema(self.primary_cgroup);
 
 		# built-in aliases
 		if   colname == '_ID'     and 'primary_key'  in schema: return schema['primary_key']
@@ -561,11 +551,12 @@ class Table:
 		return self._aliases.get(colname, colname)
 
 	def append(self, cols_, group='main', cell_id=None, _update=False):
-		""" Insert a set of rows into a table in the database. Protects against
-		    multiple writers simultaneously inserting into the same file.
+		""" Insert or updates a set of rows into this table in the database.
+		    Protects against multiple writers simultaneously inserting into 
+		    the same table.
 
-		    If table being inserted into has spatial_keys, the rows being
-		    inserted MUST contain the primary key column.
+            TODO: Document the algorithm how the append/update happens.
+                  For now, see the comments in the source.
 
 		    Return: array of primary keys of inserted rows
 		"""
@@ -665,13 +656,13 @@ class Table:
 			incell = cells == cur_cell_id
 
 			# Store cell groups into their tablets
-			for table, schema in self._tables.iteritems():
-				if self._is_pseudotable(table):
+			for cgroup, schema in self._cgroups.iteritems():
+				if self._is_pseudotablet(cgroup):
 					continue
 
 				# Get the tablet file handles
-				fp    = self._open_tablet(cur_cell_id, mode='w', table=table)
-				g     = self._get_row_group(fp, group, table)
+				fp    = self._open_tablet(cur_cell_id, mode='w', cgroup=cgroup)
+				g     = self._get_row_group(fp, group, cgroup)
 				t     = g.table
 				blobs = schema['blobs'] if 'blobs' in schema else dict()
 
@@ -679,7 +670,7 @@ class Table:
 				colsT = ColGroup([ (colname, cols[colname][incell]) for colname, _ in schema['columns'] if colname in cols ])
 				colsB = dict([ (colname, colsT[colname]) for colname in colsT.keys() if colname in blobs ])
 
-				if table == self.primary_table:
+				if cgroup == self.primary_cgroup:
 					# Logical number of rows in this cell
 					nrows = len(t)
 
@@ -757,8 +748,8 @@ class Table:
 					# Close and reopen (otherwise truncate appears to have no effect)
 					# -- bug in PyTables ??
 					fp.close()
-					fp = self._open_tablet(cur_cell_id, mode='w', table=table)
-					g  = self._get_row_group(fp, group, table)
+					fp = self._open_tablet(cur_cell_id, mode='w', cgroup=cgroup)
+					g  = self._get_row_group(fp, group, cgroup)
 					t  = g.table
 
 					# Enlarge the array to accommodate new rows (this will also set them to zero)
@@ -785,7 +776,7 @@ class Table:
 				for colname in colsB:
 					# BLOB column - find unique objects, insert them
 					# into the BLOB VLArray, and put the indices to those
-					# into the actual table
+					# into the actual cgroup
 					assert colsB[colname].dtype == object
 					flatB = colsB[colname].reshape(colsB[colname].size)
 					idents = np.fromiter(( id(v) for v in flatB ), dtype=np.uint64, count=flatB.size)
@@ -843,18 +834,18 @@ class Table:
 
 	def __str__(self):
 		""" Return some basic (human readable) information about the
-		    catalog.
+		    table.
 		"""
 		i =     'Path:          %s\n' % self.path
 		i = i + 'Partitioning:  level=%d\n' % (self.pix.level)
 		i = i + '(t0, dt):      %f, %f \n' % (self.pix.t0, self.pix.dt)
 		i = i + 'Objects:       %d\n' % (self.nrows())
-		i = i + 'Tables:        %s' % str(self._tables.keys())
+		i = i + 'Column groups: %s' % str(self._cgroups.keys())
 		i = i + '\n'
 		s = ''
-		for table, schema in dict(self._tables).iteritems():
+		for cgroup, schema in dict(self._cgroups).iteritems():
 			s = s + '-'*31 + '\n'
-			s = s + 'Table \'' + table + '\':\n'
+			s = s + 'Column group \'' + cgroup + '\':\n'
 			s = s + "%20s %10s\n" % ('Column', 'Type')
 			s = s + '-'*31 + '\n'
 			for col in schema["columns"]:
@@ -862,8 +853,8 @@ class Table:
 			s = s + '-'*31 + '\n'
 		return i + s
 
-	def _get_schema(self, table):
-		return self._tables[table]
+	def _get_schema(self, cgroup):
+		return self._cgroups[cgroup]
 
 	def _smart_load_blobs(self, barray, refs):
 		""" Load an ndarray of BLOBs from a set of refs refs,
@@ -934,20 +925,20 @@ class Table:
 			return np.empty(refs.shape, dtype=np.object_)
 
 		# Get the table for this column
-		table = self.columns[column].table
+		cgroup = self.columns[column].cgroup
 
 		# revert to static sky cell if cell_id is temporal but
 		# unpopulated (happens in static-temporal JOINs)
 		cell_id = self.static_if_no_temporal(cell_id)
 
 		# load the blobs arrays
-		with self.get_cell(cell_id) as cell:
-			with cell.open(table) as fp:
+		with self.lock_cell(cell_id) as cell:
+			with cell.open(cgroup) as fp:
 				blobs = self._fetch_blobs_fp(fp, column, refs, include_cached)
 
 		return blobs
 
-	def fetch_tablet(self, cell_id, table=None, include_cached=False):
+	def fetch_tablet(self, cell_id, cgroup=None, include_cached=False):
 		""" Load and return all rows from a given tablet in
 		    a given cell_id.
 
@@ -955,48 +946,47 @@ class Table:
 		    tablet in that cell, a static sky cell corresponding
 		    to it is tried next.
 		"""
-		if table is None:
-			table = self.primary_table
+		if cgroup is None:
+			cgroup = self.primary_cgroup
 
 		# revert to static sky cell if cell_id is temporal but
 		# unpopulated (happens in static-temporal JOINs)
 		cell_id = self.static_if_no_temporal(cell_id)
 
-		if self._is_pseudotable(table):
-			return self._fetch_pseudotable(cell_id, table, include_cached)
+		if self._is_pseudotablet(cgroup):
+			return self._fetch_pseudotablet(cell_id, cgroup, include_cached)
 
-		if self.tablet_exists(cell_id, table):
-			with self.get_cell(cell_id) as cell:
-				with cell.open(table) as fp:
+		if self.tablet_exists(cell_id, cgroup):
+			with self.lock_cell(cell_id) as cell:
+				with cell.open(cgroup) as fp:
 					rows = fp.root.main.table.read()
-					nnoncached = len(rows)
 					if include_cached and 'cached' in fp.root:
 						rows2 = fp.root.cached.table.read()
 						# Make any neighbor cache BLOBs negative (so that fetch_blobs() know to
 						# look for them in the cache, instead of 'main')
-						schema = self._get_schema(table)
+						schema = self._get_schema(cgroup)
 						if 'blobs' in schema:
 							for blobcol in schema['blobs']:
 								rows2[blobcol] *= -1
 						# Append the data from cache to the main tablet
 						rows = np.append(rows, rows2)
 		else:
-			schema = self._get_schema(table)
+			schema = self._get_schema(cgroup)
 			rows = np.empty(0, dtype=np.dtype(schema['columns']))
 
 		return rows
 
-	def _fetch_pseudotable(self, cell_id, table, include_cached=False):
+	def _fetch_pseudotablet(self, cell_id, cgroup, include_cached=False):
 		# Pseudo-columns: _CACHED, _ROWID and _ROWIDX
 		# DO NOT CALL DIRECTLY !!
 
-		assert table == '_PSEUDOCOLS'
+		assert cgroup == '_PSEUDOCOLS'
 
 		# Find out how many rows are there in this cell
 		nrows1 = nrows2 = 0
-		if self.tablet_exists(cell_id, self.primary_table):
-			with self.get_cell(cell_id) as cell:
-				with cell.open(self.primary_table) as fp:
+		if self.tablet_exists(cell_id, self.primary_cgroup):
+			with self.lock_cell(cell_id) as cell:
+				with cell.open(self.primary_cgroup) as fp:
 					nrows1 = len(fp.root.main.table)
 					nrows2 = len(fp.root.cached.table) if (include_cached and 'cached' in fp.root) else 0
 		nrows = nrows1 + nrows2
@@ -1009,34 +999,34 @@ class Table:
 		pcols  = ColGroup([('_CACHED', cached), ('_ROWIDX', rowidx), ('_ROWID', rowid)])
 		return pcols
 
-	def _is_pseudotable(self, table):
-		return table[0] == '_'
+	def _is_pseudotablet(self, cgroup):
+		return cgroup[0] == '_'
 
 	class CellProxy:
-		cat     = None
+		table   = None
 		cell_id = None
 		mode    = None
 
-		def __init__(self, cat, cell_id, mode):
-			self.cat = cat
+		def __init__(self, table, cell_id, mode):
+			self.table = table
 			self.cell_id = cell_id
 			self.mode = mode
 
 		@contextmanager
-		def open(self, table=None):
-			if table is None:
-				table = self.cat.primary_table
+		def open(self, cgroup=None):
+			if cgroup is None:
+				cgroup = self.table.primary_cgroup
 
-			fp = self.cat._open_tablet(self.cell_id, mode=self.mode, table=table)
+			fp = self.table._open_tablet(self.cell_id, mode=self.mode, cgroup=cgroup)
 
 			yield fp
 
 			fp.close()
 
 	@contextmanager
-	def get_cell(self, cell_id, mode='r', retries=-1):
+	def lock_cell(self, cell_id, mode='r', retries=-1):
 		""" Open and return a proxy object for the given cell, that allows
-		    one to open individual tablets stored there.
+		    one to safely open individual tablets stored there.
 
 		    If mode is not 'r', the entire cell will be locked
 		    for the duration of this context manager, and automatically
@@ -1059,54 +1049,3 @@ class Table:
 
 	def get_temporal_key(self):
 		return self.temporal_key.name if self.temporal_key is not None else None
-
-###############################################################
-# Aux functions implementing Table.iterate and Table.fetch
-# functionallity
-def _iterate_mapper(rows, filter, filter_args):
-	if filter != None:
-		rows = filter(rows, *filter_args)
-	return rows
-
-###############################################################
-# Aux functions implementing Table.map_reduce functionallity
-def _reducer(kw, reducer, cat, reducer_args):
-	reducer.CATALOG = cat
-	return reducer(kw[0], kw[1], *reducer_args)
-
-def extract_columns(rows, cols=All):
-	""" Given a structured array rows, extract and keep
-	    only the list of columns given in cols.
-	"""
-	if cols == All:
-		return rows
-
-	rcols = [ (col, rows.dtype[col].str) for col in cols ]
-	ret   = np.empty(len(rows), np.dtype(rcols))
-	for col in cols: ret[col] = rows[col]
-
-	return ret
-
-def in_array(needles, haystack):
-	""" Return a boolean array of len(needles) set to 
-	    True for each needle that is found in the haystack.
-	"""
-	s = np.sort(haystack)
-	i = np.searchsorted(s, needles)
-
-	i[i == len(s)] = 0
-	in_arr = s[i] == needles
-
-	return in_arr
-
-def tstart():
-	return [ time.time() ]
-	
-def tick(s, t):
-	tt = time.time()
-	dt = tt - t[0]
-	print >> sys.stderr, s, ":", dt
-	t[0] = tt
-
-
-###################################################################
