@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-from catalog import Catalog
+from table import Table
 import query_parser as qp
 import numpy as np
 from colgroup import ColGroup
@@ -89,9 +89,9 @@ class TableCache:
 
 		return col
 
-class CatalogEntry:
-	cat      = None	# Catalog instance
-	name     = None # Catalog name, as named in the query (may be different from cat.name, if 'cat AS other' construct was used)
+class TableEntry:
+	cat      = None	# Table instance
+	name     = None # Table name, as named in the query (may be different from cat.name, if 'cat AS other' construct was used)
 	relation = None	# Relation to use to join with the parent
 	joins    = None	# List of JoinEntries
 
@@ -457,8 +457,8 @@ class QueryInstance(object):
 
 	# These will be filled in from a QueryEngine instance
 	db       = None		# The controlling database instance
-	catalogs = None		# A name:Catalog dict() with all the catalogs listed on the FROM line.
-	root	 = None		# CatalogEntry instance with the primary (root) catalog
+	catalogs = None		# A name:Table dict() with all the catalogs listed on the FROM line.
+	root	 = None		# TableEntry instance with the primary (root) catalog
 	query_clauses = None	# Tuple with parsed query clauses
 	pix      = None         # Pixelization object (TODO: this should be moved to class DB)
 	locals   = None		# Extra local variables to be made available within the query
@@ -655,7 +655,7 @@ class QueryInstance(object):
 
 		# A name of a catalog? Return a proxy object
 		if name in self.catalogs:
-			return CatProxy(self, name)
+			return TableProxy(self, name)
 
 		# Is this one of the local variables passed in by the user?
 		if name in self.locals:
@@ -899,8 +899,8 @@ class QueryEngine(object):
 	# These are a part of the mappers' public API
 	db       = None		# The controlling database instance
 	pix      = None         # Pixelization object (TODO: this should be moved to class DB)
-	catalogs = None		# A name:Catalog dict() with all the catalogs listed on the FROM line.
-	root	 = None		# CatalogEntry instance with the primary (root) catalog
+	catalogs = None		# A name:Table dict() with all the catalogs listed on the FROM line.
+	root	 = None		# TableEntry instance with the primary (root) catalog
 	query_clauses  = None	# Parsed query clauses
 	locals   = None		# Extra variables to be made local to the query
 
@@ -1048,7 +1048,7 @@ class Query(object):
 		    given bounds. Calls 'filter' callable (if given) to filter
 		    the returned rows.
 
-		    See the documentation for Catalog.fetch for discussion of
+		    See the documentation for Table.fetch for discussion of
 		    'filter' callable.
 		"""
 
@@ -1245,14 +1245,14 @@ class DB(object):
 			return False
 
 	def catalog(self, catname, create=False):
-		""" Given the catalog name, returns a Catalog object.
+		""" Given the catalog name, returns a Table object.
 		"""
 		if catname not in self.catalogs:
 			catpath = '%s/%s' % (self.path, catname)
 			if not create:
-				self.catalogs[catname] = Catalog(catpath)
+				self.catalogs[catname] = Table(catpath)
 			else:
-				self.catalogs[catname] = Catalog(catpath, name=catname, mode='c')
+				self.catalogs[catname] = Table(catpath, name=catname, mode='c')
 		else:
 			assert not create
 
@@ -1263,7 +1263,7 @@ class DB(object):
 
 		# Instantiate the catalogs
 		for catname, catpath, jointype in from_clause:
-			catlist.append( ( catname, (CatalogEntry(self.catalog(catpath), catname), jointype) ) )
+			catlist.append( ( catname, (TableEntry(self.catalog(catpath), catname), jointype) ) )
 		cats = dict(catlist)
 
 		# Discover and set up JOIN links based on defined JOIN relations
@@ -1295,7 +1295,7 @@ class DB(object):
 	
 		# TODO: Verify all catalogs are reachable from the root (== there are no circular JOINs)
 	
-		# Return the root of the tree, and a dict of all the Catalog instances
+		# Return the root of the tree, and a dict of all the Table instances
 		return root, dict((  (catname, cat) for (catname, (cat, _)) in cats.iteritems() ))
 
 	def build_neighbor_cache(self, cat_path, margin_x_arcsec=30):
@@ -1411,7 +1411,7 @@ def _cache_maker_reducer(kv, db, cat_path):
 ###############################################################
 # Aux. functions implementing Query.iterate() and
 # Query.fetch()
-class CatProxy:
+class TableProxy:
 	coldict = None
 	prefix = None
 

@@ -46,7 +46,7 @@ def import_from_dvo(catdir, dvo_files, create=False):
 	"""
 	if create:
 		# Create the new database
-		cat = catalog.Catalog(catdir, name='ps1', mode='c')
+		cat = catalog.Table(catdir, name='ps1', mode='c')
 		cat.create_table('astrometry', { 'columns': to_dtype(astromCols), 'primary_key': 'id', 'spatial_keys': ('ra', 'dec'), "cached_flag": "cached" })
 		cat.create_table('photometry', { 'columns': to_dtype(photoCols) })
 		cat.create_table('import',     { 'columns': [
@@ -61,7 +61,7 @@ def import_from_dvo(catdir, dvo_files, create=False):
 				'blobarr'
 			] })
 	else:
-		cat = catalog.Catalog(catdir)
+		cat = catalog.Table(catdir)
 
 	t0 = time.time()
 	at = 0; ntot = 0

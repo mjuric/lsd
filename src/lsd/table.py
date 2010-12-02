@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from colgroup import ColGroup
 import copy
 
-# Special return type used in _mapper() and Catalog.map_reduce
+# Special return type used in _mapper() and Table.map_reduce
 # to denote that the returned value should not be yielded to
 # the user
 # Impl. note: The class is intentionally derived from list, and
@@ -46,18 +46,18 @@ class BLOBAtom(tables.ObjectAtom):
 
 class ColumnType(object):
 	""" A simple record representing columns. Built at runtime
-	    from _tables entries, and stored in Catalog.columns
+	    from _tables entries, and stored in Table.columns
 	"""
 	name    = None
 	table   = None
 	dtype   = None
 	is_blob = False
 
-class Catalog:
+class Table:
 	""" A spatially and temporally partitioned object catalog.
 	
-	    The usual workhorses are Catalog.fetch, Catalog.iterate
-	    and Catalog.map_reduce methods.
+	    The usual workhorses are Table.fetch, Table.iterate
+	    and Table.map_reduce methods.
 	"""
 
 #	class TableSchema(object):
@@ -1044,7 +1044,7 @@ class Catalog:
 		"""
 		lockfile = None if mode == 'r' else self._lock_cell(cell_id, retries=retries)
 
-		yield Catalog.CellProxy(self, cell_id, mode=mode)
+		yield Table.CellProxy(self, cell_id, mode=mode)
 
 		if lockfile != None:
 			self._unlock_cell(lockfile)
@@ -1061,7 +1061,7 @@ class Catalog:
 		return self.temporal_key.name if self.temporal_key is not None else None
 
 ###############################################################
-# Aux functions implementing Catalog.iterate and Catalog.fetch
+# Aux functions implementing Table.iterate and Table.fetch
 # functionallity
 def _iterate_mapper(rows, filter, filter_args):
 	if filter != None:
@@ -1069,7 +1069,7 @@ def _iterate_mapper(rows, filter, filter_args):
 	return rows
 
 ###############################################################
-# Aux functions implementing Catalog.map_reduce functionallity
+# Aux functions implementing Table.map_reduce functionallity
 def _reducer(kw, reducer, cat, reducer_args):
 	reducer.CATALOG = cat
 	return reducer(kw[0], kw[1], *reducer_args)
