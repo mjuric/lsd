@@ -9,7 +9,7 @@ from itertools import izip
 import bhpix
 import catalog
 from utils import as_columns, gnomonic, gc_dist, unpack_callable
-from table import Table
+from colgroup import ColGroup
 from join_ops import IntoWriter
 
 ###################################################################
@@ -96,7 +96,7 @@ def _xmatch_mapper(qresult, cat_to_dir, radius, xm_catdir):
 	for rows in qresult:
 		cell_id  = rows.cell_id
 
-		join = Table()
+		join = ColGroup()
 
 		(id1, ra1, dec1) = rows.as_columns()
 		(id2, ra2, dec2) = db.query('_ID, _LON, _LAT FROM %s' % cat_to_dir).fetch_cell(cell_id, include_cached=True).as_columns()
@@ -264,8 +264,8 @@ def _accumulator(qresult, key, val, oval):
 			vals[i] = np.array(v, dtype=vdtype)
 #			vals[i] = v
 
-		# Return it as a Table(), keyed to this static cell_id
-		yield static_cell, Table([(key, keys), (oval, vals)])
+		# Return it as a ColGroup(), keyed to this static cell_id
+		yield static_cell, ColGroup([(key, keys), (oval, vals)])
 
 def _accumulate_and_write(qresult, qwriter, key, val, oval):
 	for static_cell, rows in _accumulator(qresult, key, val, oval):

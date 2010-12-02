@@ -10,7 +10,7 @@ def make_record(dtype):
 	return tmp[0].copy()
 
 class RowIter:
-	""" Iterator to permit iteration over Table by row
+	""" Iterator to permit iteration over ColGroup by row
 	"""
 	def __init__(self, table):
 		self.table = table
@@ -44,7 +44,7 @@ class RowIter:
 
 		return self.row
 
-class Table(object):
+class ColGroup(object):
 	column_map = None	# Map from name->pos and pos->name
 	column_data = None	# A list of columns (individual numpy arrays)
 
@@ -76,10 +76,10 @@ class Table(object):
 			key = np.s_[:]
 		ret = [ (self.column_map[pos], col[key])   for (pos, col) in enumerate(self.column_data) ]
 
-		# Return a Table if the key was an instance of a slice or ndarray,
+		# Return a ColGroup if the key was an instance of a slice or ndarray,
 		# and numpy.void structure otherwise
 		if isinstance(key, slice) or isinstance(key, np.ndarray):
-			return Table(ret)
+			return ColGroup(ret)
 		else:
 			#row = self.row.copy()
 			row = make_record(self.dtype)
@@ -110,7 +110,7 @@ class Table(object):
 			else:
 				self.add_column(key, value)
 		elif isinstance(key, slice):
-			if isinstance(value, Table):
+			if isinstance(value, ColGroup):
 				# fast but specialized
 				assert value.keys() == self.keys()
 				for (pos, _) in enumerate(self.column_data):
@@ -146,7 +146,7 @@ class Table(object):
 			template = np.zeros(size, dtype=dtype)
 			cols = [ (name, template[name]) for name in template.dtype.names ]
 
-		# Detect dict() and Table()s
+		# Detect dict() and ColGroup()s
 		if getattr(cols, 'items', None) is not None:
 			cols = cols.items()
 
@@ -225,7 +225,7 @@ class Table(object):
 			return self.column_data[self.column_map[key]]
 
 		# Return a subtable
-		return Table((   (name, self.column_data[self.column_map[name]]) for name in key ))
+		return ColGroup((   (name, self.column_data[self.column_map[name]]) for name in key ))
 
 	def nrows(self):
 		return 0 if len(self.column_data) == 0 else len(self.column_data[0])
@@ -282,7 +282,7 @@ class Table(object):
 
 			Everything else returns False
 		"""
-		if not isinstance(y, Table) and not isinstance(y, np.ndarray):
+		if not isinstance(y, ColGroup) and not isinstance(y, np.ndarray):
 			return False
 
 		assert self.dtype == y.dtype, str(self.dtype) + str(y.dtype)
@@ -299,7 +299,7 @@ if __name__ == "__main__":
 	ra   = np.arange(10, dtype=np.dtype('f8'))
 	dec  = np.arange(40, dtype='i4').reshape((10, 4))
 	blob = np.array([ [ 'blob' + str(j) + '_' + str(i) for i in xrange(3) ] for j in xrange(10)], dtype=np.object_)
-	tbl0  = Table([("ra", ra), ("dec", dec), ("blob", blob)])
+	tbl0  = ColGroup([("ra", ra), ("dec", dec), ("blob", blob)])
 
 	print "Single tbl0 row:", tbl0[3], '\n'
 	tbl0['blob'][3,2] = 'new thing'
@@ -321,13 +321,13 @@ if __name__ == "__main__":
 	dec  = np.arange(1000, dtype=np.dtype('f8'))
 	id   = np.arange(1000, dtype=np.dtype('i8'))
 	blob = np.array([ 'blob' + str(i) for i in xrange(1000) ], dtype=np.object_)
-	tbl  = Table([("ra", ra), ("dec", dec), ("id", id), ("blob", blob)])
+	tbl  = ColGroup([("ra", ra), ("dec", dec), ("id", id), ("blob", blob)])
 
 	ra2   = np.arange(1000, dtype=np.dtype('f8'))
 	dec2  = np.arange(1000, dtype=np.dtype('f8'))
 	id2   = np.arange(1000, dtype=np.dtype('i8'))
 	blob2 = np.array([ 'blob' + str(i) for i in xrange(1000) ], dtype=np.object_)
-	tbl2  = Table([("ra", ra2), ("dec", dec2), ("id", id2), ("blob", blob2)])
+	tbl2  = ColGroup([("ra", ra2), ("dec", dec2), ("id", id2), ("blob", blob2)])
 
 	tbl2['ra'] += 22
 	tbl2['dec'] += 33

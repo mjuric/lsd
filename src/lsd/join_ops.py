@@ -2,7 +2,7 @@
 from catalog import Catalog
 import query_parser as qp
 import numpy as np
-from table import Table
+from colgroup import ColGroup
 import bhpix
 import utils
 import pool2
@@ -16,7 +16,7 @@ from collections import defaultdict
 from interval import intervalset
 
 #
-# The result is a J = Table() with id, idx, isnull columns for each joined catalog
+# The result is a J = ColGroup() with id, idx, isnull columns for each joined catalog
 # To resolve a column from table X, load its tablet and do rows[J['X.idx']]
 #
 # Table should contain:
@@ -167,7 +167,7 @@ class CatalogEntry:
 
 			* If the result of the join is no rows, return None
 
-		    * If the result is not empty, the return is a Table() instance
+		    * If the result is not empty, the return is a ColGroup() instance
 		      that _CAN_ (but DOESN'T HAVE TO; see below) have the 
 		      following columns:
 
@@ -193,11 +193,11 @@ class CatalogEntry:
 		# Skip everything if this is a single-table read with no bounds
 		# ("you don't pay for what you don't use")
 		if self.relation is None and not hasBounds and not self.joins:
-			return Table()
+			return ColGroup()
 
 		# Load ourselves
 		id = tcache.load_column(cell_id, self.cat.get_primary_key(), self.cat)
-		s = Table()
+		s = ColGroup()
 		mykey = '%s._ID' % self.name
 
 		s.add_column(mykey, id)						# The key on which we'll do the joins
@@ -221,7 +221,7 @@ class CatalogEntry:
 			# Handle the special case of OUTER JOINed empty 's'
 			if len(s) == 0 and len(idx2) != 0:
 				assert isnull.all()
-				s = Table(dtype=s.dtype, size=1)
+				s = ColGroup(dtype=s.dtype, size=1)
 
 			# Perform the joins
 			r = r[idx1]
@@ -546,7 +546,7 @@ class QueryInstance(object):
 		if globals_ is None:
 			globals_ = self.prep_globals()
 
-		rows = Table()
+		rows = ColGroup()
 		for (asname, name) in select_clause:
 #			col = self[name]	# For debugging
 			col = eval(name, globals_, self)
@@ -720,7 +720,7 @@ class IntoWriter(object):
 		return np.empty(0, dtype='u8')
 
 	def write(self, cell_id, rows):
-		assert isinstance(rows, Table)
+		assert isinstance(rows, ColGroup)
 		self.rows = rows
 
 		# The catalog may have been created on previous pass

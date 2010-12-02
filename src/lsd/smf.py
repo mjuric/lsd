@@ -10,7 +10,7 @@ import copy
 import itertools as it
 import bhpix
 from utils import gnomonic, gc_dist
-import table
+from colgroup import ColGroup
 import sys, os
 
 # ra, dec, g, r, i, exposure.mjd_obs, chip.T XMATCH chip, exposure
@@ -795,7 +795,7 @@ def _obj_det_match(cells, db, obj_catdir, det_catdir, o2d_catdir, radius, _remat
 			continue;
 
 		# prep join table
-		join  = table.Table(dtype=o2d_cat.dtype_for(['_ID', '_M1', '_M2', '_DIST', '_LON', '_LAT']))
+		join  = ColGroup(dtype=o2d_cat.dtype_for(['_ID', '_M1', '_M2', '_DIST', '_LON', '_LAT']))
 		njoin = 0;
 		nobj0 = nobj;
 

@@ -16,7 +16,7 @@ from StringIO import StringIO
 from pixelization import Pixelization
 from collections import OrderedDict
 from contextlib import contextmanager
-from table import Table
+from colgroup import ColGroup
 import copy
 
 # Special return type used in _mapper() and Catalog.map_reduce
@@ -573,8 +573,8 @@ class Catalog:
 		assert group in ['main', 'cached']
 		assert _update == False or group != 'cached'
 
-		# Resolve aliases in the input, and prepare a Table()
-		cols = Table()
+		# Resolve aliases in the input, and prepare a ColGroup()
+		cols = ColGroup()
 		if getattr(cols_, 'items', None):			# Permit cols_ to be a dict()-like object
 			cols_ = cols_.items()
 		for name, col in cols_:
@@ -676,7 +676,7 @@ class Catalog:
 				blobs = schema['blobs'] if 'blobs' in schema else dict()
 
 				# select out only the columns belonging to this tablet and cell
-				colsT = Table([ (colname, cols[colname][incell]) for colname, _ in schema['columns'] if colname in cols ])
+				colsT = ColGroup([ (colname, cols[colname][incell]) for colname, _ in schema['columns'] if colname in cols ])
 				colsB = dict([ (colname, colsT[colname]) for colname in colsT.keys() if colname in blobs ])
 
 				if table == self.primary_table:
@@ -1006,7 +1006,7 @@ class Catalog:
 		rowidx = np.arange(0, nrows, dtype=np.uint64)		# _ROWIDX
 		rowid  = self.pix.id_for_cell_i(cell_id, rowidx)	# _ROWID
 
-		pcols  = Table([('_CACHED', cached), ('_ROWIDX', rowidx), ('_ROWID', rowid)])
+		pcols  = ColGroup([('_CACHED', cached), ('_ROWIDX', rowidx), ('_ROWID', rowid)])
 		return pcols
 
 	def _is_pseudotable(self, table):
