@@ -31,7 +31,7 @@ inc = [numpy_include]
 longdesc = """Large Survey Database"""
 
 args = { 
-	'name'			: "skysurvey",
+	'name'			: "lsd",
 	'version'		: "0.1",
 	'description'	 	: "Large Survey Database Python Module",
 	'long_description'	: longdesc,
@@ -57,9 +57,9 @@ args = {
 	'scripts'	: ['src/lsd-footprint', 'src/lsd-import-sdss', 'src/lsd-make-object-catalog',
 	 			'src/lsd-import-dvo', 'src/lsd-import-smf',
 	 			'src/lsd-query', 'src/lsd-xmatch'],
-	'packages'	: ['skysurvey'],
+	'packages'	: ['lsd'],
 	'package_dir'	: {'': 'src'},
-	'ext_modules'	: [Extension('skysurvey.native', ['src/native/main.cpp'], include_dirs=inc)]
+	'ext_modules'	: [Extension('lsd.native', ['src/native/main.cpp'], include_dirs=inc)]
 }
 
 setup(**args)

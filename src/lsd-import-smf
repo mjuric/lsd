@@ -5,9 +5,9 @@
 
 import sys
 import getopt
-import skysurvey.smf as smf
-from   skysurvey.utils import *
-from   skysurvey import DB
+import lsd.smf as smf
+from   lsd.utils import *
+from   lsd import DB
 
 def usage():
 	print "Usage: %s [-c|--create] [-f|--file-list] [-m|--mode] [-o|--offset] [-s|--stride] <db> <det_table> <exp_table> <smf_file(s)>" % sys.argv[0]

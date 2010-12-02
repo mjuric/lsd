@@ -4,12 +4,12 @@ import os
 import os.path
 import numpy as np
 import getopt
-import skysurvey as ss
-from skysurvey.bounds import rectangle, beam, make_canonical
-from skysurvey.utils import make_printf_string, as_tuple
-from skysurvey.interval import intervalset
 import pyfits
-import skysurvey.pool2 as pool2
+import lsd as lsd
+import lsd.pool2 as pool2
+from lsd.bounds   import rectangle, beam, make_canonical
+from lsd.utils    import make_printf_string, as_tuple
+from lsd.interval import intervalset
 
 def usage():
 	print "Usage: %s --bounds=bounds --format=[fits|text] --output=[outputfile] --quiet <database> <query>" % sys.argv[0]
@@ -64,7 +64,7 @@ dbdir, query = args
 
 bounds = make_canonical(bounds)
 
-db = ss.DB(dbdir)
+db = lsd.DB(dbdir)
 q = db.query(query)
 if format == 'text':
 	# Text output

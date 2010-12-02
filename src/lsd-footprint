@@ -4,9 +4,9 @@ import os
 import os.path
 import numpy as np
 import getopt
-import skysurvey as ss
-from skysurvey.bounds import rectangle
-from skysurvey.utils import make_printf_string, as_tuple
+import lsd
+from lsd.bounds import rectangle
+from lsd.utils import make_printf_string, as_tuple
 import pyfits
 
 def usage():
@@ -38,8 +38,8 @@ for o, a in optlist:
 		query = a
 
 #
-# Compute and store the sky coverage at a given resolution (see skysurvey/tasks.py on how this is implemented)
+# Compute and store the sky coverage at a given resolution (see lsd/tasks.py on how this is implemented)
 #
-db = ss.DB(dbdir)
-sky = ss.compute_coverage(db, query=query, dx=dx/60., bounds=bounds)
+db = lsd.DB(dbdir)
+sky = lsd.compute_coverage(db, query=query, dx=dx/60., bounds=bounds)
 pyfits.writeto(output, sky[::-1,::-1].transpose(), clobber=True)
