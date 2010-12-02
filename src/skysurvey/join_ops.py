@@ -516,10 +516,16 @@ class QueryInstance(object):
 	def prep_globals(self):
 		globals_ = globals()
 
+		# Import packages of interest (numpy)
+		for i in np.__all__:
+			if len(i) >= 2 and i[:2] == '__':
+				continue
+			globals_[i] = np.__dict__[i]
+
 		# Add implicit global objects present in queries
 		globals_['_PIX'] = self.root.cat.pix
 		globals_['_DB']  = self.db
-		
+
 		return globals_
 
 	def eval_where(self, globals_ = None):

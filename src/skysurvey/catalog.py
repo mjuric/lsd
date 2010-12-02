@@ -977,7 +977,7 @@ class Catalog:
 						schema = self._get_schema(table)
 						if 'blobs' in schema:
 							for blobcol in schema['blobs']:
-								rows[blobcol] *= -1
+								rows2[blobcol] *= -1
 						# Append the data from cache to the main tablet
 						rows = np.append(rows, rows2)
 		else:

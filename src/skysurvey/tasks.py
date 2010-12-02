@@ -21,7 +21,7 @@ def _coverage_mapper(qresult, dx, filter):
 		if filter is not None:
 			rows = filter(rows, *filter_args)
 
-		lon, lat = rows.as_columns()
+		lon, lat = list(rows.as_columns())[:2]
 	
 		i = (lon / dx).astype(int)
 		j = ((90 - lat) / dx).astype(int)

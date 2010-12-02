@@ -14,8 +14,14 @@ def parse(query):
 	select_clause = []
 	from_clause = []
 	into_clause = None
+	first = True
 	try:
 		for (id, token, _, _, _) in g:
+			if first: # Optional "SELECT"
+				first = False
+				if token.lower() == "select":
+					continue
+
 			if id == tokenize.ENDMARKER:
 				break
 
