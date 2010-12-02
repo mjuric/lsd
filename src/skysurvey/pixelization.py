@@ -4,7 +4,7 @@ import numpy as np
 import Polygon.Shapes
 from intervalset import intervalset
 from numpy import fabs
-import footprint
+import bounds as bn
 import glob, os
 from collections import defaultdict
 
@@ -227,7 +227,7 @@ class Pixelization(object):
 		if fabs(fabs(x) - fabs(y)) == 0.5:
 			# If it's a "halfpixel", return a triangle
 			# by clipping agains the sky
-			bounds &= footprint.ALLSKY
+			bounds &= bn.ALLSKY
 
 		return bounds
 
@@ -347,8 +347,8 @@ class Pixelization(object):
 				self._get_cells_recursive(outcells, data_path, bounds_xy & box, bounds_t, pattern, x2, y2)
 
 	def get_cells(self, data_path, pattern, bounds, return_bounds=False):
-		""" Return a list of (cell_id, footprint) tuples completely
-		    covering the requested footprint.
+		""" Return a list of (cell_id, bounds) tuples completely
+		    covering the requested bounds.
 
 			bounds must be a list of (Polygon, intervalset) tuples.
 
@@ -359,7 +359,7 @@ class Pixelization(object):
 
 		# Special case of bounds=None (all sky)
 		if bounds == None:
-			bounds = [(footprint.ALLSKY, intervalset((-np.inf, np.inf)))]
+			bounds = [(bn.ALLSKY, intervalset((-np.inf, np.inf)))]
 
 		# Find all existing cells satisfying the bounds
 		cells = defaultdict(dict)

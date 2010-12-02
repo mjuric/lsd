@@ -1044,8 +1044,8 @@ class Query(object):
 
 	def iterate(self, bounds=None, include_cached=False, cells=[], return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None, _yield_empty=False):
 		""" Yield rows (either on a row-by-row basis if return_blocks==False
-		    or in chunks (numpy structured array)) within a
-		    given footprint. Calls 'filter' callable (if given) to filter
+		    or in chunks (numpy structured array)) within the
+		    given bounds. Calls 'filter' callable (if given) to filter
 		    the returned rows.
 
 		    See the documentation for Catalog.fetch for discussion of
@@ -1065,8 +1065,8 @@ class Query(object):
 					yield row
 
 	def fetch(self, bounds=None, include_cached=False, cells=[], filter=None, testbounds=True, nworkers=None, progress_callback=None):
-		""" Return a table (numpy structured array) of all rows within a
-		    given footprint. Calls 'filter' callable (if given) to filter
+		""" Return a table (numpy structured array) of all rows within the
+		    given bounds. Calls 'filter' callable (if given) to filter
 		    the returned rows. Returns None if there are no rows to return.
 
 		    The 'filter' callable should expect a single argument, rows,
@@ -1607,12 +1607,12 @@ if __name__ == "__main__":
 		compute_coverage(db, query)
 		exit()
 
-		import footprint as foot
+		import bounds
 		query = "_ID, ps1_det._ID, ps1_exp._ID, sdss._ID FROM '../../../ps1/sdss'(outer) as sdss, '../../../ps1/ps1_obj' as ps1_obj, '../../../ps1/ps1_det' as ps1_det, '../../../ps1/ps1_exp'(outer) as ps1_exp WHERE True"
 		query = "_ID, ps1_det._ID, ps1_exp._ID, sdss._ID FROM sdss(outer), ps1_obj, ps1_det, ps1_exp(outer)"
 		cell_id = np.uint64(6496868600547115008 + 0xFFFFFFFF)
 		include_cached = False
-		bounds = [(foot.rectangle(120, 20, 160, 60), None)]
+		bounds = [(bounds.rectangle(120, 20, 160, 60), None)]
 		bounds = None
 #		for rows in QueryEngine(query).on_cell(cell_id, bounds, include_cached):
 #			pass;

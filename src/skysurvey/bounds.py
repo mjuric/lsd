@@ -150,9 +150,9 @@ def __part_to_xy_t(part):
 
 	return (bounds_xy, bounds_t)
 
-def make_canonical(foot):
+def make_canonical(bounds):
 	"""
-	    The footprint can either be a Polyon, a specific 
+	    The bounds specification can either be a Polyon, a specific 
 	    cell_id integer, a (t0, t1) time tuple, or an array
 	    of these.
 
@@ -161,13 +161,10 @@ def make_canonical(foot):
 	from collections import defaultdict
 
 	# Handle all-sky requests, and scalars
-	if foot == []:
-		#foots = [ ALLSKY ]
+	if bounds == []:
 		return None
-	elif not isinstance(foot, list):
-		foots = [ foot ]
-	else:
-		foots = foot
+	elif not isinstance(bounds, list):
+		bounds = [ bounds ]
 
 	# Now our input is a list that consists of one or more of:
 	# a) Polygon instances
@@ -182,13 +179,13 @@ def make_canonical(foot):
 	#	form a single ([Polygon], interval)
 	# 	call _get_cell_recursive to obtain cell_ids, append them to output
 
-	#print "***INPUT:", foots;
+	#print "***INPUT:", bounds;
 
-	# cell->foot->times
+	# cell->bound_xy->times
 	cells = defaultdict(dict)
 	part0 = []
 	parts = []
-	for v in foots:
+	for v in bounds:
 		if   isinstance(v, Polygon.Polygon) or isinstance(v, intervalset):
 			part0.append(v)
 		elif isinstance(v, tuple) or isinstance(v, list):
