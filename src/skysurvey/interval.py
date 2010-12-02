@@ -2,7 +2,6 @@
 
 from bisect import bisect_left, bisect_right
 import numpy as np
-from interval import interval
 
 def intersect(i1, i2):
 	# i1, i2 are two tuples

@@ -13,7 +13,7 @@ import copy
 import urlparse
 from contextlib import contextmanager
 from collections import defaultdict
-from intervalset import intervalset
+from interval import intervalset
 
 #
 # The result is a J = Table() with id, idx, isnull columns for each joined catalog

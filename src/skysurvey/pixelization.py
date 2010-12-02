@@ -2,7 +2,7 @@
 import bhpix
 import numpy as np
 import Polygon.Shapes
-from intervalset import intervalset
+from interval import intervalset
 from numpy import fabs
 import bounds as bn
 import glob, os

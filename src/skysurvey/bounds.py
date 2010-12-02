@@ -5,6 +5,7 @@ import bhpix
 import numpy as np
 from slalib import sla_galeq
 from numpy import sin, cos, radians, degrees, sqrt, arcsin, arctan2, pi
+from interval import intervalset
 
 # Full sky in bhpix projection
 ALLSKY = Polygon.Polygon([
@@ -130,8 +131,6 @@ def rectangle(lon0, lat0, lon1, lat1, coordsys='equ'):
 		raise Exception('Unknown coordinate system')
 
 	return make_healpix_poly(lon, lat)
-
-from intervalset import intervalset
 
 def __part_to_xy_t(part):
 	""" Used by canonicize_bounds """
