@@ -59,7 +59,8 @@ args = {
 	 			'src/lsd-query', 'src/lsd-xmatch'],
 	'packages'	: ['lsd'],
 	'package_dir'	: {'': 'src'},
-	'ext_modules'	: [Extension('lsd.native', ['src/native/main.cpp'], include_dirs=inc)]
+	'ext_modules'	: [Extension('lsd.native', ['src/native/main.cpp'], include_dirs=inc)],
+	'data_files'    : [('share/lsd/examples', ['src/examples/latitude_histogram.py', 'src/examples/count_rows.py'])]
 }
 
 setup(**args)

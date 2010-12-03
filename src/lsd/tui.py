@@ -63,7 +63,7 @@ def tui_getstdopts(optlist):
 	""" Parses standard options out of command
 	    line arguments and environment variables.
 	"""
-	dbdir = os.getenv('LSDDB', None)
+	dbdir = os.getenv('LSD_DB', None)
 
 	for o, a in optlist:
 		if o in ('-d', '--db'):
@@ -71,7 +71,7 @@ def tui_getstdopts(optlist):
 
 	if dbdir is None:
 		raise TUIException('No database specified. Please specify a '
-			'database using the --db option or LSDDB environment '
+			'database using the --db option or LSD_DB environment '
 			'variable.')
 
 	return (dbdir,)
