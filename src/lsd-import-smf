@@ -6,25 +6,15 @@
 import sys
 import getopt
 import lsd.smf as smf
-from   lsd.utils import *
-from   lsd import DB
+from lsd.utils import *
+from lsd import DB
+from lsd.tui import *
 
 def usage():
-	print "Usage: %s [-c|--create] [-f|--file-list] [-m|--mode] [-o|--offset] [-s|--stride] <db> <det_table> <exp_table> <smf_file(s)>" % sys.argv[0]
+	print "Usage: %s [-c|--create] [-f|--file-list] [-m|--mode] [-o|--offset] [-s|--stride] <det_table> <exp_table> <smf_file(s)>" % sys.argv[0]
 
-try:
-	optlist, args = getopt.getopt(sys.argv[1:], 'cfm:s:o:', ['create', 'file-list', 'mode=', 'stride=', 'offset='])
-except getopt.GetoptError, err:
-	print str(err)
-	usage()
-	exit(-1)
-
-if len(args) < 4:
-	print "Error: Not enough command line arguments."
-	usage()
-	exit(-1)
-
-(dbdir, det_tabname, exp_tabname, files) = args[0], args[1], args[2], args[3:]
+optlist, (dbdir,), args = tui_getopt('cfm:s:o:', ['create', 'file-list', 'mode=', 'stride=', 'offset='], 3, usage, argn_max=-1)
+(det_tabname, exp_tabname, files) = args[0], args[1], args[2:]
 
 create = False
 filelist = False

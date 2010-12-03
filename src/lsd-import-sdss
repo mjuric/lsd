@@ -7,35 +7,24 @@ import sys
 import getopt
 import lsd
 import lsd.sdss  as sdss
-from   lsd.utils import *
+from lsd.utils import *
+from lsd.tui import *
 
 def usage():
-	print "Usage: %s [-c|--create] <db> <sdss_table> <sweep_file_dir>" % sys.argv[0]
+	print "Usage: %s [-c|--create] <sdss_table> <sweep_file_dir>" % sys.argv[0]
 
-try:
-	optlist, args = getopt.getopt(sys.argv[1:], 'c', ['create'])
-except getopt.GetoptError, err:
-	print str(err)
-	usage()
-	exit(-1)
-
-if len(args) != 3:
-	print "Error: Not enough command line arguments."
-	usage()
-	exit(-1)
+optlist, (dbdir,), (tabname, sweep_dir) = tui_getopt('c', ['create'], 2, usage)
 
 create = False
 for (o, a) in optlist:
 	if o == '-c' or o == '--create':
 		create = True
 
-dbdir, tabname, sweep_dir = args
-
-db = lsd.DB(dbdir)
-
 #
 # Actual work
 #
+db = lsd.DB(dbdir)
+
 files = shell('find "' + sweep_dir + '" -name "*star*.fits.gz" -o -name "*gal*.fits.gz" ').splitlines()
 
 print "Importing SDSS catalog:"

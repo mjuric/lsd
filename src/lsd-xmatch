@@ -7,21 +7,12 @@ import sys
 import getopt
 import lsd
 from   lsd.utils import *
+from   lsd.tui   import *
 
 def usage():
-	print "Usage: %s [--radius=<arcsec>] <db> <from_table> <to_table>" % sys.argv[0]
+	print "Usage: %s --db=dbdir --radius=[1arcsec] <from_table> <to_table>" % sys.argv[0]
 
-try:
-	optlist, args = getopt.getopt(sys.argv[1:], 'hr:', ['help', 'radius='])
-except getopt.GetoptError, err:
-	print str(err)
-	usage()
-	exit(-1)
-
-if len(args) != 3:
-	print "Error: Incorrect number of command-line arguments."
-	usage()
-	exit(-1)
+optlist, (dbdir,), (from_tabname, to_tabname) = tui_getopt('hr:', ['help', 'radius='], 2, usage)
 
 radius = 1.
 for (o, a) in optlist:
@@ -30,8 +21,6 @@ for (o, a) in optlist:
 		exit()
 	if o == '-r' or o == '--radius':
 		radius = float(a)
-
-(dbdir, from_tabname, to_tabname) = args
 
 #
 # Actual work

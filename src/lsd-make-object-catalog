@@ -7,24 +7,13 @@ import sys
 import getopt
 import lsd
 import lsd.smf as smf
-from   lsd.utils import *
+from lsd.utils import *
+from lsd.tui import *
 
 def usage():
-	print "Usage: %s [-c|--create] <db> <obj_table> <det_table>" % sys.argv[0]
+	print "Usage: %s [-c|--create] <obj_table> <det_table>" % sys.argv[0]
 
-try:
-	optlist, args = getopt.getopt(sys.argv[1:], 'c', ['create'])
-except getopt.GetoptError, err:
-	print str(err)
-	usage()
-	exit(-1)
-
-if len(args) != 3:
-	print "Error: Not enough command line arguments."
-	usage()
-	exit(-1)
-
-(dbdir, obj_tabname, det_tabname) = args
+optlist, (dbdir,), (obj_tabname, det_tabname) = tui_getopt('c', ['create'], 2, usage)
 
 create = False
 for (o, a) in optlist:
