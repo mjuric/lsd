@@ -947,9 +947,14 @@ class Query(object):
 	db      = None
 	qengine = None
 	qwriter = None
+	query_string = None
+
+	def __str__(self):
+		return self.query_string
 
 	def __init__(self, db, query, locals = {}):
-		self.db		 = db
+		self.db		  = db
+		self.query_string = query
 		self.qengine = QueryEngine(db, query, locals=locals)
 
 		(_, _, _, into_clause) = qp.parse(query)

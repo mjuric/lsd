@@ -111,11 +111,12 @@ def progress_pct(stage, step, input, index, result):
 			self.pct = 5
 
 			if   stage == 'map':
-				sys.stderr.write("[%s (%d elem): " % (self.head, self.len)),
+				sys.stderr.write(" "),
 				self.sign = ':'
 			elif stage == "reduce":
-				sys.stderr.write('|'),
+#				sys.stderr.write('|'),
 				self.sign = '+'
+			sys.stderr.write("[%d el.]" % self.len),
 	elif step == 'step':
 		self.at = self.at + 1
 		pct = 100. * self.at / self.len
@@ -125,7 +126,7 @@ def progress_pct(stage, step, input, index, result):
 	elif step == 'end':
 		if stage == self.endstage:
 			t = time.time() - self.t0
-			sys.stderr.write(']  %.2f sec\n' % t)
+			sys.stderr.write('>  %.2f sec\n' % t)
 			del self.t0
 
 def progress_dots(stage, step, input, index, result):

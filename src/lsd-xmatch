@@ -5,11 +5,11 @@
 
 import sys
 import getopt
-import lsd.smf as smf
+import lsd
 from   lsd.utils import *
 
 def usage():
-	print "Usage: %s [--radius=<arcsec>] <db> <from_cat> <to_cat>" % sys.argv[0]
+	print "Usage: %s [--radius=<arcsec>] <db> <from_table> <to_table>" % sys.argv[0]
 
 try:
 	optlist, args = getopt.getopt(sys.argv[1:], 'hr:', ['help', 'radius='])
@@ -23,9 +23,6 @@ if len(args) != 3:
 	usage()
 	exit(-1)
 
-(dbdir, from_cat_dir, to_cat_dir) = args
-db = lsd.DB(dbdir)
-
 radius = 1.
 for (o, a) in optlist:
 	if o == '-h' or o == '--help':
@@ -34,8 +31,11 @@ for (o, a) in optlist:
 	if o == '-r' or o == '--radius':
 		radius = float(a)
 
+(dbdir, from_tabname, to_tabname) = args
+
 #
 # Actual work
 #
 
-lsd.xmatch(db, from_cat_dir, to_cat_dir, radius/3600.)
+db = lsd.DB(dbdir)
+lsd.xmatch(db, from_tabname, to_tabname, radius/3600.)
