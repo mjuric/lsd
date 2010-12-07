@@ -95,27 +95,19 @@ class Pixelization(object):
 			id &= self.id2cell_mask
 
 		# TODO: Transformation verification, remove when debugged
-		if np.any(i == 0xFFFFFFFF):
-			ux, uy, ut = self._xyt_from_cell_id(id)
-			ui = 0xFFFFFFFF
-			(cx, cy) = bhpix.xy_center(x, y, self.level)
-		else:
-			ux, uy, ut, ui = self._xyti_from_id(id)
-			(cx, cy) = bhpix.xy_center(x, y, self.xybits)
-		ct = ct * self.dt + self.t0
-		ci = i
-		if np.any(cx != ux) or np.any(cy != uy) or np.any(ct != ut) or np.any(ci != ui):
-			print cc, "==", cu, ct, "==", ut
-			raise Exception("**** Bug detected ****")			
-
-		# NOTE: Test tranformation correctness (comment this out for production code)
-		#(ux, uy, ut, ui) = self._xyti_from_id(id)
-		#cc = bhpix.xy_center(x, y, self.xybits)
-		#cu = bhpix.xy_center(ux, uy, self.xybits)
-		#ct = ct * self.dt + self.t0
-		#if np.any(cc[0] != cu[0]) or np.any(cc[1] != cu[1]) or np.any(ct != ut) or np.any(ui != 0):
-		#	print cc, "==", cu, ct, "==", ut
-		#	raise Exception("**** Bug detected ****")			
+		if False:
+			if np.any(i == 0xFFFFFFFF):
+				ux, uy, ut = self._xyt_from_cell_id(id)
+				ui = 0xFFFFFFFF
+				(cx, cy) = bhpix.xy_center(x, y, self.level)
+			else:
+				ux, uy, ut, ui = self._xyti_from_id(id)
+				(cx, cy) = bhpix.xy_center(x, y, self.xybits)
+			ct = ct * self.dt + self.t0
+			ci = i
+			if np.any(cx != ux) or np.any(cy != uy) or np.any(ct != ut) or np.any(ci != ui):
+				print cc, "==", cu, ct, "==", ut
+				raise Exception("**** Bug detected ****")			
 
 		return id
 
