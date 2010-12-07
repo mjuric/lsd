@@ -96,7 +96,7 @@ class TableEntry:
 		self.name  = name if name is not None else name
 		self.joins = []
 
-	def get_cells(self, bounds):
+	def get_cells(self, bounds, include_cached=True):
 		""" Get populated cells of self.table that overlap
 			the requested bounds. Do it recursively.
 			
@@ -111,7 +111,7 @@ class TableEntry:
 
 		# Fetch our populated cells
 		pix = self.table.pix
-		cells = self.table.get_cells(bounds, return_bounds=True)
+		cells = self.table.get_cells(bounds, return_bounds=True, include_cached=include_cached)
 
 		# Autodetect if we're a static or temporal table
 		self.static = True
@@ -992,7 +992,7 @@ class Query(object):
 
 		# Add cells within bounds
 		if len(cells) == 0 or bounds is not None:
-			partspecs.update(self.qengine.root.get_cells(bounds))
+			partspecs.update(self.qengine.root.get_cells(bounds, include_cached=include_cached))
 
 		# Tell _mapper not to test spacetime boundaries if the user requested so
 		if not testbounds:
@@ -1334,10 +1334,18 @@ class DB(object):
 		    to refresh the stats after insertions.
 		"""
 		from tasks import compute_counts
+		from fcache import TabletTreeCache
 		for tabname in tables:
 			table = self.table(tabname)
+
+			# Scan the number of rows
 			table._nrows = compute_counts(self, tabname)
 			table._store_schema()
+
+			# Compute the tablet tree cache
+			data_path = table._get_cgroup_data_path(table.primary_cgroup)
+			pattern   = table._tablet_filename(table.primary_cgroup)
+			table.tablet_tree = TabletTreeCache().create_cache(table.pix, data_path, pattern, table.path + '/tablet_tree.pkl')
 
 ###################################################################
 ## Auxilliary functions implementing DB.build_neighbor_cache

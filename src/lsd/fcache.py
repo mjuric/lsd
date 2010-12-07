@@ -23,7 +23,7 @@ def _scan_recursive_kernel(xy, lev, cc):
 	cc._scan_recursive(lev, x, y)
 	yield cc._bmap, cc._leaves
 
-class CellPathCache:
+class TabletTreeCache:
 	_bmap = None
 
 	_bmaps = None
@@ -83,7 +83,7 @@ class CellPathCache:
 				else:
 					# Static cell
 					tbounds = bounds_t
-					assert self._leaves[offs][0] == 1, "There can be only one static cell (x,y,t=%s,%s,%s)" % (x, y, t)
+					assert self._leaves[offs][0] == np.inf, "There can be only one static cell (x,y,t=%s,%s,%s)" % (x, y, t)
 
 				# Compute cell ID
 				cell_id = (x, y, t)
@@ -102,7 +102,7 @@ class CellPathCache:
 				j2 = j*2 + dj
 				self._get_cells_recursive(outcells, bounds_xy & box, bounds_t, i2, j2, lev+1, dx/2)
 
-	def get_cells(self, bounds=None, return_bounds=False, include_cached=False):
+	def get_cells(self, bounds=None, return_bounds=False, include_cached=True):
 		""" Return a list of (cell_id, bounds) tuples completely
 		    covering the requested bounds.
 
@@ -162,7 +162,7 @@ class CellPathCache:
 		for fn in glob.iglob(pattern):
 			# parse out the time, construct cell ID
 			(kind, _) = fn.split('/')[-2:]
-			t = self.t0 if kind == 'static' else float(kind[1:])
+			t = self._pix.t0 if kind == 'static' else float(kind[1:])
 
 			yield t, fn
 
@@ -278,7 +278,7 @@ class CellPathCache:
 
 	def create_cache(self, pix, tablet_path, pattern, fn):
 		self.scan_table(pix, tablet_path, pattern)
-		cPickle.dump((self._bmaps, self._leaves, self._pix), file('fcache.pkl', mode='w'))
+		cPickle.dump((self._bmaps, self._leaves, self._pix), file(fn, mode='w'))
 		return self
 
 	def __init__(self, fn = None):
@@ -291,9 +291,9 @@ class CellPathCache:
 if __name__ == '__main__':
 	if 1:
 		pix = Pixelization(7, 54335, 1)
-		cc = CellPathCache().create_cache(pix, 'pdb/ps1_det/tablets', 'ps1_det.astrometry.h5', 'fcache.pkl')
+		cc = TabletTreeCache().create_cache(pix, 'pdb/ps1_det/tablets', 'ps1_det.astrometry.h5', 'fcache.pkl')
 	else:
-		cc = CellPathCache('fcache.pkl')
+		cc = TabletTreeCache('fcache.pkl')
 		cells = cc.get_cells()
 		print "%s cells." % len(cells)
 		print cells[:10]
