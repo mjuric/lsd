@@ -1,23 +1,11 @@
 #!/usr/bin/env python
 
-import os, os.path
-
-def suppress_keyboard_interrupt_message():
-	old_excepthook = sys.excepthook
-
-	def new_hook(type, value, traceback):
-		if type != exceptions.KeyboardInterrupt:
-			old_excepthook(type, value, traceback)
-		else:
-			pass
-
-	sys.excepthook = new_hook
-
+import os, os.path, sys
 
 # Use NUMPY_INCLUDE environment variable to set where to find NumPy
 numpy_include=os.getenv('NUMPY_INCLUDE', '/opt/python2.7/lib/python2.7/site-packages/numpy/core/include/')
 if not os.path.isfile(numpy_include + '/numpy/arrayobject.h'):
-	print >> sys.stderr, "Failed to find " . numpy_include + '/numpy/arrayobject.h'
+	print >> sys.stderr, "Failed to find " + numpy_include + '/numpy/arrayobject.h'
 	print >> sys.stderr, "Error: could not find arrayobject.h. Please set the NumPy include path using NUMPY_INCLUDE environment variable"
 	exit(-1)
 
