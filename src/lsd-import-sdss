@@ -13,12 +13,15 @@ from lsd.tui import *
 def usage():
 	print "Usage: %s [-c|--create] <sdss_table> <sweep_file_dir>" % sys.argv[0]
 
-optlist, (dbdir,), (tabname, sweep_dir) = tui_getopt('c', ['create'], 2, usage)
+optlist, (dbdir,), (tabname, sweep_dir) = tui_getopt('ca', ['create', 'all'], 2, usage)
 
 create = False
+all = False
 for (o, a) in optlist:
 	if o == '-c' or o == '--create':
 		create = True
+	if o == '-a' or o == '--all':
+		all = True
 
 #
 # Actual work
@@ -28,7 +31,7 @@ db = lsd.DB(dbdir)
 files = shell('find "' + sweep_dir + '" -name "*star*.fits.gz" -o -name "*gal*.fits.gz" ').splitlines()
 
 print "Importing SDSS catalog:"
-sdss.import_from_sweeps(db, tabname, files, create)
+sdss.import_from_sweeps(db, tabname, files, create, all)
 print " done."
 
 print "Building neighbor cache ",

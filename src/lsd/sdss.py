@@ -72,7 +72,7 @@ F1_EDGE			 = (2**2)
 F2_DEBLENDED_AS_MOVING	 = (2**0)
 RS_SURVEY_PRIMARY	 = (2**8)
 
-def import_from_sweeps(db, sdss_tabname, sweep_files, create=False):
+def import_from_sweeps(db, sdss_tabname, sweep_files, create=False, all=False):
 	""" Import an SDSS catalog from a collection of SDSS sweep files.
 
 	    Note: Assumes underlying shared storage for all output table
@@ -87,7 +87,7 @@ def import_from_sweeps(db, sdss_tabname, sweep_files, create=False):
 	t0 = time.time()
 	at = 0; ntot = 0
 	pool = pool2.Pool()
-	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (db, sdss_tabname), progress_callback=pool2.progress_pass):
+	for (file, nloaded, nin) in pool.imap_unordered(sweep_files, import_from_sweeps_aux, (db, sdss_tabname, all), progress_callback=pool2.progress_pass):
 		at = at + 1
 		ntot = ntot + nloaded
 		t1 = time.time()
@@ -97,18 +97,22 @@ def import_from_sweeps(db, sdss_tabname, sweep_files, create=False):
 		print('  ===> Imported %-70s [%d/%d, %5.2f%%] +%-6d %9d (%.0f/%.0f min.)' % (sfile, at, len(sweep_files), 100 * float(at) / len(sweep_files), nloaded, ntot, time_pass, time_tot))
 	del pool
 
-def import_from_sweeps_aux(file, db, tabname):
+def import_from_sweeps_aux(file, db, tabname, all=False):
 	# import an SDSS run
 	dat   = pyfits.getdata(file, 1)
 	table = db.table(tabname)
 
-	F1 = F1_BRIGHT | F1_SATURATED | F1_NODEBLEND | F1_EDGE;	# these must not be set for an object to qualify
-	F2 = F2_DEBLENDED_AS_MOVING				# these must not be set for an object to qualify	# Compute which objects pass flag cuts
+	if not all:
+		F1 = F1_BRIGHT | F1_SATURATED | F1_NODEBLEND | F1_EDGE;	# these must not be set for an object to qualify
+		F2 = F2_DEBLENDED_AS_MOVING				# these must not be set for an object to qualify	# Compute which objects pass flag cuts
 
-	f1 = dat.field('objc_flags')
-	f2 = dat.field('objc_flags2')
-	rs = dat.field('resolve_status')
-	ok = (rs & RS_SURVEY_PRIMARY != 0) & (f1 & F1 == 0) & (f2 & F2 == 0)
+		f1 = dat.field('objc_flags')
+		f2 = dat.field('objc_flags2')
+		rs = dat.field('resolve_status')
+		ok = (rs & RS_SURVEY_PRIMARY != 0) & (f1 & F1 == 0) & (f2 & F2 == 0)
+		ok |= all
+	else:
+		ok = np.ones(len(dat.field('resolve_status')), dtype=bool)
 
 	# Import objects passing some basic quality cuts
 	if any(ok != 0):
