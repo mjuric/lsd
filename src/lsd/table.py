@@ -4,6 +4,7 @@ import subprocess
 import tables
 import numpy as np
 import os
+import sys
 import json
 import utils
 import cPickle
@@ -209,15 +210,15 @@ class Table:
 	def get_cells(self, bounds=None, return_bounds=False, include_cached=True):
 		""" Return a list of cells
 		"""
-		try:
-			return self.tablet_tree.get_cells(bounds, return_bounds, include_cached)
-		except AttributeError:
-			print "Warning: No up to date tablet tree cache for table %s. Query startup will be slow." % self.path
+		if getattr(self, 'tablet_tree', None) is None:
+			print >> sys.stderr, "No up-to-date tablet tree cache for table %s. Rebuilding." % (self.name),
 
 			data_path = self._get_cgroup_data_path(self.primary_cgroup)
 			pattern   = self._tablet_filename(self.primary_cgroup)
 
-			return self.pix.get_cells(data_path, pattern, bounds, return_bounds=return_bounds)
+			self.tablet_tree = TabletTreeCache().create_cache(self.pix, data_path, pattern, self.path + '/tablet_tree.pkl')
+
+		return self.tablet_tree.get_cells(bounds, return_bounds, include_cached)
 
 	def is_cell_local(self, cell_id):
 		""" Returns True if the cell is reachable from the

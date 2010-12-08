@@ -1,5 +1,56 @@
 #!/usr/bin/env python
+"""
+fcache module - TabletTreeCache implementation
 
+TabletTreeCache class scans and caches the layout of the <table>/tablets
+directory structure into a fast bitmap+list data structure pickled in
+<table>/tablet_tree.pkl file. These are used by Table.get_cells() routine to
+substantially speed up the cell scan.
+
+On very large tables (e.g., ps1_det), this class accellerates the get_cells()
+~ 40x (6 seconds instead of 240).
+
+The main acceleration data structures are a 2D (W x W) numpy array of
+indices (bmap), and a 1D ndarray of (mjd, next) pairs into which the indices
+in the image refer to (leaves). Leaves is (logically) a singly linked list
+of all temporal cells within the spatial cell, with the root of the list
+being pointed to from bmap. <W> above is 2**lev, where lev is the bhpix
+level of pixelization of the table.
+
+To look up whether a particular static cell exists and what it
+contains do:
+        - Compute the (i,j) indices of the cell in bhpix projection,
+	  where (i, j) range from [0, W)
+	- If bmap[i, j] == 0, the cell is unpopulated
+	- If bmap[i, j] != 0, its value is an index, 'offs' into leaves.
+	- leaves[offs] is a (mjd, next) tuple, with mjd being the
+	  temporal coordinate of the cell.
+	- The absolute value of next is the offset to the next entry in
+	  leaves that is a temporal cell within this static cell (i.e., offs
+	  += abs(leaves[offs]['next']) will position you to the next cell).  Its
+	  sign is negative if the cell contain only neighbor
+	  caches; otherwise it's positive. This allows us to quickly cull
+	  cache-only cells from queries that don't care about it.	  
+	  A special value abs(next) = fcache.END_MARKER denotes there are no
+	  more temporal cells.
+
+	- For further acceleration, there is a series of images of lower
+	  resolution (W/2 x W/2), (W/4 x W/4), ... (1 x 1), stored in a
+	  dict() named bmaps. These can be used to quickly rule out there
+	  are no populated cells in a larger partitioning of space. E.g., if
+	  pixel (0, 0) is zero in the (2 x 2) map, it means there are no
+	  populated cells with x < 0, y < 0 bhpix coordinates (and the
+	  search of that entire subtree can be avoided). TabletTreeCache
+	  makes use of these 'mipmaps' to accelerate get_cells().
+
+TODO:
+	- this cache should be build/maintained whenever the database is
+	  modified. Modifications to Table._create_tablet and Table.append
+	  should do the trick.
+	- instead of pickling, we should mmap the bmaps and leaves
+	  structures. It will make them easier to update
+"""
+import logging
 import cPickle, os, glob
 import tables
 import pool2
@@ -10,6 +61,8 @@ from pixelization import Pixelization
 from interval import intervalset
 from collections import defaultdict
 from itertools import izip
+
+END_MARKER=0x7FFFFFFF
 
 def _get_cells_kernel(ij, lev, cc, bounds_xy, bounds_t):
 	i, j = ij
@@ -57,11 +110,12 @@ class TabletTreeCache:
 		if offs > 1:
 			# Get the cell_ids for leaf cells matching pattern
 			xybounds = None if(bounds_xy.area() == box.area()) else bounds_xy
-			while True:
-				(t, has_data) = self._leaves[offs]
-				offs += 1
-				if t == np.inf:
-					break
+			next = 0
+			while next != END_MARKER:
+				(t, next) = self._leaves[offs]
+				has_data = next > 0
+				next = abs(next)
+				offs += next
 
 				if not has_data and not self._include_cached:
 					continue
@@ -83,7 +137,7 @@ class TabletTreeCache:
 				else:
 					# Static cell
 					tbounds = bounds_t
-					assert self._leaves[offs][0] == np.inf, "There can be only one static cell (x,y,t=%s,%s,%s)" % (x, y, t)
+					assert next == END_MARKER, "There can be only one static cell (x,y,t=%s,%s,%s)" % (x, y, t)
 
 				# Compute cell ID
 				cell_id = (x, y, t)
@@ -178,25 +232,29 @@ class TabletTreeCache:
 		siblings = list(self._get_temporal_siblings(path, self._pattern))
 		if len(siblings):
 			offs0 = len(self._leaves)
-			for t, fn in siblings:
-				# TODO: check if there are any non-cached data in here
+			for i, (t, fn) in enumerate(siblings):
+				# check if there are any non-cached data in here
 				try:
 					with tables.openFile(fn) as fp:
 						has_data = len(fp.root.main.table) > 0
 				except tables.exceptions.NoSuchNodeError:
 					has_data = 0
-#				has_data = 1
+
+				# Construct the "next" pointer
+				next = 1 if i+1 != len(siblings) else END_MARKER
+
+				# Convention: next is positive if there's data, negative if caches-only
+				if not has_data:
+					next *= -1
 
 				# Add to leaves
-				self._leaves.append((t, has_data))
+				self._leaves.append((t, next))
 
 			if offs0 != len(self._leaves):
 				assert self._bmap.shape[0] == bhpix.width(lev), "Update this code if multi-resolution cells need to be supported"
 				w2 = bhpix.width(lev)/2
 				i, j = (x // dx + w2, y // dx + w2)
 				self._bmap[i, j] = offs0
-				# Add end marker
-				self._leaves.append((np.inf, False))
 				##print i, j, offs0, len(self._leaves)-offs0
 		else:
 			# Recursively subdivide the four subpixels
@@ -208,7 +266,7 @@ class TabletTreeCache:
 	def _reset(self):
 		w = bhpix.width(self._pix.level)
 
-		self._leaves = [(0, False)]*2			# A floating point list of (mjd, has_data) tuples. has_data is True if the cell has non-cached data.
+		self._leaves = [(np.inf, END_MARKER)]*2		# A floating point list of (mjd, next_delta) tuples. next_delta is positive if the cell has non-cached data.
 		self._bmap = np.zeros((w, w), dtype=np.int32)	# A map with indices to self._leaves for static cells that have an entry, zero otherwise
 
 	def scan_table(self, pix, tablet_path, pattern):
@@ -240,21 +298,23 @@ class TabletTreeCache:
 				assert np.all(bmap[b != 0] == 0)
 				bmap |= b
 			del pool
+			# Store the number of elements in the array to 'next' field of the first array element
+			leaves[0] = (np.inf, len(leaves))
 			self._bmap = bmap
 			self._leaves = leaves
 
 		# Convert _leaves to numpy array
-		npl = np.empty(len(self._leaves), dtype=[('mjd', 'f4'), ('has_data', 'bool')])
-		for (i, (offs, has_data)) in enumerate(self._leaves):
-			npl[i] = (offs, has_data)
+		npl = np.empty(len(self._leaves), dtype=[('mjd', 'f4'), ('next', 'i4')])
+		for (i, (offs, next)) in enumerate(self._leaves):
+			npl[i] = (offs, next)
 		self._leaves = npl
 
 		# Recompute mipmaps
 		self._compute_mipmaps()
 
-		nstatic = np.sum(self._bmap != 0)
-		print "%s cells in %s static cells" % (len(self._leaves)-nstatic-2, nstatic)
-		print "%s cells with data, the rest contain caches only." % (sum(npl[npl['mjd'] < np.inf]['has_data']))
+		#nstatic = np.sum(self._bmap != 0)
+		#logging.debug("%s cells in %s static cells" % (len(self._leaves)-2, nstatic))
+		#logging.debug("%s cells with data, the rest contain caches only." % (sum(npl['next'] > 0)-2))
 		#print self._bmaps[0]
 		#print self._bmaps[1]
 		#print self._bmaps[2]
@@ -291,9 +351,10 @@ class TabletTreeCache:
 if __name__ == '__main__':
 	if 1:
 		pix = Pixelization(7, 54335, 1)
-		cc = TabletTreeCache().create_cache(pix, 'pdb/ps1_det/tablets', 'ps1_det.astrometry.h5', 'fcache.pkl')
+		#cc = TabletTreeCache().create_cache(pix, 'db/ps1_det/tablets', 'ps1_det.astrometry.h5', 'fcache.pkl')
+		cc = TabletTreeCache().create_cache(pix, 'db/sdss/tablets', 'sdss.main.h5', 'fcache.pkl')
 	else:
 		cc = TabletTreeCache('fcache.pkl')
-		cells = cc.get_cells()
+		cells = cc.get_cells(include_cached=False)
 		print "%s cells." % len(cells)
 		print cells[:10]
