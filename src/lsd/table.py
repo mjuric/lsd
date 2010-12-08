@@ -4,10 +4,12 @@ import subprocess
 import tables
 import numpy as np
 import os
+import sys
 import json
 import utils
 import cPickle
 import copy
+from fcache       import TabletTreeCache
 from utils        import is_scalar_of_type
 from pixelization import Pixelization
 from collections  import OrderedDict
@@ -205,13 +207,18 @@ class Table:
 		#print "Reverting to static sky", self._cell_prefix(cell_id)
 		return cell_id
 
-	def get_cells(self, bounds=None, return_bounds=False):
+	def get_cells(self, bounds=None, return_bounds=False, include_cached=True):
 		""" Return a list of cells
 		"""
-		data_path = self._get_cgroup_data_path(self.primary_cgroup)
-		pattern   = self._tablet_filename(self.primary_cgroup)
+		if getattr(self, 'tablet_tree', None) is None:
+			print >> sys.stderr, "No up-to-date tablet tree cache for table %s. Rebuilding." % (self.name),
 
-		return self.pix.get_cells(data_path, pattern, bounds, return_bounds=return_bounds)
+			data_path = self._get_cgroup_data_path(self.primary_cgroup)
+			pattern   = self._tablet_filename(self.primary_cgroup)
+
+			self.tablet_tree = TabletTreeCache().create_cache(self.pix, data_path, pattern, self.path + '/tablet_tree.pkl')
+
+		return self.tablet_tree.get_cells(bounds, return_bounds, include_cached)
 
 	def is_cell_local(self, cell_id):
 		""" Returns True if the cell is reachable from the
@@ -223,7 +230,8 @@ class Table:
 	#############
 
 	def _load_schema(self):
-		data = json.loads(file(self.path + '/schema.cfg').read(), object_pairs_hook=OrderedDict)
+		schemacfg = self.path + '/schema.cfg'
+		data = json.loads(file(schemacfg).read(), object_pairs_hook=OrderedDict)
 
 		self.name = data["name"]
 		self._nrows = data.get("nrows", None)
@@ -258,6 +266,13 @@ class Table:
 				('_ROWID',  'u8')
 			]
 		}
+
+		# Load the file tree cache if it's not older than 'schema.cfg' file
+		# TODO: I should add a last row modification time to schema.cfg and decide
+		#       based on that whether to invalidate the cache or not.
+		tabtreepkl = self.path + '/tablet_tree.pkl'
+		if os.path.exists(tabtreepkl) and (os.stat(schemacfg)[8] < os.stat(tabtreepkl)[8]):
+			self.tablet_tree = TabletTreeCache(tabtreepkl)
 
 		self._rebuild_internal_schema()
 

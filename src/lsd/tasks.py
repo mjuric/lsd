@@ -21,7 +21,18 @@ def _coverage_mapper(qresult, dx, filter):
 			rows = filter(rows, *filter_args)
 
 		lon, lat = list(rows.as_columns())[:2]
-	
+
+		# Work around PS1 bugs:
+		tofix = (lon < 0) | (lon >= 360)
+		if np.any(tofix):
+			#print "Fixing RIGHT ASCENSION in cell ", rows.cell_id
+			lon[tofix] = np.fmod(np.fmod(lon[tofix], 360.) + 360., 360.)
+		tofix = (lat < -90) | (lat > 90)
+		if np.any(tofix):
+			print "Fixing DECLINATION in cell ", rows.cell_id
+			lat[lat < -90] = -90
+			lat[lat > 90]  = 90
+
 		i = (lon / dx).astype(int)
 		j = ((90 - lat) / dx).astype(int)
 	
@@ -29,6 +40,10 @@ def _coverage_mapper(qresult, dx, filter):
 		w = imax - imin + 1
 		h = jmax - jmin + 1
 		i -= imin; j -= jmin
+		if w <= 0 or h <= 0 or w > 10800 or h > 5400:
+			print w, h
+			print rows.cell_id
+			exit()
 	
 		if False:
 			# Binning (method #1, straightforward but slow)
@@ -49,12 +64,13 @@ def compute_coverage(db, query, dx = 0.5, bounds=None, include_cached=False, fil
 	    a filter function if given. The output is a starcount
 	    array in (ra, dec) binned to <dx> resolution.
 	"""
-	width  = int(round(360/dx))
-	height = int(round(180/dx))
+	width  = int(np.ceil(360/dx))
+	height = int(np.ceil(180/dx)+1)	# The +1 is because the poles are included
 
 	sky = np.zeros((width, height))
 
 	for (patch, imin, jmin) in db.query(query).execute([(_coverage_mapper, dx, filter)], bounds=bounds, include_cached=include_cached):
+		#print patch.shape, imin, jmin, sky.shape
 		sky[imin:imin + patch.shape[0], jmin:jmin + patch.shape[1]] += patch
 
 	print "Objects:", sky.sum()
