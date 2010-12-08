@@ -14,50 +14,50 @@ sdss_table_def = \
 		#
 		'main': {
 			'columns': [
-				('sdss_id',		'u8',	''),			# computed column
-				('ra',			'f8',	'ra'),
-				('dec',			'f8',	'dec'),
-				('l',			'f8',	''),			# computed column
-				('b',			'f8',	''),			# computed column
-				('type',		'i4',	'objc_type'),
-				('flags',		'i4',	'objc_flags'),
-				('flags2',		'i4',	'objc_flags2'),
-				('resolve_status',	'i2',	'resolve_status')
+				('sdss_id',		'u8',	''),			# LSD ID
+				('ra',			'f8',	'ra'),                  # Right ascension
+				('dec',			'f8',	'dec'),                 # Declination
+				('l',			'f8',	''),			# Galactic longitude
+				('b',			'f8',	''),			# Galactic latitude
+				('type',		'i4',	'objc_type'),           # Object type (see SDSS docs for interpretation)
+				('flags',		'i4',	'objc_flags'),          # Flags (see SDSS docs for interpretation)
+				('flags2',		'i4',	'objc_flags2'),         # Flags (see SDSS docs for interpretation)
+				('resolve_status',	'i2',	'resolve_status')       # See SDSS docs for interpretation
 			],
 			'primary_key' : 'sdss_id',
 			'spatial_keys': ('ra', 'dec'),
 		},
 		'survey': {
 			'columns': [
-				('run', 		'i4',	'run'),
-				('camcol',		'i4',	'camcol'),
-				('field',		'i4',	'field'),
-				('objid',		'i4',	'id'),
+				('run', 		'i4',	'run'),                 # SDSS Run number
+				('camcol',		'i4',	'camcol'),              # Camera column
+				('field',		'i4',	'field'),               # SDSS field number
+				('objid',		'i4',	'id'),                  # SDSS object id (within a given field)
 			],
 			'exposure_key': 'run',
 		},
 		'photometry': {
 			'columns': [
-				('u',			'f4',	''),
-				('uErr',		'f4',	''),
-				('uExt',		'f4',	''),
-				('uCalib',		'i2',	''),
-				('g',			'f4',	''),
-				('gErr',		'f4',	''),
-				('gExt',		'f4',	''),
-				('gCalib',		'i2',	''),
-				('r',			'f4',	''),
-				('rErr',		'f4',	''),
-				('rExt',		'f4',	''),
-				('rCalib',		'i2',	''),
-				('i',			'f4',	''),
-				('iErr',		'f4',	''),
-				('iExt',		'f4',	''),
-				('iCalib',		'i2',	''),
-				('z',			'f4',	''),
-				('zErr',		'f4',	''),
-				('zExt',		'f4',	''),
-				('zCalib',		'i2',	''),
+				('u',			'f4',	''),			# u-band photometry (AB mags)
+				('uErr',		'f4',	''),                    # u-band error estimate
+				('uExt',		'f4',	''),                    # u-band extinction (from SFD'98)
+				('uCalib',		'i2',	''),                    # u-band flags (see SDSS docs)
+				('g',			'f4',	''),                    # g-band photometry (AB mags)
+				('gErr',		'f4',	''),                    # g-band error estimate
+				('gExt',		'f4',	''),                    # g-band extinction (from SFD'98)
+				('gCalib',		'i2',	''),                    # g-band flags (see SDSS docs)
+				('r',			'f4',	''),                    # r-band photometry (AB mags)
+				('rErr',		'f4',	''),                    # r-band error estimate
+				('rExt',		'f4',	''),                    # r-band extinction (from SFD'98)
+				('rCalib',		'i2',	''),                    # r-band flags (see SDSS docs)
+				('i',			'f4',	''),                    # i-band photometry (AB mags)
+				('iErr',		'f4',	''),                    # i-band error estimate
+				('iExt',		'f4',	''),                    # i-band extinction (from SFD'98)
+				('iCalib',		'i2',	''),                    # i-band flags (see SDSS docs)
+				('z',			'f4',	''),                    # z-band photometry (AB mags)
+				('zErr',		'f4',	''),                    # z-band error estimate
+				('zExt',		'f4',	''),                    # z-band extinction (from SFD'98)
+				('zCalib',		'i2',	''),                    # z-band flags (see SDSS docs)
 			],
 		}
 	}
