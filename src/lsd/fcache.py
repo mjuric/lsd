@@ -115,7 +115,8 @@ class TabletTreeCache:
 				(t, next) = self._leaves[offs]
 				has_data = next > 0
 				next = abs(next)
-				offs += next
+				if next != END_MARKER:	# Not really necessary, but numpy warns of overflow otherwise.
+					offs += next
 
 				if not has_data and not self._include_cached:
 					continue

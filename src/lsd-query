@@ -11,6 +11,8 @@ from lsd.utils    import make_printf_string, as_tuple
 from lsd.interval import intervalset
 from lsd.tui import *
 
+np.seterr(over='raise')
+
 def usage():
 	print "Usage: %s --db=dbdir --bounds=bounds --format=[fits|text] --output=[output,fits] --quiet <query>" % sys.argv[0]
 
