@@ -5,10 +5,10 @@
 
 import sys
 import getopt
+from lsd.tui import *
 import lsd.smf as smf
 from lsd.utils import *
 from lsd import DB
-from lsd.tui import *
 
 def usage():
 	print "Usage: %s [-c|--create] [-f|--file-list] [-m|--mode] [-o|--offset] [-s|--stride] <det_table> <exp_table> <smf_file(s)>" % sys.argv[0]

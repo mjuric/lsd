@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+"""
+Implementation of class Table, representing tables in the database.
+"""
 
 import subprocess
 import tables
@@ -16,80 +19,80 @@ from collections  import OrderedDict
 from contextlib   import contextmanager
 from colgroup     import ColGroup
 
-# Special return type used in _mapper() and Table.map_reduce
-# to denote that the returned value should not be yielded to
-# the user
-# Impl. note: The class is intentionally derived from list, and
-#             the value is intentionally [], for it to
-#             be compatible with the map/reduce mode (i.e.,
-#             an empty list will be ignored when constructing
-#             the list of values to reduce)
-class EmptySpecial(list):
-	pass
-Empty = EmptySpecial()	# Marker for mapreduce
-
-# Constants with special meaning
-Automatic = None
-Default = None
-All = []
-
 class BLOBAtom(tables.ObjectAtom):
-	""" Same as tables.ObjectAtom, except that it uses the highest available
-        pickle protocol to serialize the objects.
-    """
+	"""
+	A PyTables atom representing BLOBs
+
+	Same as tables.ObjectAtom, except that it uses the highest available
+        pickle protocol to serialize the value into a BLOB.
+        """
+
 	def _tobuffer(self, object_):
 		return cPickle.dumps(object_, -1)
 
 class ColumnType(object):
-	""" A simple record representing columns. Built at runtime
-	    from _cgroups entries, and stored in Table.columns
 	"""
-	name    = None
-	cgroup  = None
-	dtype   = None
-	is_blob = False
+	Description of a column in a Table
+
+	A simple record representing columns of a table. Built at runtime
+	from _cgroups entries, and stored in Table.columns.
+	"""
+	name    = None		#: The name of the column
+	cgroup  = None		#: The name of the column's column group
+	dtype   = None		#: Dtype (a numpy.dtype instance) of the column
+	is_blob = False		#: True if the column is a BLOB
 
 class Table:
-	""" A spatially and temporally partitioned table. Typically
-	    shouldn't be used directly, but queried indirectly
-	    with DB.query()
+	"""
+	A spatially and temporally partitioned table.
+
+	Instances of this object typically shouldn't be used directly, but
+	queried via DB.query calls.
+
+	If needed, this object must never be instantiated directly, but
+	through a call to DB.table(). If always instantiated via db.table()
+	calls, a Table instance is unique to a given table:
+	
+	    >>> a = db.table('sometable')
+	    >>> b = db.table('sometable')
+	    >>> a is b
+	    True
 	"""
 
-#	class TableSchema(object):
-#		""" A simple record representing column groups.
-#		"""
-#		name    = None
-#		columns = None
-
-	path = '.'
-	pix  = Pixelization(level=7, t0=54335, dt=1)
+	path = '.'		#: Full path to the table directory (set by controlling DB instance)
+	pix  = Pixelization(level=7, t0=54335, dt=1) #: Pixelization object for the table
 				# t0: default starting epoch (== 2pm HST, Aug 22 2007 (night of GPC1 first light))
 				# td: default temporal resolution (in days)
-	_nrows = 0
+	_nrows = 0		#: The number of rows in the table (use nrows() to access)
 
-	NULL = 0		# The value for NULL in JOINed rows that had no matches
+	_cgroups = None		#: Column groups in the table ( OrderedDict of table definitions (dicts), keyed by tablename; the first table is the primary one)
+	_fgroups = None		#: Map of file group name -> file group definition. File groups define where and how external blobs are stored.
+	_filters = None		#: Default PyTables filters to be applied to every Leaf in the file (can be overridden on per-tablet and per-blob basis)
 
-	_cgroups = None		# Column groups in the table ( OrderedDict of lists of (tablename, schema, primary_key) tuples; the first table is the primary one)
-	_fgroups = None		# Map of group name -> absolute path
-	_filters = None		# Default PyTables filters to be applied to every Leaf in the file (can be overridden on per-tablet and per-blob basis)
-
-	columns        = None	# OrderedDict of ColumnType objects representing the schema
-	primary_cgroup = None	# Primary cgroup of this table ( the one holding the IDs and spatial/temporal keys)
-	primary_key    = None
-	spatial_keys   = None
-	temporal_key   = None
+	columns        = None	#: OrderedDict of ColumnType objects describing the columns in the table
+	primary_cgroup = None	#: The primary cgroup of this table (IDs and spatial/temporal keys are always in the primary group)
+	primary_key    = None	#: A ColumnType instance for the primary_key (the unique "ID" of each row)
+	spatial_keys   = None	#: A tuple of two ColumnType instances, for (lon, lat). None if no spatial key exists.
+	temporal_key   = None	#: A ColumnType instance for the temporal key. None if no temporal key exist.
 
 	### File name/path related methods
 	def _get_cgroup_data_path(self, cgroup):
-		""" Allow individual cgroups to override where they're placed
-		    This may come in handy for direct JOINs (not used yet).
+		"""
+		Allow individual cgroups to override where they're placed
+
+		This may someday come in handy for direct JOINs (not used yet).
+		
+		TODO: This seems like a dumb idea, in retrospect. A single
+		      join is not that expensive, and it's infinitely more
+		      flexible and robust than a row-by-row JOIN. Remove it
+		      at some point.
 		"""
 		schema = self._get_schema(cgroup)
 		return schema.get('path', '%s/tablets' % (self.path))
 
 	def _get_fgroup_path(self, fgroup):
-		""" Allow specification of per-filegroup paths.
-		    May come in handy for direct JOINs.
+		"""
+		Allow specification of per-filegroup paths.
 		"""
 		if fgroup not in self._fgroups or 'path' not in self._fgroups:
 			return '%s/files/%s' % (self.path, fgroup)
@@ -97,7 +100,10 @@ class Table:
 		return self._fgroups[fgroup]['path']
 
 	def resolve_uri(self, uri, return_parts=False):
-		""" Resolve an lsd: URI referring to this table
+		"""
+		Resolve an lsd: URI referring to this table.
+		
+		TODO: Clean up and document lsd URIs
 		"""
 		assert uri[:4] == 'lsd:'
 
@@ -112,6 +118,33 @@ class Table:
 			return path, (tabname, fgroup, fn), (file, args, suffix)
 
 	def _get_fgroup_filter(self, fgroup):
+		"""
+		Fetch the I/O filter associated with the file group.
+		
+		Each file group can have an "I/O filter" associated with it. 
+		The typical use for filters is to enable transparent
+		compression of external BLOBs.
+		
+		Available I/O filters are:
+		    gzip : gzip compression
+		    bzip2 : bzip2 compression
+
+		Returns
+		-------
+		file : callable
+		    A callable with an interface equal to that of file().
+		    For example, gzip.GzipFile is returned for gzip I/O
+		    filter.
+		kwargs : dict
+		    A dictionary of keyword arguments the caller should pass
+		    in a call to file callable (the one above). For example,
+		    kwargs would be { 'compresslevel': 5 } to set the
+		    compression level in a call to GzipFile.
+		suffix : string
+		    Any suffix that the caller should append to the file
+		    name to get to the actual file as stored on the disk
+		    (example: .gz for gzip compressed files).
+		"""
 		# Check for any filters associated with this fgroup
 		if fgroup in self._fgroups and 'filter' in self._fgroups[fgroup]:
 			(filter, kwargs) = self._fgroups[fgroup]['filter']
@@ -138,8 +171,25 @@ class Table:
 
 	@contextmanager
 	def open_uri(self, uri, mode='r', clobber=True):
-		""" Open the resource (a file) at the given URI and
-		    return a file-like object.
+		"""
+		Open the resource (a file) identified by the URI
+		and return a file-like object. The resource is
+		closed automatically when the context is exited.
+
+		Parameters
+		----------
+		uri : string
+		    The URI of the file to be opened. It is assumed that the
+		    URI is an lsd: URI, referring to this table (i.e., it
+		    must begin with lsd:tablename:).
+		mode : string
+		    The mode keyword is passed to the call that opens the
+		    URI, but in general it is the same or similar to the
+		    mode keyword of file(). If mode != 'r', the resource is
+		    assumed to be opened for writing.
+		clobber : boolean
+		    If False, an exception will be thrown if the file being
+		    opened exists and mode != 'r'
 		"""
 		(fn, (_, _, _), (file, kwargs, _)) = self.resolve_uri(uri, return_parts=True)
 
@@ -159,25 +209,40 @@ class Table:
 		f.close()
 
 	def set_default_filters(self, **filters):
-		""" Set default PyTables filters (compression, checksums) """
+		"""
+		Set default PyTables filters (compression, checksums)
+		
+		Immediately commits the change to disk.
+		"""
 		self._filters = filters
 		self._store_schema()
 
 	def define_fgroup(self, fgroup, fgroupdef):
-		""" Define a file group """
+		"""
+		Define a new (or redefine an existing) file group
+		
+		Immediately commits the change to disk.
+		"""
 		self._fgroups[fgroup] = fgroupdef
 		self._store_schema()
 
 	def _tablet_filename(self, cgroup):
-		""" The filename of a tablet of given cgroup """
+		""" Return the filename of a tablet of the given cgroup """
 		return '%s.%s.h5' % (self.name, cgroup)
 
 	def _tablet_file(self, cell_id, cgroup):
+		"""
+		Return the full path to the tablet of the given cgroup
+		"""
 		return '%s/%s/%s' % (self._get_cgroup_data_path(cgroup), self.pix.path_to_cell(cell_id), self._tablet_filename(cgroup))
 
 	def tablet_exists(self, cell_id, cgroup=None):
-		""" Return True if the given tablet exists in cell_id.
-		    For pseudo-tables check the existence of primary_cgroup
+		"""
+		Check if a tablet exists.
+
+		Return True if the given tablet exists in cell_id. For
+		pseudo-cgroups check the existence of primary_cgroup.
+
 		"""
 		if cgroup is None or self._is_pseudotablet(cgroup):
 			cgroup = self.primary_cgroup
@@ -188,12 +253,40 @@ class Table:
 		return os.access(fn, os.R_OK)
 
 	def _cell_prefix(self, cell_id):
+		"""
+		Return the full path prefix to a particular cell.
+
+		The prefix is unique to this table. It is useful if several
+		tables share the same tablet tree, as it ensures that the
+		files at the leaves will be unique, if constructed from this
+		prefix.
+
+		It is used by Table._lock_cell() to construct a unique
+		filename for a lock.
+
+		Example
+		-------
+
+		For a table named 'ps1_det', in database 'some_db', in some
+		cell, this function will return:
+		
+		    >>> tab._cell_prefix(cell_id)
+		    'db/ps1_det/tablets/..../-0.328125+0.265625/T55249/ps1_det
+
+		"""
 		return '%s/%s/%s' % (self._get_cgroup_data_path(self.primary_cgroup), self.pix.path_to_cell(cell_id), self.name)
 
 	def static_if_no_temporal(self, cell_id):
-		""" See if we have data in cell_id. If not, return a
-		    corresponding static sky cell_id. Useful when evaluating
-		    static-temporal JOINs
+		"""
+		Return the associated static cell, if no data exist in
+		temporal.
+
+		See if we have data in cell_id. If not, return a
+		corresponding static sky cell_id. Useful when evaluating
+		static-temporal JOINs
+		
+		If the cell_id already refers to a static cell, this
+		function is a NOOP.
 		"""
 		if not self.pix.is_temporal_cell(cell_id):
 			return cell_id
@@ -208,7 +301,30 @@ class Table:
 		return cell_id
 
 	def get_cells(self, bounds=None, return_bounds=False, include_cached=True):
-		""" Return a list of cells
+		"""
+		Returns a list of cells (cell_id-s) overlapping the bounds.
+
+		Used by the query engine to retrieve the list of cells to
+		visit when evaluating a query. Uses TabletTreeCache to
+		accelelrate the lookup (and autocreates it if it doesn't
+		exist).
+
+		Parameters
+		----------
+		bounds : list of (Polygon, intervalset) tuples or None
+		    The bounds to be checked
+		return_bounds : boolean
+		    If true, for return a list of (cell_id, bounds) tuples,
+		    where the returned bounds in each tuple are the
+		    intersection of input bounds and the bounds of that
+		    cell (i.e., for an object known to be in that cell, you
+		    only need to check the associated bounds to verify
+		    whether it's within the input bounds).
+		    If the bounds cover the entire cell, (cell_id, (None,
+		    None)) will be returned.
+		include_cached : boolean
+		    If true, return the cells that have cached data only,
+		    and no "true" data belonging to that cell.
 		"""
 		if getattr(self, 'tablet_tree', None) is None:
 			print >> sys.stderr, "No up-to-date tablet tree cache for table %s. Rebuilding." % (self.name),
@@ -221,15 +337,24 @@ class Table:
 		return self.tablet_tree.get_cells(bounds, return_bounds, include_cached)
 
 	def is_cell_local(self, cell_id):
-		""" Returns True if the cell is reachable from the
-		    current machine. A placeholder for if/when I decide
-		    to make this into a true distributed database.
+		"""
+		Returns True if the cell is local to the current machine.
+
+		A placeholder for if/when I decide to make this into a true
+		distributed database.
 		"""
 		return True
 
 	#############
 
 	def _load_schema(self):
+		"""
+		Load the table schema.
+		
+		Load the table schema from schema.cfg file, and rebuild
+		the internal representation of the table (the self.columns
+		dict).
+		"""
 		schemacfg = self.path + '/schema.cfg'
 		data = json.loads(file(schemacfg).read(), object_pairs_hook=OrderedDict)
 
@@ -277,6 +402,11 @@ class Table:
 		self._rebuild_internal_schema()
 
 	def _store_schema(self):
+		"""
+		Store the table schema.
+
+		Store the table schema to schema.cfg, in JSON format.
+		"""
 		data = dict()
 		data["level"], data["t0"], data["dt"] = self.pix.level, self.pix.t0, self.pix.dt
 		data["nrows"] = self._nrows
@@ -291,8 +421,14 @@ class Table:
 		f.close()
 
 	def _rebuild_internal_schema(self):
-		# Rebuild internal representation of the schema from self._cgroups
-		# OrderedDict
+		"""
+		(Re)Build the internal representation of the schema.
+
+		Rebuild the internal representation of the schema from
+		self._cgroups OrderedDict. This means populating the
+		self.columns dict, as well as primary_cgroup, primary_key
+		and other similar data members.
+		"""
 		self.columns = OrderedDict()
 		self.primary_cgroup = None
 
@@ -329,16 +465,49 @@ class Table:
 
 	@property
 	def dtype(self):
-		# Return the dtype of a row in this table
+		"""
+		Return the dtype of a row in this table.
+		
+		Returns
+		-------
+		dtype : numpy.dtype
+		"""
 		return np.dtype([ (name, coltype.dtype) for (name, coltype) in self.columns.iteritems() ])
 
 	def dtype_for(self, cols):
-		# Return the dtype of a row consisting of [cols]
+		"""
+		Return the dtype of a row of a subset of columns.
+
+		Parameters
+		----------
+		cols : iterable of strings
+		    The subset of columns for which to return the dtype.
+		    Column aliases are allowed.
+
+		Returns
+		-------
+		dtype : numpy.dtype
+		"""
 		return np.dtype([ (name, self.columns[self.resolve_alias(name)].dtype) for name in cols ])
 
 	#################
 
 	def create_cgroup(self, cgroup, schema, ignore_if_exists=False):
+		"""
+		Create a new column group.
+
+		Immediately commits the change to the disk.
+
+		Parameters
+		----------
+		cgroup : string
+		    The name of the new column group.
+		schema : dict-like
+		    The schema of the new column group.
+		ignore_if_exists: boolean
+		    If False, and the cgroup already exists, an Exception
+		    will be raised.
+		"""
 		# Create a new table and set it as primary if it
 		# has a primary_key
 		if cgroup in self._cgroups and not ignore_if_exists:
@@ -379,6 +548,26 @@ class Table:
 
 	### Cell locking routines
 	def _lock_cell(self, cell_id, retries=-1):
+		"""
+		Low-level: Lock a given cell for writing.
+
+		You should prefer the lock_cell() context manager to this
+		function.
+
+		If retries != -1, and the cell is locked, we will retry
+		<retries> times, with 1 second pause in between, to lock the
+		cell. If all attempts fail, subprocess.CalledProcessError
+		will be thrown.
+
+		Returns
+		-------
+		fn : string
+		    The filename of the lock file.
+		    
+		Note: For forward-compatibility, you should use
+		      Table._unlock_cell(fn) to unlock the cell, and not
+		      remove the lockfile directly (e.g., using os.unlink)
+		"""
 		# create directory if needed
 		fn = self._cell_prefix(cell_id) + '.lock'
 
@@ -389,13 +578,28 @@ class Table:
 		utils.shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, fn) )
 		return fn
 
-	def _unlock_cell(self, lockfile):
-		os.unlink(lockfile)
+	def _unlock_cell(self, lock):
+		"""
+		Unlock a cell.
+		"""
+		os.unlink(lock)
 
 	#### Low level tablet creation/access routines. These employ no locking
 	def _get_row_group(self, fp, group, cgroup):
-		""" Obtain a handle to the given HDF5 node, autocreating
-		    it if necessary.
+		"""
+		Get a handle to the given HDF5 node.
+		
+		Obtain a handle to the given HDF5 node, autocreating it if
+		necessary. If auto-creating, use the information from the
+		table schema to create the HDF5 objects (tables, arrays)
+		corresponding to the cgroup.
+
+		The parameter 'group' specifies whether we're
+		retreiving/creating the group with data belonging to the
+		cell ('main'), or the neighbor cache ('cached').
+
+		TODO: I feel this whole 'group' business hasn't been well
+		      though out and should be reconsidered/redesigned...
 		"""
 		assert group in ['main', 'cached']
 
@@ -439,8 +643,12 @@ class Table:
 		return g
 
 	def drop_row_group(self, cell_id, group):
-		""" Delete the given HDF5 group and all its children
-		    from all tablets of cell cell_id
+		"""
+		Delete the given HDF5 group and all its children from all
+		tablets of cell cell_id
+
+		TODO: I feel this whole 'group' business hasn't been well
+		      though out and should be reconsidered/redesigned...
 		"""
 		with self.lock_cell(cell_id, mode='w') as cell:
 			for cgroup in self._cgroups:
@@ -451,6 +659,11 @@ class Table:
 						fp.removeNode('/', group, recursive=True);
 
 	def _create_tablet(self, fn, cgroup):
+		"""
+		Create a new tablet.
+		
+		Create a tablet in file <fn>, for column group <cgroup>.
+		"""
 		# Create a tablet at a given path, for cgroup 'cgroup'
 		assert os.access(fn, os.R_OK) == False
 
@@ -468,10 +681,13 @@ class Table:
 		return fp
 
 	def _open_tablet(self, cell_id, cgroup, mode='r'):
-		""" Open a given tablet in read or write mode, autocreating
-		    if necessary.
-		    
-		    No locking of any kind.
+		"""
+		Open (or create) a tablet.
+
+		Open a given tablet in read or write mode, autocreating if
+		necessary. Autocreation happens only if mode=='w'.
+
+		Employs no locking of any kind.
 		"""
 		fn = self._tablet_file(cell_id, cgroup)
 
@@ -488,8 +704,11 @@ class Table:
 		return fp
 
 	def _drop_tablet(self, cell_id, cgroup):
-		# Remove a tablet file. No locking of any kind.
-		#
+		"""
+		Remove a tablet.
+		
+		Remove a tablet file. Employs no locking.
+		"""
 		if not self.tablet_exists(cell_id, cgroup):
 			return
 
@@ -497,8 +716,21 @@ class Table:
 		os.unlink(fn)
 
 	def _append_tablet(self, cell_id, cgroup, rows):
-		# Append a set of rows to a tablet. No locking of any kind
-		#
+		"""
+		Internal: Append a set of rows to a tablet.
+
+		Employs no locking.
+
+		Parameters
+		----------
+		cell_id : integer
+		    The cell_id into which to write
+		cgroup : string
+		    The column group into which to write
+		rows : structured ndarray
+		    The structured array, compatible with the tablet's
+		    table, that is to be appended to the tablet.
+		"""
 		fp  = self._open_tablet(cell_id, mode='w', cgroup=cgroup)
 
 		fp.root.main.table.append(rows)
@@ -506,7 +738,13 @@ class Table:
 		fp.close()
 
 	### Public methods
-	def __init__(self, path, mode='r', name=None, level=Automatic, t0=Automatic, dt=Automatic):
+	def __init__(self, path, mode='r', name=None, level=None, t0=None, dt=None):
+		"""
+		Constructor.
+		
+		Never use directly. Use DB.table() to obtain an instance of
+		this class.
+		"""
 		if mode == 'c':
 			assert name is not None
 			self._create(name, path, level, t0, dt)
@@ -517,7 +755,8 @@ class Table:
 			self._load_schema()
 
 	def _create(self, name, path, level, t0, dt):
-		""" Create an empty table and store its definition.
+		"""
+		Create an empty table and store its schema.
 		"""
 		self.path = path
 
@@ -532,16 +771,26 @@ class Table:
 		self.columns = OrderedDict()
 		self.name = name
 
-		if level == Automatic: level = self.pix.level
-		if    t0 == Automatic: t0 = self.pix.t0
-		if    dt == Automatic: dt = self.pix.dt
+		if level is None: level = self.pix.level
+		if    t0 is None: t0 = self.pix.t0
+		if    dt is None: dt = self.pix.dt
 		self.pix = Pixelization(level, t0, dt)
 
 		self._store_schema()
 		self._load_schema()	# This will trigger the addition of pseudotables
 
 	def define_alias(self, alias, colname):
-		""" Defines an aliase for a column name
+		"""
+		Define an alias to a column
+
+		Immediately commits the change to disk.
+
+		Parameters
+		----------
+		alias : string
+		    The new alias of the column
+		colname : string
+		    The column being aliased
 		"""
 		assert colname in self.columns
 
@@ -549,8 +798,20 @@ class Table:
 		self._store_schema()
 
 	def resolve_alias(self, colname):
-		""" Return the real column name for special column
-		    aliases.
+		"""
+		Return the name of an aliased column.
+
+		Given an alias, return the column name it aliases. This
+		function is a no-op if the alias is a column name itself.
+
+		Besides the aliases defined by the user using
+		.define_alias(), there are five built-in special aliases:
+		
+		    _ID   : Alias to the primary_key
+		    _LON  : Alias to the longitude spatial key (if any)
+		    _LAT  : Alias to the latitude spatial key (if any)
+		    _TIME : Alias to the temporal key (if any)
+		    _EXP  : Alias to exposure key
 		"""
 		schema = self._get_schema(self.primary_cgroup);
 
@@ -566,14 +827,23 @@ class Table:
 		return self._aliases.get(colname, colname)
 
 	def append(self, cols_, group='main', cell_id=None, _update=False):
-		""" Insert or updates a set of rows into this table in the database.
-		    Protects against multiple writers simultaneously inserting into 
-		    the same table.
+		"""
+		Append or update a set of rows in this table.
+		
+		Appends or updates a set of rows into this table. Protects
+		against multiple writers simultaneously inserting into the
+		same table.
 
-            TODO: Document the algorithm how the append/update happens.
-                  For now, see the comments in the source.
+		Returns
+		-------
+		ids : numarray
+		    The primary keys of appended/updated rows
 
-		    Return: array of primary keys of inserted rows
+		TODO: Document (and simplify!!!) the algorithm deciding how the
+		      append/update happens.  For now, see the comments in
+		      the source or e-mail me (mjuric@youknowtherest).
+		TODO: Refactor and rework this monstrosity. It brings shame to
+		      my family ;-).
 		"""
 
 		assert group in ['main', 'cached']
@@ -842,6 +1112,12 @@ class Table:
 		return cols[key]
 
 	def nrows(self):
+		"""
+		Returns the number of rows in the table
+		
+		Note: returns the cached value precomputed by
+		db.compute_summary_statistics()
+		"""
 		return self._nrows
 
 	def close(self):
@@ -869,15 +1145,31 @@ class Table:
 		return i + s
 
 	def _get_schema(self, cgroup):
+		"""
+		Return the schema of the given column group.
+		"""
 		return self._cgroups[cgroup]
 
 	def _smart_load_blobs(self, barray, refs):
-		""" Load an ndarray of BLOBs from a set of refs refs,
-		    taking into account not to instantiate duplicate
-		    objects for the same BLOBs.
-		    
-		    The input array of refs must be one-dimensional.
-		    The output is a 1D array of blobs, corresponding to the refs.
+		"""
+		Intelligently load an array of BLOBs
+		
+		Load an ndarray of BLOBs from a set of refs refs, taking
+		into account not to instantiate duplicate objects for the
+		same BLOBs.
+
+		Parameters
+		----------
+		barray : tables.VLArray
+		    The PyTables VLArray from which to read the BLOBs
+		refs : ndarray of int64
+		    The 1-dimensional list of BLOB references to be
+		    instantiated.
+
+		Returns
+		-------
+		blobs : numpy array of objects
+		    A 1D array of blobs, corresponding to the refs.
 		"""
 		##return np.ones(len(refs), dtype=object);
 		assert len(refs.shape) == 1
@@ -904,6 +1196,38 @@ class Table:
 		return blobs
 
 	def _fetch_blobs_fp(self, fp, column, refs, include_cached=False):
+		"""
+		Fetch the BLOBs referenced by refs from PyTables file object fp
+
+		The BLOB references are indices into a VLArray (variable
+		length array) in the HDF5 file. By convention, the indices
+		to BLOBs in the 'main' subgroup of the file (that contains
+		the rows belonging to the cell, as opposed to those in
+		neighbor cache), are positive. Conversly, the refs to cached
+		BLOBs are negative (and should be loaded from the 'cached'
+		subgroup of the file). This function transparently takes
+		care of all of that.
+		
+		Parameters
+		----------
+		fp : table.File
+		    PyTables file object from which to load the BLOBs
+		column : string
+		    The column name of the BLOB column
+		refs : ndarray of int64
+		    The BLOB references to BLOBs to instantiate
+		include_cached : boolean
+		    Whether to load the cached BLOBs or not.
+		
+		Returns
+		-------
+		blobs : numpy array of objects
+		    A 1D array of blobs, corresponding to the refs.
+
+		TODO: Why do we need include_cached param here, when it
+		      could be inferred from whether there are any negative
+		      refs?
+		"""
 		# Flatten refs; we'll deflatten the blobs in the end
 		shape = refs.shape
 		refs = refs.reshape(refs.size)
@@ -928,12 +1252,17 @@ class Table:
 		return blobs
 
 	def fetch_blobs(self, cell_id, column, refs, include_cached=False, _fp=None):
-		""" Fetch blobs from column 'column'
-		    in cell cell_id, given a vector of references 'refs'
+		"""
+		Instantiate BLOBs for a given column.
 
-		    If the cell_id has a temporal component, and there's no
-		    tablet in that cell, a static sky cell corresponding
-		    to it is tried next.
+		Fetch blobs from column 'column' in cell cell_id, given a
+		vector of references 'refs'
+
+		If the cell_id has a temporal component, and there's no
+		tablet in that cell, a static sky cell corresponding to it
+		is tried next.
+
+		See documentation for _fetch_blobs_fp() for more details.
 		"""
 		# short-circuit if there's nothing to be loaded
 		if len(refs) == 0:
@@ -954,12 +1283,39 @@ class Table:
 		return blobs
 
 	def fetch_tablet(self, cell_id, cgroup=None, include_cached=False):
-		""" Load and return all rows from a given tablet in
-		    a given cell_id.
+		"""
+		Load and return the contents of a tablet.
 
-		    If the cell_id has a temporal component, and there's no
-		    tablet in that cell, a static sky cell corresponding
-		    to it is tried next.
+		Parameters
+		----------
+		cell_id : number
+		    The cell ID from which to load
+		cgroup : string or None
+		    The column group whose tablet to load. If set to None,
+		    the primary column group's tablet will be loaded.
+		include_cached : boolean
+		    If True, data from the neighbor cache will be returned
+		    as well.
+
+		Returns
+		-------
+		rows : structured ndarray
+		    The rows from the tablet.
+
+		Notes
+		-----
+		If the tablet contains BLOB columns, only the references
+		will be returned by this function. Call fetch_blobs to
+		instantiate the actual objects.
+		
+		If include_cached=True, and the tablet contains BLOB
+		columns, the references to blobs in the neighbor cache will
+		be negative. fetch_blobs() understands and automatically
+		takes care of this.
+		
+		If the cell_id has a temporal component, and there's no
+		tablet in that cell, a static sky cell corresponding to it
+		is tried next.
 		"""
 		if cgroup is None:
 			cgroup = self.primary_cgroup
@@ -992,8 +1348,17 @@ class Table:
 		return rows
 
 	def _fetch_pseudotablet(self, cell_id, cgroup, include_cached=False):
-		# Pseudo-columns: _CACHED, _ROWID and _ROWIDX
-		# DO NOT CALL DIRECTLY !!
+		"""
+		Internal: Fetch a "pseudotablet".
+		
+		A pseudotablet is a tablet that contains pseudocolumns,
+		columns that are computed on the fly:  _CACHED, _ROWID and
+		_ROWIDX
+		
+		DO NOT CALL THIS FUNCTION DIRECTLY. It will be called by
+		fetch_tablet, when a pseudotablet name is encountered (a
+		name beginning with '_').
+		"""
 
 		assert cgroup == '_PSEUDOCOLS'
 
@@ -1015,9 +1380,18 @@ class Table:
 		return pcols
 
 	def _is_pseudotablet(self, cgroup):
+		"""
+		Test whether a given cgroup is a pseudotablet.
+		
+		The current implementation checks if the name begins with an
+		underscore.
+		"""
 		return cgroup[0] == '_'
 
 	class CellProxy:
+		"""
+		Helper for Table.lock_cell()
+		"""
 		table   = None
 		cell_id = None
 		mode    = None
@@ -1029,6 +1403,9 @@ class Table:
 
 		@contextmanager
 		def open(self, cgroup=None):
+			"""
+			Opens the requested table within a locked cell.
+			"""
 			if cgroup is None:
 				cgroup = self.table.primary_cgroup
 
@@ -1055,12 +1432,21 @@ class Table:
 			self._unlock_cell(lockfile)
 
 	def get_spatial_keys(self):
+		"""
+		Names of spatial keys, or (None, None) if they don't exist.
+		"""
 		# Find out which columns are our spatial keys
 		return (self.spatial_keys[0].name, self.spatial_keys[1].name) if self.spatial_keys is not None else (None, None)
 
 	def get_primary_key(self):
-		# Find out which columns are our spatial keys
+		"""
+		Returns the name of the primary key.
+		"""
 		return self.primary_key.name
 
 	def get_temporal_key(self):
+		"""
+		Returns the name of the temporal key, or None if it's not
+		defined.
+		"""
 		return self.temporal_key.name if self.temporal_key is not None else None

@@ -1,10 +1,25 @@
 #!/usr/bin/env python
+"""
+BHpix and HEALPix projection functions
+"""
 
-#from math import *
 import numpy as np
 from numpy import cos, radians, fmod, sqrt, pi, arcsin, degrees, abs, floor, fabs
 
 def proj_healpix(l, b):
+	"""
+	Project (l, b) to HealPix projection coordinates
+
+	Parameters
+	----------
+	l, b: numpy array or scalar
+	    The longitude and lattitude, in degrees
+	    
+	Returns
+	-------
+	x, y: np.ndarrays
+	    The x and y coordinates in HealPix projection.
+	"""
 	z   = cos(radians(90.-b))
 	phi = radians(fmod(fmod(l, 360.)+360, 360)) # wrap to [0,360)
 
@@ -16,10 +31,25 @@ def proj_healpix(l, b):
 
 	return (x, y)
 
+# Constants used in proj_bhealpix and related functions
 _c = np.array([-1., -1.,  1., 1.])
 _s = np.array([ 1., -1., -1., 1.])
 
 def proj_bhealpix(l, b):
+	"""
+	Project (l, b) to BHpix ("Butterfly HealPix") projection
+
+	Parameters
+	----------
+	l, b: numpy array or scalar
+	    The longitude and lattitude, in degrees
+	    
+	Returns
+	-------
+	x, y: np.ndarrays
+	    The x and y coordinates in BHpix projection. The
+	    projected coordinates range from [-1, 1].
+	"""
 	(hxx, hyy) = proj_healpix(l, b)
 
 	l = (hxx / (0.5*pi)).astype(int)
@@ -32,6 +62,20 @@ def proj_bhealpix(l, b):
 	return (h1, h2)
 
 def deproj_healpix(x, y):
+	"""
+	Deproject from HealPix to (lon, lat)
+
+	Parameters
+	----------
+	x, y: numpy array or scalars
+	    HealPix coordinates of the point(s)
+	    
+	Returns
+	-------
+	lon, lat: np.ndarrays
+	    The deprojected longitude and lattitude
+	    corresponding to (x, y), in degrees.
+	"""
 	l = np.empty_like(x)
 	b = np.empty_like(x)
 
@@ -54,15 +98,28 @@ def deproj_healpix(x, y):
 
 	return degrees(l), degrees(b)
 
-def deproj_bhealpix_scalar(x, y):
+def _deproj_bhealpix_scalar(x, y):
+	""" Aux. function for deproj_bhealpix. Do not use directly. """
 	(l, b) = deproj_bhealpix(np.array([x]), np.array([y]))
 	return l[0], b[0]
 
 def deproj_bhealpix(x, y):
-	""" Deproject from butterfly-HealPix to lon, lat
+	"""
+	Deproject from BHpix ("butterfly HealPix") to (lon, lat)
+
+	Parameters
+	----------
+	x, y: numpy array or scalars
+	    BHpix coordinates of the point(s)
+	    
+	Returns
+	-------
+	lon, lat: np.ndarrays
+	    The deprojected longitude and lattitude
+	    corresponding to (x, y), in degrees.
 	"""
 	if not isinstance(x, np.ndarray) and not isinstance(y, np.ndarray):
-		return deproj_bhealpix_scalar(x, y)
+		return _deproj_bhealpix_scalar(x, y)
 
 	# Compute to which of the four healpix slices
 	# this point belongs to
@@ -79,40 +136,90 @@ def deproj_bhealpix(x, y):
 	return deproj_healpix(hxx, hyy)
 
 def ij_center(i, j, level):
+	"""
+	BHpix pixel center from BHpix integers (internal)
+	
+	Return (x, y) coordinates of a pixel with integer
+	coordinates (i, j), at level 'level'. The integer
+	coordinates range from to [-2**level/2, 2**level/2).
+
+	TODO: ij should be redefined to span from
+	      [0, 2**level)
+	"""
 	dx = pix_size(level)
 	return ((i + 0.5)*dx, (j + 0.5)*dx)
 
 def xy_to_ij(x, y, level):
+	"""
+	Compute BHpix integer coordinates (internal)
+
+	Return (i, j) integers corresponding to (x, y)
+	where (i, j) span [-2**level/2, 2**level/2).
+	
+	TODO: ij should be redefined to span from
+	      [0, 2**level)
+	"""
 	dx = pix_size(level)
 	return (x // dx, y // dx)
 
 def xy_center(x, y, level):
+	"""
+	Return the center of a pixel with point (x, y)
+	"""
 	(i, j) = xy_to_ij(x, y, level)
 	return ij_center(i, j, level)
 
 def pix_size(level):
+	"""
+	The size (in BHpix projected units) of a pixel
+	at level 'level'.
+	"""
 	return 2.**(1-level)
 
 def NSIDE(level):
-	""" The HealPix NSIDE parameter corresponding to our level """
+	"""
+	The HealPix NSIDE parameter corresponding to 'level'
+	"""
 	return width(level) / 4
 
 def pix_area(lev):
-	""" The area (in degrees) of a pixel at level lev """
+	"""
+	The area (in degrees) of a pixel at level 'lev'
+	"""
 	return (129600. / np.pi) / (3./4. * width(lev)**2)
 
 def pix_idx(x, y, level):
+	"""
+	The one-dimensional BHpix index I of a pixel containing
+	the point (x, y).
+	
+	The index is computed as j * wh + i, where (i, j) are
+	integer indices shifted so that
+	(x,y) = (-1,-1) <=> (i, j) <=> (0, 0)
+	"""
 	i, j = xy_to_ij(x, y, level)
 	wh = width(level)
 	i = i + wh/2; j = j + wh/2;
 	return j * wh + i
 
 def width(level):
-	''' Return the number of pixels on the side for a given split level. '''
+	'''
+	The width on BHpix map (in pixels) at a given level.
+	
+	The number of pixels in the map equals width*width.
+	Note that not all of them are valid pixels on the sphere.
+	'''
 	return 2**level
 
 def get_pixel_level(x, y):
-	# deduce the level, assuming (x,y) are the center of a pixel
+	"""
+	Deduce the level, given a center (x, y) of a pixel
+	
+	Returns
+	-------
+	level: integer
+	    BHpix level
+	"""
 	for levx in xrange(32):
 		p = x*(1<<levx)
 		if int(p) == p: break;
@@ -150,6 +257,14 @@ def testpix():
 
 ################################################################
 def map_to_valid_pixels(x, y, dx, assume_adjacent=True):
+	"""
+	Map pixel coordinates (x, y) to a valid pixel.
+
+	Map (x, y) to a valid BHpix pixel, if they're outside
+	of the valid BHpix projection boundaries. This is useful
+	to enumerate all neighbors of a given pixel (see
+	bhpix.neighbors).
+	"""
 	if not assume_adjacent:
 		raise Exception('Not implemented.')
 
@@ -220,6 +335,16 @@ def map_to_valid_pixels(x, y, dx, assume_adjacent=True):
 	return ret
 
 def neighbors(x, y, level, include_self=False):
+	"""
+	Return a set of neighbors of a given pixel
+	
+	Returns
+	-------
+	neighbors: set
+	    A set of (x, y) center coordinates of pixels
+	    sharing an edge or a corner with the input
+	    pixel.
+	"""
 	# Return a set of immediate neighbors of the pixel
 	# into which (x,y) falls
 	result = set()

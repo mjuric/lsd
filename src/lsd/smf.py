@@ -10,6 +10,7 @@ import bhpix
 from utils import gnomonic, gc_dist
 from colgroup import ColGroup
 import sys, os
+import logging
 
 # Table defs for exposure table
 exp_table_def = \
@@ -919,3 +920,5 @@ def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, _re
 
 if __name__ == '__main__':
 	make_object_catalog('ps1_obj', 'ps1_det')
+
+logging.info("Here")

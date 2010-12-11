@@ -5,7 +5,7 @@ __all__ = ['TUIException', 'tui_getopt']
 
 ##################################
 
-import sys, exceptions, getopt, os
+import sys, exceptions, getopt, os, logging
 
 class TUIException(Exception):
 	pass;
@@ -76,5 +76,13 @@ def tui_getstdopts(optlist):
 
 	return (dbdir,)
 
-## Setup various useful text UI handlers ##################
-suppress_keyboard_interrupt_message()
+def startup():
+	## Setup various useful text UI handlers ##################
+	suppress_keyboard_interrupt_message()
+
+	## Setup logging ##
+	logging.basicConfig(filename="lsd.log", format='%(asctime)s %(name)s[%(process)d] {%(module)s:%(funcName)s:%(levelname)s}: %(message)s', level=(logging.DEBUG if os.getenv("DEBUG", 1) else logging.INFO))
+	logging.root.name = sys.argv[0].split('/')[-1]
+	logging.info("Started %s", ' '.join(sys.argv))
+
+startup()

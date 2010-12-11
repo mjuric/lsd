@@ -6,6 +6,7 @@ import numpy as np
 from slalib import sla_galeq
 from numpy import sin, cos, radians, degrees, sqrt, arcsin, arctan2, pi
 from interval import intervalset
+from collections import defaultdict
 
 # Full sky in bhpix projection
 ALLSKY = Polygon.Polygon([
@@ -16,11 +17,13 @@ ALLSKY = Polygon.Polygon([
 	])
 
 def lambert_proj(l, phi, l0, phi1):
-	""" Return the Lambert Equal Area Projection coordinates
-	    x, y given input lon,lat == l,phi and projection pole
-	    l0, phi1
+	"""
+	Project l, phi to Lambert Equal Area Projection
+	
+	Return the Lambert Equal Area Projection coordinates x, y given
+	input lon,lat == l,phi and projection pole l0, phi1
 
-	    All input quantities are in degrees.
+	All input quantities are in degrees.
 	"""
 	l    = radians(l)
 	phi  = radians(phi)
@@ -39,10 +42,13 @@ def lambert_proj(l, phi, l0, phi1):
 	return x, y
 
 def lambert_deproj(x, y, l0, phi1):
-	""" Deproject from Lambert Equal Area coordinates x, y
-	    to lon, lat, given projection pole l0, phi1
+	"""
+	Deproject from Lambert Equal Area Projection to lon, lat
+	
+	Deproject from Lambert Equal Area coordinates x, y to lon, lat,
+	given projection pole l0, phi1
 
-	    All angular quantities are in degrees.
+	All angular quantities are in degrees.
 	"""
 	r = sqrt(x * x + y * y);
 	c = 2 * arcsin(0.5 * r);
@@ -57,19 +63,34 @@ def lambert_deproj(x, y, l0, phi1):
 	return l0 + degrees(l), degrees(phi)
 
 def make_healpix_poly(lon, lat):
-	# Project to bhpix and construct the polygon, taking care of the south pole
+	"""
+	Transform a polygon on the sphere to a Polygon in BHpix
+
+	Given the vertices (lon, lat; ndarrays), transform them to BHpix
+	projection space and construct a Polygon.Polygon instance
+	corresponding to the input Polygon on the sphere.
+
+	The function knows how to handle a case when the south pole is
+	included in the polygon on the sphere.
+	
+	TODO: We currently don't take care to add vertices when crossing
+	l=(0, 90, 180, 270) meridians. We should do that (otherwise small
+	pieces of the sky will be effectively cut out of the resulting BHpix
+	polygon).
+	"""
 	hrect = bhpix.proj_bhealpix(lon, lat)
+
 	poly = Polygon.Polygon(zip(*hrect))
+
 	if(poly.orientation()[0] == -1):
 		poly = Polygon.Polygon([(1, 1), (-1, 1), (-1, -1), (1, -1)]) - poly
+
 	return poly
 
 def beam(lon0, lat0, radius=1., coordsys='equ'):
-	""" Return a polygon (in bhpix projection) corresponding
-	    to the requested lon/lat/radius beam.
-	    
-	    TODO: Properly handle lon=(0,90,180,270) transitions
-	    in bhpix projection
+	"""
+	Return a polygon (in bhpix projection) corresponding to the
+	requested lon/lat/radius beam.
 	"""
 	# transform from the desired coordinate system to equatorial
 	if coordsys == 'gal':
@@ -98,11 +119,9 @@ if __name__ == '__main__':
 	exit()
 
 def rectangle(lon0, lat0, lon1, lat1, coordsys='equ'):
-	""" Return a polygon (in bhpix projection) corresponding
-	    to the requested lon/lat rectangle.
-	    
-	    TODO: Properly handle lon=(0,90,180,270) transitions
-	    in bhpix projection
+	"""
+	Return a polygon (in bhpix projection) corresponding to the
+	requested lon/lat rectangle.
 	"""
 	if lon0 > lon1:
 		lon1 = lon1 + 360
@@ -133,7 +152,7 @@ def rectangle(lon0, lat0, lon1, lat1, coordsys='equ'):
 	return make_healpix_poly(lon, lat)
 
 def __part_to_xy_t(part):
-	""" Used by canonicize_bounds """
+	""" Internal: Used by canonicize_bounds """
 	bounds_xy = Polygon.Polygon()
 	bounds_t = intervalset()
 	for v in part:
@@ -151,16 +170,25 @@ def __part_to_xy_t(part):
 
 def make_canonical(bounds):
 	"""
-	    The bounds specification can either be a Polyon, a specific 
-	    cell_id integer, a (t0, t1) time tuple, or an array
-	    of these.
+	Convert a "free-form" bounds specification to canonical form
 
-		Returns a list of (Polygon, intervalset) tuples.
+	Used to allow some flexibility when inputing the bounds from the
+	command line.
+
+	Parameters
+	----------
+	bounds: Polygon, tuple, integer or an array of these
+	    The bounds can either be a Polyon, a specific cell_id integer, a
+	    (t0, t1) time tuple, or a list of these. If bounds is an empty
+	    Python list (i.e., []) or None, we return None (== all sky)
+
+	Returns a list of (Polygon, intervalset) tuples, or None (signifying
+	all sky), both suitable to be passed as bounds parameter of
+	Query.execute()/iterate()/fetch() calls.
 	"""
-	from collections import defaultdict
 
 	# Handle all-sky requests, and scalars
-	if bounds == []:
+	if bounds == [] or bounds is None:
 		return None
 	elif not isinstance(bounds, list):
 		bounds = [ bounds ]

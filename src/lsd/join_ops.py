@@ -1,4 +1,11 @@
 #!/usr/bin/env python
+"""
+TODO: A module in need of urgent refactoring.
+
+Contains (among others) DB, Query, QueryEngine and QueryInstance classes, as
+well as the JOIN machinery.
+
+"""
 import os, json, glob, copy
 import numpy as np
 import cPickle
@@ -395,9 +402,24 @@ def create_join(db, fn, jkind, tableR, tableS):
 	return globals()[jclass](db, tableR, tableS, jkind, **data)
 
 class iarray(np.ndarray):
-	""" Subclass of ndarray allowing per-row indexing.
+	"""
+	Subclass of ndarray allowing per-row indexing (with arr(ind)).
+
+	All columns within a query are of this type. It allows the user to
+	write queries such as:
 	
-	    Used by ColDict.load_column()
+	    SELECT chips(3) FROM ...
+	   
+	where chips is an array column (i.e., each row is an array). In the
+	above query, the user expects to get the fourth element (remember,
+	0-based indexing!) of chips within each row. But since columns are
+	numpy arrays (vectors) where the row is the first index, we must
+	(roughly) translate this internally into:
+	
+	    chips[:, 3]
+
+	to work as expected. This is what the __call__ routine of this class
+	does.
 	"""
 	def __call__(self, *args):
 		"""
@@ -590,7 +612,7 @@ class QueryInstance(object):
 	
 					if isnullKey in self.jmap:
 						isnull		= self.jmap[isnullKey]
-						col[isnull] = table.NULL
+						col[isnull] = 0
 				elif len(idx):
 					# This tablet is empty, but columns show up here because of an OUTER join.
 					# Just return NULLs of proper dtype
@@ -950,9 +972,18 @@ class Query(object):
 	query_string = None
 
 	def __str__(self):
+		"""
+		Returns the query string.
+		"""
 		return self.query_string
 
 	def __init__(self, db, query, locals = {}):
+		"""
+		Internal: Constructs the query.
+		
+		Do not attempt to instantiate Query objects directly; use
+		DB.query() function instead.
+		"""
 		self.db		  = db
 		self.query_string = query
 		self.qengine = QueryEngine(db, query, locals=locals)
@@ -962,27 +993,136 @@ class Query(object):
 			self.qwriter = IntoWriter(db, into_clause, locals)
 
 	def execute(self, kernels, bounds=None, include_cached=False, cells=[], group_by_static_cell=False, testbounds=True, nworkers=None, progress_callback=None, _yield_empty=False):
-		""" A MapReduce implementation, where rows from individual cells
-		    get mapped by the mapper, with the result reduced by the reducer.
-		    
-		    Mapper, reducer, and all *_args must be pickleable.
-		    
-		    The mapper must be a callable expecting at least one argument, 'rows'.
-		    'rows' is always the first argument; if any extra arguments are passed 
-		    via mapper_args, they will come after it.
-		    'rows' will be a numpy array of table records (with named columns)
+		"""
+		Map/Reduce a list of functions over query results
+		
+		Starts up a MapReduce job, where blocks of rows returned by
+		a query in each cell are yielded to the first kernel
+		(callable) in the list (the mapper), whose outputs are
+		passed on to the reducers in accordance with the MapReduce
+		programming model (see
+		http://mwscience.net/trac/wiki/LargeSurveyDatabase for an
+		introduction).
 
-		    The mapper must return a sequence of key-value pairs. All key-value
-		    pairs will be merged by key into (key, [values..]) pairs that shall
-		    be passed to the reducer.
+		This method is a generator, and should be called from within
+		a loop, such as:
+		
+		   >>> for res in query.execute([kernel1, kernel2]):
+		           ... do something with res ...
 
-		    The reducer must expect two parameters, the first being the key
-		    and the second being a sequence of all values that the mappers
-		    returned for that key. The return value of the reducer is passed back
-		    to the user and is user-defined.
-   
-		    If the reducer is None, only the mapping step is performed and the
-		    return value of the mapper is passed to the user.
+		NOTE: There are a number of parameters to this function that
+		      haven't been documented yet. Assume those are internal
+		      to the code and should not be used (their meaning may
+		      change).
+
+		Parameters
+		----------
+		kernels : list
+		    A list of "kernels" to execute. Each kernel is either a
+		    callable (e.g., a Python function or an object with
+		    an overloaded __call__ method), or a tuple of the form:
+		    
+		        (callable, arg2, arg3, arg4, ...)
+
+		    The MapReduce engine, running within each LSD cell, will
+		    call the first callable ("the mapper") as follows:
+		    
+		        callable(qresult, arg2, arg3, arg4, ...)
+		        
+		    where arg2, ... will exist only if given in the tuple as
+		    show above.
+		    
+		    The qresult object, passed as the first argument, is a
+		    generator yielding blocks of rows that are the (partial)
+		    results of the query. They are instances of ColGroup
+		    class (with an interface compatible with that of a
+		    structured ndarray).
+		    
+		    The mapper must process the yielded blocks and yield
+		    back the outputs to be returned to the user, or
+		    subsequent kernels. Note that results must always be
+		    yielded, and never returned.
+		    
+		    If more than one kernel is present in the list, all but
+		    the final one are required to yield tuples of the form
+		    (key, value), which will be transformed in accordance
+		    with the MapReduce model before being passed on to
+		    subsequent kernels.
+		    
+		    All but the first kernel will be called as:
+
+		        callable(kv, arg2, arg3, arg4, ...)
+		        
+		    where the first argument, kv, is a pair of the form:
+		    
+		        key, values = kv
+		        
+		    where the key is whatever was returned as key by the
+		    previous kernel, and values is a generator that yields
+		    values associated with that key, by the previous
+		    kernels.
+		    
+		    The final kernel in the list may return any value; it
+		    will be yielded back to the user, with no further
+		    processing.
+
+		bounds : list of (Polygon, intervalset) tuples
+		    A list of space/time bounds to which to restrict the
+		    query. The list is used to cull the list of all cells in
+		    the database, to a subset that overlap the bounds, as
+		    well as (unless testbounds=False) to cull the query
+		    results within each cell before yielding them to the
+		    kernel.
+
+		testbounds : boolean
+		    If set to false, the bounds will only be used to cull
+		    the list of cells over which to launch the mappers, but
+		    not to cull the query results within each cell. This is
+		    useful if the mappers perform their own row culling
+		    themselves (presumably, more efficient than the built-in
+		    point-in-polygon test)
+
+		include_cached : boolean
+		    Whether to include the objects from the neighbor cache
+		    into the results of a query. Unless you're performing
+		    spatial correlations (e.g., nearest neighbor searches),
+		    you likely want to leave this be False.
+		
+		group_by_static_cell : boolean
+		    Each execution of a mapper by default operates on
+		    exactly one table cell. If this flag is set to True, and
+		    the table has a temporal component, the mapper will be
+		    executed once for _all_ temporal cells within a spatial
+		    cell (their data will be yielded to it with no
+		    interruption). For more, see the discussion in
+		    "Important notes"
+
+		Important notes
+		---------------
+		    - Each execution of a mapper is guaranteed to operate on
+		      one and only one cell, unless group_by_static=True in
+		      which case rows from all temporal cells, belonging to
+		      a common spatial cell, will be yielded to it.
+		      
+		      However, it is undefined, and mapper should make no
+		      assumptions, on how many times blocks of results from within
+		      a cell will be yielded to it. For smaller cells, it
+		      the result may come in a single block: for larger
+		      cells, there may be more than one block. To be
+		      general, the mapper should always call qresult within
+		      a loop, such as:
+		      
+		      	  for rows in qresult:
+		      	  	... process the block of rows ...
+
+		    - The mapper, the reducer, all of their arguments, and
+		      all keys and values being yielded must be pickleable.
+		      LSD internally pickles/unpickles these to transfer
+		      them to nodes/processes/threads that do the actual
+		      work on each cell.
+
+		    - The keys must be comparable and hashable (nearly every
+		      Python object is).
 		"""
 		partspecs = dict()
 
@@ -1051,13 +1191,41 @@ class Query(object):
 				yield 0, self.qengine.peek()
 
 	def iterate(self, bounds=None, include_cached=False, cells=[], return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None, _yield_empty=False):
-		""" Yield rows (either on a row-by-row basis if return_blocks==False
-		    or in chunks (numpy structured array)) within the
-		    given bounds. Calls 'filter' callable (if given) to filter
-		    the returned rows.
+		"""
+		Yield query results row-by-row or in blocks
 
-		    See the documentation for Table.fetch for discussion of
-		    'filter' callable.
+		Executes the query, and yields back the results as they
+		become available. The results are yielded either row by row
+		(if return_blocks=False, the default), or in blocks of rows
+		(structured ndarrays, if return_blocks=True).  While the
+		former seems natural and likely more convenient, the latter
+		is significantly more efficient.
+
+		Calls 'filter' callable (if given) to filter the returned
+		rows.  The filter callable must respect the rules for a
+		'mapper' kernel (the first kernel), as discussed in the
+		documentation for Query.execute(). In particular, it should
+		be a generator, and expect a qresult as first argument. If
+		the filter expects extra argument, pass it and its arguments
+		as a tuple (e.g., filter=(filtercallable, arg2, arg3, ...)).
+
+		See the documentation of Query.execute() for a description of
+		other parameters.
+
+		Example
+		-------
+		An identity filter:
+
+		    def identity(qresult):
+		    	for rows in qresult:
+		    		yield rows
+
+		A kernel filtering on column 'r' may look like:
+
+		    def r_filter(qresult):
+		    	for rows in qresult:
+		    		yield rows[rows['r'] < 21.5]
+		   
 		"""
 
 		mapper = filter if filter is not None else _iterate_mapper
@@ -1073,25 +1241,16 @@ class Query(object):
 					yield row
 
 	def fetch(self, bounds=None, include_cached=False, cells=[], filter=None, testbounds=True, nworkers=None, progress_callback=None):
-		""" Return a table (numpy structured array) of all rows within the
-		    given bounds. Calls 'filter' callable (if given) to filter
-		    the returned rows. Returns None if there are no rows to return.
+		"""
+		Returns a table (a ColGroup instance) with query results.
 
-		    The 'filter' callable should expect a single argument, rows,
-		    being the set of rows (numpy structured array) to filter. It
-		    must return the set of filtered rows (also as numpy structured
-		    array). E.g., identity filter function would be:
-		    
-		    	def identity(rows):
-		    		return rows
+		As opposed to Query.iterate and Query.execute, Query.fetch
+		blocks until the query is completely executed and returns
+		the results in a single ColGroup instance. This is
+		convenient to collect results of smaller queries.
 
-		    while a function filtering on column 'r' may look like:
-		    
-		    	def r_filter(rows):
-		    		return rows[rows['r'] < 21.5]
-		   
-		    The filter callable must be piclkeable. Extra arguments to
-		    filter may be given in 'filter_args'
+		See Query.iterate() and Query.execute() for descriptions of
+		various parameters.
 		"""
 
 		ret = None
@@ -1119,19 +1278,36 @@ class Query(object):
 		return ret
 
 	def fetch_cell(self, cell_id, include_cached=False):
-		""" Execute the query on a given (single) cell.
+		""" Internal: Execute the query on a given (single) cell.
 
-		    Does not launch extra workers, nor shows the
-		    progress bar.
+		    Does not launch extra workers, nor does it show the
+		    progress bar. Only to be used internally, not a part of
+		    the public API.
 		"""
 		return self.fetch(cells=[cell_id], include_cached=include_cached, nworkers=1, progress_callback=pool2.progress_pass)
 
 class DB(object):
-	path = None		# Root of the database, where all tables reside
+	"""
+	The interface to LSD databases
+
+	DB objects represent LSD databases. Once instantiated, they can me
+	used to create new queries, tables and joins, as well as perform
+	house-keeping on the database.
+	"""
+	path = None	#: Path to the root directory of the database, where all tables reside
 
 	def __init__(self, path):
-		self.path = path
+		"""
+		Opens an existing database.
 		
+		Opens a database residing in directory 'path'. The directory
+		must exist (an exception is thrown if it doesn't).
+		
+		Tip: To create a new, empty, database, simply make a new
+		     empty directory.
+		"""
+		self.path = path
+
 		if not os.path.isdir(path):
 			raise Exception('"%s" is not an acessible directory.' % (path))
 
@@ -1139,7 +1315,13 @@ class DB(object):
 
 	@contextmanager
 	def lock(self, retries=-1):
-		""" Lock the database for reading/writing """
+		"""
+		Lock the entire database for table or join creation/removal
+		operations.
+
+		TODO: Only DB.create_into_tables() obeys this lock so far.
+		      Make other ops that create tables obey it as well.
+		"""
 		# create a lock file
 		lockfile = self.path + '/dblock.lock'
 		utils.shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, lockfile) )
@@ -1150,6 +1332,7 @@ class DB(object):
 		# unlock
 		os.unlink(lockfile)
 
+	### URI (Uniform Resource Identifier) management routines
 	def resolve_uri(self, uri):
 		""" Resolve the given URI into something that can be
 		    passed on to file() for loading.
@@ -1177,6 +1360,19 @@ class DB(object):
 				yield f
 
 	def query(self, query, locals={}):
+		"""
+		Constructs and returns a Query object.
+		
+		Constructs a query object given an LSD query string, and
+		potentially a dictionary of objects ('locals') that are to
+		be made available to the code within the query. For example:
+
+		>>> def Ar(ra, dec):
+		       ... do something to compute extinction ...
+		       return ext_r
+		>>> db.query("SELECT mag_r + Ar(ra, dec) FROM sometable", {'Ar': Ar})
+		
+		"""
 		return Query(self, query, locals=locals)
 
 	def _aux_create_table(self, table, tname, schema):
@@ -1189,7 +1385,15 @@ class DB(object):
 
 	def create_table(self, tabname, tabdef):
 		"""
-			Creates the table given the extended schema description.
+		Creates a table, given the LSD Table Definition.
+
+		The LSD Table Definition (LSD-TD) is a dictionary of entries
+		describing the complete layout of a table. This is as
+		close as LSD gets to a Data Definition Language (DDL).
+		
+		TODO: Fully describe LSD-TD in a separate document. For now,
+		look into lsd.smf and lsd.sdss modules to see some examples
+		of table definitions.
 		"""
 		table = self.table(tabname, create=True)
 
@@ -1220,6 +1424,67 @@ class DB(object):
 		return table
 
 	def define_join(self, name, type, **joindef):
+		"""
+		Define how two tables are joined.
+
+		Creates a .join file with the name '<name>.join', containing
+		information from joindef on how to join two tables. The
+		contents of joindef depends on the type of the join (the
+		argument type).
+		
+		If name has the form '.<left_table>:<right_table>', this
+		join will be automatically found by LSD when looking how to
+		join two tables, left_table and right_table, found in the
+		FROM clause of a query. NOTE: For forward compatibility,
+		define such joins using DB.define_default_join()
+	
+		type=indirect
+		-------------
+		If type == 'indirect', the join being defined is an
+		"indirect join". It is roughly equivalent to the following
+		SQL statement:
+		
+		    SELECT ... FROM R
+		    [OUTER] JOIN indir ON indir.m1 = R.id
+		    [OUTER] JOIN S     ON indir.m2 = S.id
+		
+		where R and S are the two tables being joined, and indir is
+		the indirection table. For this case, joindef specifys where
+		to find indir.m1 and indir.m2 columns.
+
+		For type=indirect, joindef must contain:
+		
+		    "m1" : ("indir1", "m1")
+		    "m2" : ("indir2", "m2")
+
+		Note that while m1 and m2 are not required to be in the same
+		table (which SQL does require, and makes for a good practice
+		anyways), they are required to be of the same length.
+
+		Note that simpler JOINs are a subset of indirect joins. For
+		example:
+		
+		    SELECT ... FROM R
+		    JOIN S ON S.id = R.id
+
+                is equivalent to:
+                
+                    "m1" : ("R", "id")
+                    "m2" : ("R", "id")
+
+                Or:
+		
+		    SELECT ... FROM R
+		    JOIN S ON S.id = R.s_id
+
+                is equivalent to:
+                
+                    "m1" : ("R", "id")
+                    "m2" : ("R", "exp_id")
+
+                assuming id are the primary keys of R and S, and (in the
+                latter example), exp_id is the foreign key.
+		"""
 		#- .join file structure:
 		#	- indirect joins:			Example: ps1_obj:ps1_det.join
 		#		type:	indirect		"type": "indirect"
@@ -1243,9 +1508,22 @@ class DB(object):
 		f.close()
 
 	def define_default_join(self, tableA, tableB, type, **joindef):
+		"""
+		Define a default join relation between two tables.
+		
+		See documentation for DB.define_join() for details on type
+		and joindef arguments.
+		"""
 		return self.define_join('.%s:%s' % (tableA, tableB), type, **joindef)
 
 	def table_exists(self, tabname):
+		"""
+		Test whether a table exists
+		
+		Returns:
+		--------
+		True or False
+		"""
 		try:
 			self.table(tabname)
 			return True
@@ -1253,7 +1531,15 @@ class DB(object):
 			return False
 
 	def table(self, tabname, create=False):
-		""" Given the table name, returns a Table object.
+		"""
+		Returns a Table instance for a given table name.
+
+		If create=True, creates a new empty table. If the table
+		being created already exists, throws an exception.
+		
+		NOTE: There should usually be no need to access tables
+		      directly, though a Table instance (use queries for
+		      that).
 		"""
 		if tabname not in self.tables:
 			path = '%s/%s' % (self.path, tabname)
@@ -1267,6 +1553,11 @@ class DB(object):
 		return self.tables[tabname]
 
 	def construct_join_tree(self, from_clause):
+		"""
+		Internal: Figure out how to join tables in a query
+		
+		This is an internal function; do not use it.
+		"""
 		tablist = []
 
 		# Instantiate the tables
@@ -1307,13 +1598,27 @@ class DB(object):
 		return root, dict((  (tabname, table) for (tabname, (table, _)) in tables.iteritems() ))
 
 	def build_neighbor_cache(self, tabname, margin_x_arcsec=30):
-		""" Cache the objects found within margin_x (arcsecs) of
-		    each cell into neighboring cells as well, to support
-		    efficient nearest-neighbor lookups.
+		""" 
+		(Re)Build the neighbor cache in a given table.
+		
+		Cache the objects found within margin_x (arcsecs) of each
+		cell into neighboring cells, to support efficient
+		nearest-neighbor lookups.
 
-		    This routine works in tandem with _cache_maker_mapper
-		    and _cache_maker_reducer auxilliary routines.
+		Parameters
+		----------
+		tabname : string
+		    The name of the table
+		margin_x_arcsec : number
+		    The margin (in arcseconds) which to cache into
+		    neighboring cells
+		    
+		TODO: The implementation of this is pretty and inefficient.
+		      It should be nearly completely rewritten at some
+		      point.
 		"""
+		# This routine works in tandem with _cache_maker_mapper and
+		# _cache_maker_reducer auxilliary routines.
 		margin_x = np.sqrt(2.) / 180. * (margin_x_arcsec/3600.)
 
 		ntotal = 0
@@ -1329,9 +1634,25 @@ class DB(object):
 		print "Total %d cached objects in %d cells" % (ntotal, ncells)
 
 	def compute_summary_stats(self, *tables):
-		""" Compute frequently used summary statistics and
-		    store them into the dbinfo file. This should be called
-		    to refresh the stats after insertions.
+		"""
+		Compute summary statistics.
+		
+		Compute and store frequently used summary statistics. This
+		should be called to refresh the stats after insertions or
+		larger modifications to tables.
+		
+		It:
+		    - counts and stores the number of rows in a table
+		    - constructs and stores a cache to speed up query
+		      startup (TabletTreeCache objects)
+
+		Parameters
+		----------
+		*tables: strings
+		    One or more names of tables to operate on.
+
+		TODO: Better document *when* this function should be caller
+		      (or better yet, do away with it alltogether).
 		"""
 		from tasks import compute_counts
 		from fcache import TabletTreeCache
@@ -1470,13 +1791,19 @@ def _fitskw_dumb(hdrs, kw):
 	return res
 
 def fits_quickparse(header):
-	""" An ultra-simple FITS header parser. Does not support
-	    CONTINUE statements, HIERARCH, or anything of the sort;
-	    just plain vanilla:
+	"""
+	An ultra-simple FITS header parser.
+	
+	Does not support CONTINUE statements, HIERARCH, or anything of the
+	sort; just plain vanilla:
+	
 	    	key = value / comment
-	    one-liners. The upshot is that it's fast.
 
-	    Assumes each 80-column line has a '\n' at the end
+	one-liners. The upshot is that it's fast, much faster than the
+	PyFITS equivalent.
+
+	NOTE: Assumes each 80-column line has a '\n' at the end (which is
+	      how we store FITS headers internally.)
 	"""
 	res = {}
 	for line in header.split('\n'):
@@ -1509,8 +1836,11 @@ def fits_quickparse(header):
 	return res;
 
 def fitskw(hdrs, kw, default=0):
-	""" Intelligently extract a keyword kw from an arbitrarely
-	    shaped object ndarray of FITS headers.
+	"""
+	Intelligently extract a keyword kw from an arbitrarely
+	shaped object ndarray of FITS headers.
+	
+	Designed to be called from within LSD queries.
 	"""
 	shape = hdrs.shape
 	hdrs = hdrs.reshape(hdrs.size)

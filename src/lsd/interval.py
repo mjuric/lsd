@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-
+"""
+Basic interval arithmetic for LSD
+"""
 from bisect import bisect_left, bisect_right
 import numpy as np
 
@@ -22,9 +24,23 @@ def intersect(i1, i2):
 
 class intervalset:
 	""" A simple class representing a set of closed intervals.
-	    Has two methods: add(i) to add a new interval i, and
-	    isInside(x) to test whether each point in a NumPy
-	    array x is inside the interval set.
+
+	    Methods of interest:
+	    
+	    add(i): adds a new interval i to the set
+	    isInside(x): test whether x is in the interval
+	    intersect(i): intersect with an interval i
+	    
+	    where interval i is a tuple (x0, x1)
+	    
+	    Also of interest are operators:
+	    
+	    |  : returns a union of two intervalsets
+	    &  : returns an intersection of two intervalsets
+	    == : tests for equality of intervalsets
+	    
+	    TODO: Rewrite this class in C (it's the bottleneck in
+	          get_cells())
 	"""
 	def __init__(self, *ivals):
 		self.data = []

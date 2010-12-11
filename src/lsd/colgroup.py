@@ -1,4 +1,14 @@
 #!/usr/bin/env python
+"""
+Implementation of ColGroup class
+
+ColGroup is a functional equivalent of structured numpy.ndarray, the
+difference being that a structured array is layed out row-by-row (in
+memory), while a ColGroup is layed out column-by-column.
+
+It's implemented as an ordered list of columns, with each column a ndarray
+of equal length.
+"""
 
 import numpy as np
 from utils import full_dtype
@@ -10,7 +20,11 @@ def make_record(dtype):
 	return tmp[0].copy()
 
 class RowIter:
-	""" Iterator to permit iteration over ColGroup by row
+	"""
+	Iterator to permit iteration over ColGroup by row
+	
+	WARNING: TERRIBLY INEFFICIENT AND FLAWED AS DESIGNED. NEEDS
+	A COMPLETE REWRITE. AVOID IF YOU CAN.
 	"""
 	def __init__(self, cgroup):
 		self.cgroup = cgroup
@@ -45,6 +59,34 @@ class RowIter:
 		return self.row
 
 class ColGroup(object):
+	"""
+	A structured array, stored by column instead of by row.
+
+	ColGroup is a functional equivalent of structured numpy.ndarray, the
+	difference being that a structured array is layed out row-by-row (in
+	memory), while a ColGroup is layed out column-by-column.  It's
+	implemented as a list of columns, with each column being a ndarray
+	of equal length).
+	
+	The most frequently used operations are indexing and slicing
+	(__getitem__), and addition/removal of new columns. Indexing/slicing
+	works just as with ndarray; e.g.:
+
+		>>> cg2 = cg[::3]
+		
+	will return a new ColGroup, containing every third row of the
+	original one.
+
+	Addition and removal of columns is fast. See add_column/add_columns
+	and drop_column.
+
+	To obtain an ordered list of all column names, use .keys().
+	To obtain an ordered list of (name, column) tuples, use .items().
+	To obtain the number of rows, use len(cg).
+	
+	Sorting is possible using .sort()
+	"""
+
 	column_map = None	# Map from name->pos and pos->name
 	column_data = None	# A list of columns (individual numpy arrays)
 
@@ -54,15 +96,42 @@ class ColGroup(object):
 	## dict-like interface implementation
 	##
 	def keys(self):
-		# Return the list of columns, in order of appearance
+		"""
+		Returns an ordered list of columns.
+
+		The columns appear in order in which they were added.
+		"""
 		return [ self.column_map[pos] for (pos, _) in enumerate(self.column_data) ]
 
 	def items(self):
-		# Return a list of (name, column) tuples
+		"""
+		Returns an ordered list of (column_name, column_data)
+		
+		The tuples appear in the order in which the columns were
+		added. The 'column_data' element is the ndarray containing
+		the column's data.
+		"""
 		items = [ (self.column_map[pos], self.column_data[pos]) for pos in xrange(len(self.column_data)) ]
 		return items
 
 	def __getitem__(self, key):
+		"""
+		Slicing and indexing.
+		
+		This method is functionally equivalent to
+		ndarray.__getitem__. It returns a ColGroup as a result,
+		unless the key was a scalar in which case a numpy record
+		is returned.
+
+		All numpy fancy indexing and slicing will work just as it
+		does with ndarrays. An extension is if a list or tuple of
+		strings is passed as an index, e.g.:
+		
+			>>> cg2 = cg[("ra", "dec")]
+			
+		in which case a ColGroup consisting of only the named
+		columns is returned as a result.
+		"""
 		# return a subcgroup if column names (or a tuple or
 		# a list of them) were given
 		if isinstance(key, str) or isinstance(key, list) or isinstance(key, tuple):
@@ -92,6 +161,11 @@ class ColGroup(object):
 			return row
 
 	def drop_column(self, key):
+		"""
+		Remove the named column from the ColGroup.
+		
+		Note: This operation is computationally cheap.
+		"""
 		pos  = self.column_map[key] if     isinstance(key, str) else key
 		cols = self.items()
 
@@ -102,8 +176,16 @@ class ColGroup(object):
 		self.column_map.update(( (pos, colname)    for (pos, (colname, _)) in enumerate(cols) ))
 
 	def __setitem__(self, key, value):
-		# Append a column to the cgroup, or replace data
-		# in an existing column or entire cgroup slice
+		"""
+		Set the data within a ColGroup, or append a new column.
+		
+		This method is a functional equivalent of the eponymous
+		method in ndarray.
+		
+		If the key is a string that is not one of the column name,
+		the value is assumed to be a ndarray to be added to this
+		ColGroup (see ColGroup.add_column())
+		"""
 		if isinstance(key, str):
 			if key in self.column_map:
 				self.column_data[self.column_map[key]][:] = value
@@ -126,17 +208,40 @@ class ColGroup(object):
 				self.column_data[pos][key] = val
 
 	def __contains__(self, column):
-		# Test if a column exists in the cgroup
+		"""
+		Test if a column exists in the ColGroup
+		"""
 		return column in self.column_map
 
 	#############
 
 	@property
 	def dtype(self):
-		# Return the dtype this column set would have if it was a numpy structured array
+		"""
+		Return the dtype this column group would have if it was a
+		numpy structured array
+		"""
 		return np.dtype([ (self.column_map[pos], full_dtype(col)) for (pos, col) in enumerate(self.column_data) ])
 
 	def __init__(self, cols=[], dtype=None, size=0):
+		"""
+		Construct the column group.
+
+		Build the column group out of an iterable, cols, that is
+		expected to yield (colname, coldata) tuples, where coldata
+		is a numpy array. All data elements in the tuples must be of
+		the same length.
+
+		Alternativey, if cols.items() exists, it will be called to
+		yield the (colname, coldata) tuples. This allows you to pass
+		a dict (or, more likely, an OrderedDict) as the cols
+		argument.
+		
+		Finally, instead of specifying cols, you can specify the
+		dtype and size of the ColGroup via dtype and size arguments.
+		If dtype is specified, cols must be None or a zero-length
+		array.
+		"""
 		self.column_map = dict()
 		self.column_data = []
 
@@ -156,10 +261,56 @@ class ColGroup(object):
 #		self._mk_row()
 
 	def add_columns(self, cols):
+		"""
+		Add a list (iterable) of (colname, coldata) pairs
+		to the ColGroup.
+		
+		This is a convenience method that repeatedly calls
+		add_column() for each pair yielded from cols.
+		"""
 		for name, col in cols:
 			self.add_column(name, col)
 
 	def add_column(self, name, col, dtype=None):
+		"""
+		Append a column to the ColGroup.
+		
+		Parameters
+		----------
+		name : string
+		    The name of the new column.
+		col : ndarray or other
+		    The data for the column. If ndarray is given, it must be of
+		    the same length as existing columns (if any). If a
+		    other is given, a vector will be constructed of the
+		    same length as the existing columns (or one, if there
+		    are none), and the element replicated everywhere.
+		dtype : numpy.dtype
+		    If dtype is given, and col is a scalar, dtype
+
+
+		Examples
+		--------
+		Add a simple column, from ndarray
+
+		>>> x = np.array([1, 2, 3])
+		>>> cg = c.ColGroup();
+		>>> cg.add_column('x', x)
+
+		Add a column from a scalar
+
+		>>> cg.add_column('s', 2.)
+
+		Add a column from an array
+
+		>>> cg.add_column('a', [1, 3, 4])
+		>>> cg['a']
+		array([[1, 3, 4],
+		[1, 3, 4],
+		[1, 3, 4]])
+		>>> cg['a'].dtype
+		>>> dtype('int64')
+		"""
 		if not isinstance(col, np.ndarray):
 			# permit scalars to initialize new columns
 			col = np.array([col], dtype=dtype, ndmin=1)
@@ -184,6 +335,14 @@ class ColGroup(object):
 #			self.row = make_record(self.dtype)
 
 	def resize(self, size, refcheck=True):
+		"""
+		Resize the columns to new size
+		
+		Resizes each column in the ColGroup to the requested size.
+		If the new size is greater than the current length, the
+		contents of newly created elements is undefined
+		(== implementation-dependend and may change in the future).
+		"""
 		for (pos, _) in enumerate(self.column_data):
 			col = self.column_data[pos]
 			self.column_data[pos] = np.resize(col, (size,) + col.shape[1:])
@@ -218,6 +377,9 @@ class ColGroup(object):
 #		return self
 
 	def subset(self, key):
+		"""
+		Internal: use cg[key] for forward compatibility.
+		"""
 		# Return a subset or a column
 
 		# Return a single column
@@ -228,32 +390,61 @@ class ColGroup(object):
 		return ColGroup((   (name, self.column_data[self.column_map[name]]) for name in key ))
 
 	def nrows(self):
+		"""
+		Internal: return the number of rows in the ColGroup.
+		
+		Use len(cg) for forward compatibility.
+		"""
 		return 0 if len(self.column_data) == 0 else len(self.column_data[0])
 
 	def ncols(self):
+		"""
+		Return the number of columns in the ColGroup
+		"""
 		return len(self.column_data)
 
 	def __len__(self):
 		return self.nrows()
 
 	def __iter__(self):
-		# Iterate through the list of rows
+		"""
+		Iterate through rows of the ColGroup
+		
+		NOTE: The implementation of RowIterator is horrible at the
+		moment, so iterating row-by-row should be avoided if
+		possible.
+		"""
 		return RowIter(self)
 
 	def as_columns(self):
+		"""
+		Return an iterable yielding columns (the ndarrays)
+		
+		Allows one to write code like:
+		>>> x, y, z = cg.as_columns()
+		
+		TODO: Add a 'cols' parameter, to restrict the list of
+		columns that gets returned so that something like:
+		
+		>>> x, y = cg.as_columns(['x','y'])
+		
+		becomes possible.
+		"""
 		return iter(self.column_data)
 	
-	def column_at(self, idx):
-		return self.column_data[idx]
-
 	def as_ndarray(self):
+		"""
+		Return a structured ndarray with columns of this ColGroup
+		"""
 		rows = np.empty(self.nrows(), dtype=self.dtype)
 		for name in self.keys():
 			rows[name] = self[name]
 		return rows
 
 	def __str__(self):
-		# Print head/tail of the cgroup
+		"""
+		Prints the head/tail of the columns in the group.
+		"""
 		if len(self.column_data) == 0:
 			return ''
 
@@ -264,7 +455,11 @@ class ColGroup(object):
 		return ret[:-1] if ret != '' else ''
 
 	def sort(self, cols=()):
-		""" Sort the cgroup by one or more (or all) columns
+		"""
+		Sort the cgroup by one or more (or all) columns
+		
+		The names of the columns are to be given in the cols
+		iterable.
 		"""
 		if len(cols) == 0:
 			cols = self.keys()
@@ -277,10 +472,10 @@ class ColGroup(object):
 
 	def __eq__(self, y):
 		"""
-			Emulate ndarray per-element equality comparison
-			Works for comparing cgroup-to-cgroup and cgroup-to-structured ndarray
+		Emulate ndarray per-element equality comparison
 
-			Everything else returns False
+		Works for comparing cgroup-to-cgroup and cgroup-to-structured ndarray
+		Comparison to anything else returns False.
 		"""
 		if not isinstance(y, ColGroup) and not isinstance(y, np.ndarray):
 			return False
