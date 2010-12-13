@@ -3,6 +3,7 @@
 Implementation of class Table, representing tables in the database.
 """
 
+import logging
 import subprocess
 import tables
 import numpy as np
@@ -60,7 +61,7 @@ class Table:
 	"""
 
 	path = '.'		#: Full path to the table directory (set by controlling DB instance)
-	pix  = Pixelization(level=7, t0=54335, dt=1) #: Pixelization object for the table
+	pix  = Pixelization(level=int(os.getenv("PIXLEVEL", 7)), t0=54335, dt=1) #: Pixelization object for the table
 				# t0: default starting epoch (== 2pm HST, Aug 22 2007 (night of GPC1 first light))
 				# td: default temporal resolution (in days)
 	_nrows = 0		#: The number of rows in the table (use nrows() to access)
@@ -576,6 +577,7 @@ class Table:
 			utils.mkdir_p(path)
 
 		utils.shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, fn) )
+		logging.debug("Acquired lockfile %s" % (fn))
 		return fn
 
 	def _unlock_cell(self, lock):
@@ -583,6 +585,7 @@ class Table:
 		Unlock a cell.
 		"""
 		os.unlink(lock)
+		logging.debug("Released lockfile %s" % (lock))
 
 	#### Low level tablet creation/access routines. These employ no locking
 	def _get_row_group(self, fp, group, cgroup):
@@ -673,6 +676,7 @@ class Table:
 			utils.mkdir_p(path)
 
 		# Create the tablet
+		logging.debug("Creating tablet %s" % (fn))
 		fp  = tables.openFile(fn, mode='w')
 
 		# Force creation of the main subgroup
@@ -691,6 +695,7 @@ class Table:
 		"""
 		fn = self._tablet_file(cell_id, cgroup)
 
+       		logging.debug("Opening tablet %s (mode='%s')" % (fn, mode))
 		if mode == 'r':
 			fp = tables.openFile(fn)
 		elif mode == 'w':
@@ -709,6 +714,8 @@ class Table:
 		
 		Remove a tablet file. Employs no locking.
 		"""
+		assert 0, "Not currently used."
+
 		if not self.tablet_exists(cell_id, cgroup):
 			return
 
@@ -731,6 +738,8 @@ class Table:
 		    The structured array, compatible with the tablet's
 		    table, that is to be appended to the tablet.
 		"""
+		assert 0, "Not currently used."
+
 		fp  = self._open_tablet(cell_id, mode='w', cgroup=cgroup)
 
 		fp.root.main.table.append(rows)
@@ -1032,6 +1041,7 @@ class Table:
 
 					# Close and reopen (otherwise truncate appears to have no effect)
 					# -- bug in PyTables ??
+					logging.debug("Closing tablet (%s)" % (fp.filename))
 					fp.close()
 					fp = self._open_tablet(cur_cell_id, mode='w', cgroup=cgroup)
 					g  = self._get_row_group(fp, group, cgroup)
@@ -1097,6 +1107,7 @@ class Table:
 #					print 'LEN:', colname, bsize, len(barray), ito
 
 				t.append(rows)
+				logging.debug("Closing tablet (%s)" % (fp.filename))
 				fp.close()
 #				exit()
 
@@ -1413,6 +1424,7 @@ class Table:
 
 			yield fp
 
+			logging.debug("Closing tablet (%s)" % (fp.filename))
 			fp.close()
 
 	@contextmanager

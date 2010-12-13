@@ -81,8 +81,21 @@ def startup():
 	suppress_keyboard_interrupt_message()
 
 	## Setup logging ##
-	logging.basicConfig(filename="lsd.log", format='%(asctime)s %(name)s[%(process)d] {%(module)s:%(funcName)s:%(levelname)s}: %(message)s', level=(logging.DEBUG if os.getenv("DEBUG", 1) else logging.INFO))
-	logging.root.name = sys.argv[0].split('/')[-1]
+	format = '%(asctime)s.%(msecs)03d %(name)s[%(process)d] %(levelname)-8s {%(module)s:%(funcName)s}: %(message)s'
+	datefmt = '%a, %d %b %Y %H:%M:%S'
+	level = logging.DEBUG if (os.getenv("DEBUG", 0) or os.getenv("LOGLEVEL", "info") == "debug") else logging.INFO
+	filename = 'lsd.log' if os.getenv("LOG", None) is None else os.getenv("LOG")
+	logging.basicConfig(filename=filename, format=format, datefmt=datefmt, level=level)
+
+	logger = logging.getLogger()
+	logger.name = sys.argv[0].split('/')[-1]
 	logging.info("Started %s", ' '.join(sys.argv))
+	logging.debug("Debug messages turned ON")
+
+	# Log WARNING and above to console
+	ch = logging.StreamHandler()
+	ch.setLevel(logging.WARNING)
+	ch.setFormatter(logging.Formatter('%(levelname)s: %(name)s[%(process)d]: %(message)s'))
+	logger.addHandler(ch)
 
 startup()
