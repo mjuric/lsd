@@ -126,29 +126,30 @@ class TableEntry:
 			if self.table.pix.is_temporal_cell(cell_id):
 				self.static = False
 				break
-		#print self.table.name, ":", self.static
+		# print "TTT:", self.table.name, ":", self.static
 
 		# Fetch the children's populated cells
 		for ce in self.joins:
 			cc, op = ce.get_cells(bounds)
 			if   op == 'and':
+				# Construct new cell list by adding cells from both existing, and 
+				# the new one that are covered in the other list.
 				ret = dict()
-				for cell_id, cbounds in cc.iteritems():
-					assert cell_id not in cells or cells[cell_id] == cbounds
-#					if not (cell_id not in cells or cells[cell_id] == cbounds): # TODO: Debugging -- make sure the timespace constraints are the same
-#						aa = cells[cell_id]
-#						bb = cbounds
-#						pass
-					assert cell_id not in cells or cells[cell_id] == cbounds # TODO: Debugging -- make sure the timespace constraints are the same
-					if cell_id in cells:
-						ret[cell_id] = cbounds
-					else:
-						static_cell = pix.static_cell_for_cell(cell_id)
-						if static_cell in cells:
-							ret[static_cell] = cells[static_cell]
+				c1, c2 = cc, cells
+				for _ in xrange(2):
+					for cell_id, cbounds in c1.iteritems():
+						assert cell_id not in c2 or c2[cell_id] == cbounds # TODO: Debugging -- make sure the timespace constraints are the same
+						if cell_id in c2:
 							ret[cell_id] = cbounds
+						else:
+							static_cell = pix.static_cell_for_cell(cell_id)
+							if static_cell in c2:
+								ret[static_cell] = c2[static_cell]	# Keep the static cell for future comparisons
+								ret[cell_id] = cbounds
+					c1, c2 = cells, cc
+				cells = ret
 			elif op == 'or':
-				ret = cells
+				print "or"
 				for cell_id, cbounds in cc.iteritems():
 					assert cell_id not in cells or cells[cell_id] == cbounds # TODO: Debugging -- make sure the timespace constraints are the same
 #					if not (cell_id not in cells or cells[cell_id] == cbounds): # TODO: Debugging -- make sure the timespace constraints are the same
@@ -156,8 +157,7 @@ class TableEntry:
 #						bb = cbounds
 #						pass
 					assert cell_id not in cells or cells[cell_id] == cbounds # Debugging -- make sure the timespace constraints are the same
-					ret[cell_id] = cbounds
-			cells = ret
+					cells[cell_id] = cbounds
 
 		if self.relation is None:
 			# Remove all static cells if there's even a single temporal cell
