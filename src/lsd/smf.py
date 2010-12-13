@@ -360,6 +360,37 @@ def all_chips():
 
 		yield chip_id, chip_xy
 
+def fix_ps1_coord_bugs(cols, file, hduname):
+	# FIXME: Work around PS1 bugs
+	ra, dec = cols['ra'], cols['dec']
+
+	if np.any(ra < 0):
+		print "HERE!"
+		logging.warning("Encountered %d instances of ra < 0 in file %s, %s HDU. Wrapping to [0, 360)." % (sum(ra < 0), file, hduname))
+		ra[ra < 0] = np.fmod(np.fmod(ra[ra < 0], 360) + 360, 360)
+
+	if np.any(ra >= 360):
+		logging.warning("Encountered %d instances of ra >= 360 in file %s, %s HDU. Wrapping to [0, 360)." % (sum(ra >= 360), file, hduname))
+		ra[ra >= 360] = np.fmod(np.fmod(ra[ra >= 360], 360) + 360, 360)
+
+	if np.any(np.abs(dec) > 90):
+		logging.warning("Encountered %d instances of dec > +/- 90 in file %s, %s HDU. Truncating to +/-90." % (sum(np.abs(dec) > 90), file, hduname))
+		dec[dec > 90] = 90
+		dec[dec < -90] = -90
+
+	cols['ra'], cols['dec'] = ra, dec
+
+	# Remove any NaN rows
+	if np.isnan(cols['ra'].sum()):
+		logging.warning("Encountered %d instances of ra == NaN in file %s, %s HDU. Removing those rows." % (sum(np.isnan(ra)), file, hduname))
+		keep = ~np.isnan(cols['ra'])
+		for name in cols: cols[name] = cols[name][keep]
+
+	if np.isnan(cols['dec'].sum()):
+		logging.warning("Encountered %d instances of dec == NaN in file %s, %s HDU. Removing those rows." % (sum(np.isnan(dec)), file, hduname))
+		keep = ~np.isnan(cols['dec'])
+		for name in cols: cols[name] = cols[name][keep]
+
 def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f):
 	det_c2t = gen_tab2type(det_table_def)
 	exp_c2t = gen_tab2type(exp_table_def)
@@ -372,6 +403,7 @@ def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f):
 	imhdr = hdus[0].header
 	exp_cols, exp_nullcols = load_columns_from_header(imhdr, exp_c2f, exp_c2t)
 	add_lb(exp_cols)
+	fix_ps1_coord_bugs(exp_cols, file, 'primary')
 
 	# Record the list of keywords not found in the header
 	# and prepare the lists of columns not found in the header
@@ -435,6 +467,8 @@ def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f):
 		# Record any columns that were not found
 		if len(nullcols):
 			exp_cols['notfound_cols'][0][chip_id] = nullcols
+
+		fix_ps1_coord_bugs(det_cols, file, chip_xy + '.psf')
 
 		# Add computed columns
 		add_lb(det_cols)
@@ -920,5 +954,3 @@ def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, _re
 
 if __name__ == '__main__':
 	make_object_catalog('ps1_obj', 'ps1_det')
-
-logging.info("Here")
