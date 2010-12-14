@@ -10,6 +10,7 @@ import os, json, glob, copy
 import numpy as np
 import cPickle
 import pyfits
+import logging
 
 from contextlib  import contextmanager
 from collections import defaultdict
@@ -952,6 +953,12 @@ class QueryEngine(object):
 		# Set up the args for __iter__
 		self._partspecs = partspecs
 		self._include_cached = include_cached
+
+		# Set the static cell
+		if partspecs:
+			cell_id = partspecs[0][0]
+			self.static_cell = self.pix.static_cell_for_cell(cell_id)
+
 		return self
 
 	def __iter__(self):
@@ -1265,8 +1272,12 @@ class Query(object):
 				ret = rows
 				nret = len(rows)
 			else:
-				while len(ret) < nret + len(rows):
-					ret.resize(2 * max(len(ret),1))
+				lnew = nret + len(rows)
+				lret = len(rows)
+				while lret < lnew:
+					lret = 2 * max(lret,1)
+				if lret != len(rows):
+					ret.resize(lret)
 
 				# append
 				ret[nret:nret+len(rows)] = rows

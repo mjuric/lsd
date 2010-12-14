@@ -248,8 +248,9 @@ class ColGroup(object):
 		if dtype is not None:
 			# construct cols from structured array dtype
 			assert cols is None or len(cols) == 0
+			# TODO: This is very inefficient (2x more RAM used than needed)
 			template = np.zeros(size, dtype=dtype)
-			cols = [ (name, template[name]) for name in template.dtype.names ]
+			cols = [ (name, template[name].copy()) for name in template.dtype.names ]
 
 		# Detect dict() and ColGroup()s
 		if getattr(cols, 'items', None) is not None:
@@ -488,6 +489,45 @@ class ColGroup(object):
 			res &= (self[name] == y[name])
 
 		return res
+
+	def copy(self):
+		"""
+		Return a copy of this object.
+		"""
+		ret = ColGroup()
+		for name in self.keys():
+			ret.add_column(name, self[name].copy())
+		return ret
+
+def fromiter(it, dtype=None, blocks=False):
+	"""
+	Load a ColGroup from an iterable.
+	"""
+	assert blocks == True, "blocks==False not implemented yet."
+
+	ret = None
+	for rows in it:
+		if ret is None:
+			ret = rows.copy()
+			nret = len(rows)
+		else:
+			lnew = nret + len(rows)
+			lret = len(rows)
+			while lret < lnew:
+				lret = 2 * max(lret,1)
+			if lret != len(rows):
+				ret.resize(lret)
+
+			# append
+			ret[nret:nret+len(rows)] = rows
+			nret = nret + len(rows)
+
+	if ret is not None:
+		ret.resize(nret)
+	else:
+		ret = ColGroup(dtype=dtype, size=0)
+
+	return ret
 
 if __name__ == "__main__":
 	# Multi-dimensional arrays
