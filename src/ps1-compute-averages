@@ -1,0 +1,133 @@
+#!/usr/bin/env python
+
+import os
+import lsd
+import lsd.colgroup as colgroup
+import numpy as np
+import scipy.stats.mstats
+from itertools import izip
+from collections import defaultdict
+from lsd.join_ops import IntoWriter
+from scipy.weave import inline
+import logging
+
+def calc_objmag(qresult, qwriter):
+	"""
+	Compute object magnitude from detections.
+
+	Compute ndet, median, average, SIQR per detection.
+	"""
+	# PS1 bug workaround: Ignore the few objects that wound up on the south pole
+	if qresult.static_cell & 0xFFFFFFFF00000000 == 0:
+		logging.warning("Encountered the cell a south pole cell. Dropping it.")
+		return
+
+#	nr = 0
+#	for k, rows in enumerate(qresult):
+#		if len(rows):
+#			print "k=", k
+#			print rows
+
+	all_rows = colgroup.fromiter(qresult, blocks=True)
+	#all_rows = next(iter(qresult))
+	if not len(all_rows):
+		return
+
+	# Sort
+	all_rows.sort(["filterid", "_ID", "mag"])
+#	print len(all_rows)
+#	print all_rows
+
+	# Prepare the output array
+	objs = np.unique(all_rows['_ID'])
+	out = colgroup.ColGroup(
+		dtype=[
+			('obj_id', 'u8'),
+			('ndet', 'i2'), ('ndet_ok', 'i2'),
+			('nmag', '5i2'), ('nmag_ok', '5i2'),
+			('mean', '5f4'), ('stdev', '5f4'), ('median', '5f4'), ('q25', '5f4'), ('q75', '5f4')
+		      ],
+		      size=len(objs)
+	      )
+	out['obj_id'][:] = objs
+
+	# Pull out the arrays we'll be using
+	(id_out, ndet, ndet_ok, nmag, nmag_ok, mean, stdev, median, q25, q75) = out.as_columns()
+	id_in, mags, filterid = all_rows['_ID'], all_rows['mag'], all_rows['filterid']
+
+	# Convert filterid to index
+	band = np.empty(len(all_rows), dtype='i4')
+	for f, i in { 'g.0000': 0, 'r.0000': 1, 'i.0000': 2, 'z.0000': 3, 'y.0000': 4 }.iteritems():
+		band[filterid == f] = i
+
+	code = \
+	"""
+	#line 50 "objdata_weave.py"
+
+	assert(Sid_out[0] == sizeof(*id_out));	// Make sure we've got a contiguous array
+
+	// stream through the input arrays
+	int size = Nmags[0];
+	std::vector<float> mags1;
+	for(int i = 0, j = 0; i != size; i = j)
+	{
+		j = i;
+		mags1.clear();
+		while(j != size && id_in[i] == id_in[j] && band[i] == band[j])
+		{
+			float mag = MAGS1(j);
+			if(std::isfinite(mag))
+			{
+				mags1.push_back(mag);
+			}
+			j++;
+		}
+
+		// find where to store
+		int row = std::lower_bound(id_out, id_out + Nid_out[0], id_in[i]) - id_out;
+		int col = band[i];
+
+		assert(id_out[row] == id_in[i]);
+		assert(0 <= row && row < Nid_out[0]);
+		assert(0 <= col && col < 5);
+
+		// store number of elements (all and finite)
+		   NMAG2(row, col) = j - i;
+		NMAG_OK2(row, col) = mags1.size();
+
+		// median statistics
+		Q252(row, col)    = gsl_stats_float_quantile_from_sorted_data(&mags1[0], 1, mags1.size(), 0.25);
+		MEDIAN2(row, col) = gsl_stats_float_quantile_from_sorted_data(&mags1[0], 1, mags1.size(), 0.50);
+		Q752(row, col)    = gsl_stats_float_quantile_from_sorted_data(&mags1[0], 1, mags1.size(), 0.75);
+
+		// mean statistics
+		MEAN2(row, col)  = gsl_stats_float_mean(&mags1[0], 1, mags1.size());
+		STDEV2(row, col) = gsl_stats_float_sd(&mags1[0], 1, mags1.size());
+	}
+	"""
+	inline(code,
+		['id_out', 'ndet', 'ndet_ok', 'nmag', 'nmag_ok', 'mean', 'stdev', 'median', 'q25', 'q75', 'id_in', 'mags', 'band'],
+		headers=['<cmath>', '<iostream>', '<vector>', '<gsl/gsl_statistics_float.h>', '<cassert>', '<algorithm>'],
+		libraries=['gsl', 'gslcblas'],
+		undef_macros=['NDEBUG'])
+
+	# Compute ndet
+	out['ndet'][:] = np.sum(out['nmag'], axis=1)
+	assert np.all(out['ndet'])
+	out['ndet_ok'][:] = np.sum(out['nmag_ok'], axis=1)
+
+	# Write out the result
+	result = qwriter.write(qresult.static_cell, out)
+	yield result
+
+
+db = lsd.DB("db")
+#q = db.query("SELECT _ID, cal_psf_mag as mag, filterid FROM ps1_obj, ps1_det where (obj_id==6496442462481940483) & (filterid=='g.0000')")
+#q = db.query("SELECT _ID, cal_psf_mag as mag, filterid FROM ps1_obj, ps1_det where (obj_id==6496442462481940483) | (obj_id==6496442462481940484)")
+q = db.query("SELECT _ID, cal_psf_mag as mag, filterid FROM ps1_obj, ps1_det")
+#q = db.query("select _ID, cal_psf_mag, filterid, u, g, r, i, z from ps1_obj, ps1_det, sdss where _ROWNUM==1")
+writer = IntoWriter(db, "mags WHERE obj_id |= obj_id")
+nrows = 0
+for cell_id, rows in q.execute([(calc_objmag, writer)], group_by_static_cell=True):
+	nrows += len(rows)
+print nrows
