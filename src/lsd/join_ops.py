@@ -233,6 +233,7 @@ class TableEntry:
 			r = r[idx1]
 			s = s[idx2]
 			r.add_columns(s.items())
+			assert np.all(idx2 == r[self.name])
 
 			# Add the NULL column only if there were any NULLs
 			if isnull.any():
@@ -245,7 +246,7 @@ class TableEntry:
 			if tk is not None:
 				t = tcache.load_column(cell_id,  tk, self.table)
 				if len(t):
-					r = self.filter_spacetime(r, t[idx2], bounds)
+					r = self.filter_spacetime(r, t[r[self.name]], bounds)
 
 		# Let children JOIN themselves onto us
 		for ce in self.joins:
@@ -527,14 +528,15 @@ class QueryInstance(object):
 			if len(rows):
 				in_  = self.eval_where(globals_)
 
-				if not in_.all():
-					rows = rows[in_]
+				if(in_.any()):
+					if not in_.all():
+						rows = rows[in_]
 
-				# Attach metadata
-				rows.cell_id = self.cell_id
-				rows.where__ = in_
+					# Attach metadata
+					rows.cell_id = self.cell_id
+					rows.where__ = in_
 
-				yield rows
+					yield rows
 
 		# We yield nothing if the result set is empty.
 
@@ -1951,6 +1953,33 @@ def deref(uris, db=None, unpickle=False):
 	assert ret.shape == uris.shape, '%s %s %s' % (ret.shape, uris.shape, idx.shape)
 
 	return ret
+
+def bin(v):
+	"""
+	Similar to __builtin__.bin but works on ndarrays.
+	
+	Useful in queries for converting flags to bit strings.
+
+	FIXME: The current implementation is painfully slow.
+	"""
+	import __builtin__
+	if not isinstance(v, np.ndarray):
+		return __builtin__.bin(v)
+
+	# Must be some kind of integer
+	assert v.dtype.kind in ['i', 'u']
+
+	# Create compatible string array
+	l = v.dtype.itemsize*8
+	ss = np.empty(v.shape, dtype=('a', v.dtype.itemsize*9))
+	s = ss.reshape(-1)
+	for i, n in enumerate(v.flat):
+		c = __builtin__.bin(n)[2:]
+		c = '0'*(l-len(c)) + c
+		ll = [ c[k:k+8] for k in xrange(0, l, 8) ]
+		s[i] = ','.join(ll)
+		#s[i] = c
+	return ss
 
 ###############################
 

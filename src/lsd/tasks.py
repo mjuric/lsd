@@ -17,6 +17,7 @@ def _coverage_mapper(qresult, dx, filter):
 	filter, filter_args = unpack_callable(filter)
 
 	for rows in qresult:
+		assert len(rows)
 		if filter is not None:
 			rows = filter(rows, *filter_args)
 
@@ -35,7 +36,12 @@ def _coverage_mapper(qresult, dx, filter):
 
 		i = (lon / dx).astype(int)
 		j = ((90 - lat) / dx).astype(int)
-	
+
+		assert len(lon)
+		assert len(lat)
+		assert len(i)
+		assert len(j)
+
 		(imin, imax, jmin, jmax) = (i.min(), i.max(), j.min(), j.max())
 		w = imax - imin + 1
 		h = jmax - jmin + 1
