@@ -26,11 +26,11 @@ def _coverage_mapper(qresult, dx, filter):
 		# Work around PS1 bugs:
 		tofix = (lon < 0) | (lon >= 360)
 		if np.any(tofix):
-			#print "Fixing RIGHT ASCENSION in cell ", rows.cell_id
+			#print "Fixing RIGHT ASCENSION in cell ", rows.info.cell_id
 			lon[tofix] = np.fmod(np.fmod(lon[tofix], 360.) + 360., 360.)
 		tofix = (lat < -90) | (lat > 90)
 		if np.any(tofix):
-			print "Fixing DECLINATION in cell ", rows.cell_id
+			print "Fixing DECLINATION in cell ", rows.info.cell_id
 			lat[lat < -90] = -90
 			lat[lat > 90]  = 90
 
@@ -48,7 +48,7 @@ def _coverage_mapper(qresult, dx, filter):
 		i -= imin; j -= jmin
 		if w <= 0 or h <= 0 or w > 10800 or h > 5400:
 			print w, h
-			print rows.cell_id
+			print rows.info.cell_id
 			exit()
 	
 		if False:
@@ -88,7 +88,7 @@ def compute_coverage(db, query, dx = 0.5, bounds=None, include_cached=False, fil
 def ls_mapper(qresult):
 	# return the number of rows in this chunk, keyed by the filename
 	for rows in qresult:
-		yield rows.cell_id, len(rows)
+		yield rows.info.cell_id, len(rows)
 
 def compute_counts(db, table, include_cached=False):
 	ntotal = 0
@@ -114,7 +114,7 @@ def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm):
 	table_xm = db.table(tabname_xm)
 
 	for rows in qresult:
-		cell_id  = rows.cell_id
+		cell_id  = rows.info.cell_id
 
 		join = ColGroup()
 
@@ -266,7 +266,7 @@ def _accumulator(qresult, key, val, oval):
 	for rows in qresult:
 		kdtype = rows[key].dtype
 		vdtype = rows[val].dtype
-		cell_id = rows.cell_id
+		cell_id = rows.info.cell_id
 
 		if static_cell == None:
 			static_cell = qresult.pix.static_cell_for_cell(cell_id)

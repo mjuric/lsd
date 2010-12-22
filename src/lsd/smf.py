@@ -522,7 +522,7 @@ def make_image_cache(db, det_tabname, exp_tabname):
 def _exp_id_gather(qresult):
 	# Fetch all exp_ids referenced from this cell
 	for rows in qresult:
-		cell_id = rows.cell_id
+		cell_id = rows.info.cell_id
 
 		exp_id     = np.unique(rows['_EXP'])
 		exp_cells  = qresult.pix.cell_for_id(exp_id)

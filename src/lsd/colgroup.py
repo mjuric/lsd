@@ -58,6 +58,13 @@ class RowIter:
 
 		return self.row
 
+class InfoInstance:
+	"""
+	Container for ColGroup.info. Defined outside ColGroup to be
+	pickleable.
+	"""
+	pass;
+
 class ColGroup(object):
 	"""
 	A structured array, stored by column instead of by row.
@@ -89,8 +96,7 @@ class ColGroup(object):
 
 	column_map = None	# Map from name->pos and pos->name
 	column_data = None	# A list of columns (individual numpy arrays)
-
-	row = None		# A np.void instance with the correct dtype for a row in this cgroup
+	info = None		# A class holding any user-defined tags
 
 	##
 	## dict-like interface implementation
@@ -113,6 +119,32 @@ class ColGroup(object):
 		"""
 		items = [ (self.column_map[pos], self.column_data[pos]) for pos in xrange(len(self.column_data)) ]
 		return items
+
+	def __getattr__(self, name):
+		"""
+		Allow accessing columns as attributes
+
+		'name' is the name of the column to return.
+		"""
+		if (self.column_map is None) or (name not in self.column_map):
+			raise AttributeError('Column %s not found.' % name)
+
+		return self.column_data[self.column_map[name]]
+
+	def __setattr__(self, name, value):
+		"""
+		Allow adding (or replacing) columns as attributes.
+		"""
+		if name in ['column_map', 'column_data', 'info']:
+			object.__setattr__(self, name, value)
+		else:
+			self[name] = value
+
+	def __delattr__(self, name):
+		"""
+		Delete a column from the group.
+		"""
+		self.drop_column(name)
 
 	def __getitem__(self, key):
 		"""
@@ -164,7 +196,8 @@ class ColGroup(object):
 		"""
 		Remove the named column from the ColGroup.
 		
-		Note: This operation is computationally cheap.
+		Note: This operation is computationally cheap, relative
+		to the same operation with a structured ndarray.
 		"""
 		pos  = self.column_map[key] if     isinstance(key, str) else key
 		cols = self.items()
@@ -223,6 +256,12 @@ class ColGroup(object):
 		"""
 		return np.dtype([ (self.column_map[pos], full_dtype(col)) for (pos, col) in enumerate(self.column_data) ])
 
+	def column(self, idx):
+		"""
+		Return the column at index idx.
+		"""
+		return self.column_data[idx]
+
 	def __init__(self, cols=[], dtype=None, size=0):
 		"""
 		Construct the column group.
@@ -244,6 +283,7 @@ class ColGroup(object):
 		"""
 		self.column_map = dict()
 		self.column_data = []
+		self.info = InfoInstance()
 
 		if dtype is not None:
 			# construct cols from structured array dtype
@@ -490,14 +530,40 @@ class ColGroup(object):
 
 		return res
 
-	def copy(self):
+	def copy(self, expr=None):
 		"""
-		Return a copy of this object.
+		Return a copy of this object, potentially keeping only some
+		rows.
+
+		Copies the info object as well.
+
+		If expr is not None, keeps only the rows for which expr
+		evaulates to True.
 		"""
 		ret = ColGroup()
-		for name in self.keys():
-			ret.add_column(name, self[name].copy())
+		ret.info = self.info
+
+		if expr is None:
+			for name in self.keys():
+				ret.add_column(name, self[name].copy())
+		else:
+			for name in self.keys():
+				ret.add_column(name, self[name][expr])
 		return ret
+
+	def cut(self, expr):
+		"""
+		Remove rows for which expr evaluates to False
+		
+		Returns self.
+
+		Convenient for interactive work.
+		"""
+
+		self.column_data = [ col[expr] for col in self.column_data ]
+
+		return self
+
 
 def fromiter(it, dtype=None, blocks=False):
 	"""
@@ -505,31 +571,76 @@ def fromiter(it, dtype=None, blocks=False):
 	"""
 	assert blocks == True, "blocks==False not implemented yet."
 
-	ret = None
+	buf = None
 	for rows in it:
-		if ret is None:
-			ret = rows.copy()
-			nret = len(rows)
+		if buf is None:
+			# Just copy the first one
+			buf = rows.copy()
+			at  = len(buf)
 		else:
-			lnew = nret + len(rows)
-			lret = len(rows)
-			while lret < lnew:
-				lret = 2 * max(lret,1)
-			if lret != len(rows):
-				ret.resize(lret)
+			at2 = at + len(rows)
+			if at2 > len(buf):
+				# Next higher power of two
+				newsize = 1 << int(np.ceil(np.log2(at2)))
+				buf.resize(newsize)
 
 			# append
-			ret[nret:nret+len(rows)] = rows
-			nret = nret + len(rows)
+			buf[at:at+len(rows)] = rows
+			at = at + len(rows)
 
-	if ret is not None:
-		ret.resize(nret)
+	# Truncate the buffer to output size
+	if buf is not None:
+		buf.resize(at)
 	else:
-		ret = ColGroup(dtype=dtype, size=0)
+		buf = ColGroup(dtype=dtype, size=0)
 
-	return ret
+	return buf
+
+def test_fromiter():
+	# Test fromiter()
+	from itertools import izip
+
+	# No element
+	cg1 = fromiter([], blocks=True)
+	assert np.all(cg1 == ColGroup())
+
+	# Single element
+	cg1 = ColGroup()
+	cg1.f1 = np.arange(10)
+	cg1.f2 = np.arange(10)
+	cg2 = fromiter([cg1], blocks=True)
+	assert np.all(cg1 == cg2)
+
+	# More than one block of varying sizes
+	s = [20, 2, 4, 570, 13, 44, 56, 88, 9999, 1003000, 0, 1]
+	def mkarray(begin, end):
+		cg = ColGroup()
+		cg.f1 = np.arange(begin, end)
+		cg.f2 = np.arange(begin, end, dtype='f4')
+		return cg
+
+	s = [20, 2, 4, 570, 13, 44, 56, 88, 9999, 1003000, 0, 1]
+	cg2 = fromiter(( mkarray(end-len, end) for (len, end) in izip(s, np.cumsum(s)) ), blocks=True)
+	cg1 = mkarray(0, sum(s))
+	assert np.all(cg1 == cg2)
+
+	# Special sizes
+	s = [0, 2, 2, 4, 8, 16, 32, 32, 32, 1]
+	cg2 = fromiter(( mkarray(end-len, end) for (len, end) in izip(s, np.cumsum(s)) ), blocks=True)
+	cg1 = mkarray(0, sum(s))
+	assert np.all(cg1 == cg2)
+
+	# Fuzzing
+	for _ in xrange(1000):
+		s = np.random.random_integers(0, 10000, 20)
+		cg2 = fromiter(( mkarray(end-len, end) for (len, end) in izip(s, np.cumsum(s)) ), blocks=True)
+		cg1 = mkarray(0, sum(s))
+		assert np.all(cg1 == cg2)
 
 if __name__ == "__main__":
+	test_fromiter()
+	exit()
+
 	# Multi-dimensional arrays
 	ra   = np.arange(10, dtype=np.dtype('f8'))
 	dec  = np.arange(40, dtype='i4').reshape((10, 4))

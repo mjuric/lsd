@@ -533,8 +533,7 @@ class QueryInstance(object):
 						rows = rows[in_]
 
 					# Attach metadata
-					rows.cell_id = self.cell_id
-					rows.where__ = in_
+					rows.info.cell_id = self.cell_id
 
 					yield rows
 
@@ -1199,6 +1198,9 @@ class Query(object):
 			else:
 				yield 0, self.qengine.peek()
 
+		# Shut down the workers
+		del pool
+
 	def iterate(self, bounds=None, include_cached=False, cells=[], return_blocks=False, filter=None, testbounds=True, nworkers=None, progress_callback=None, _yield_empty=False):
 		"""
 		Yield query results row-by-row or in blocks
@@ -1688,7 +1690,7 @@ def _cache_maker_mapper(qresult, margin_x, db, tabname):
 	# Map: fetch all rows to be copied to adjacent cells,
 	# yield them keyed by destination cell ID
 	for rows in qresult:
-		cell_id = rows.cell_id
+		cell_id = rows.info.cell_id
 		p, _ = qresult.pix.cell_bounds(cell_id)
 
 		# Find all objects within 'margin_x' from the cell pixel edge
@@ -1784,7 +1786,7 @@ def _mapper(partspec, mapper, qengine, include_cached):
 def _iterate_mapper(qresult):
 	for rows in qresult:
 		if len(rows):	# Don't return empty sets. TODO: Do we need this???
-			yield (rows.cell_id, rows)
+			yield (rows.info.cell_id, rows)
 
 def _into_writer(kw, qwriter):
 	cell_id, irows = kw

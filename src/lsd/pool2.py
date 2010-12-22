@@ -153,9 +153,28 @@ class Pool:
 	qin = None
 	qout = None
 	ps = []
-	DEBUG = int(os.getenv('DEBUG', False))
 	min_tasks_for_parallel = 3
-	nworkers = int(os.getenv('NWORKERS', cpu_count()))
+	DEBUG = None	# Filled in in __init__ from getenv
+	nworkers = None	# Filled in in __init__ from getenv or cpu_count()
+
+	def __del__(self):
+		self.close()
+
+	def close(self):
+		if len(self.ps) == 0:
+			return
+
+		for q in self.qcmd:
+			q.put('EXIT')
+
+		kill = []
+		for p in self.ps:
+			p.join(5)
+			if p.is_alive():
+				kill.append(p)
+		
+		for p in kill:
+			p.terminate()
 
 	def _create_workers(self):
 		""" Lazily create workers, when needed. This routine
@@ -175,6 +194,9 @@ class Pool:
 			p.start()
 
 	def __init__(self, nworkers = None):
+		self.DEBUG    = int(os.getenv('DEBUG', False))
+		self.nworkers = int(os.getenv('NWORKERS', cpu_count()))
+
 		if nworkers != None:
 			self.nworkers = nworkers
 
