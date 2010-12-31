@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import mmap
+import traceback
 from utils import unpack_callable
 
 RET_KEYVAL = 1
@@ -22,20 +23,31 @@ def _worker(qcmd, qin, qout):
 		     message 'DONE' is encountered. Return the
 		     results yielded by mapper via qout.
 	"""
-	for cmd, args in iter(qcmd.get, 'EXIT'):
-		if cmd == 'MAP':
-			mapper, mapper_args = args
+	try:
+		for cmd, args in iter(qcmd.get, 'EXIT'):
+			if cmd == 'MAP':
+				mapper, mapper_args = args
 
-			i, item, result = None, None, None
-			for (i, item) in iter(qin.get, 'DONE'):
-				for result in mapper(item, *mapper_args):
-					qout.put((i, result))
-				qout.put('DONE')
+				i, item, result = None, None, None
+				for (i, item) in iter(qin.get, 'DONE'):
+					try:
+						for result in mapper(item, *mapper_args):
+							qout.put((i, result))
+						qout.put(('DONE', None))
+					except KeyboardInterrupt:
+						return
+					except:
+						type, value, tb = sys.exc_info()
+						tb_str = traceback.format_tb(tb)
+						del tb    # See docs for sys.exec_info() for why this has to be here
+						qout.put(('EXCEPT', (type, value, tb_str)))
 
-			# Immediately release memory
-			del result, i, item
-			del mapper, mapper_args
-			del args
+				# Immediately release memory
+				del result, i, item
+				del mapper, mapper_args
+				del args
+	except KeyboardInterrupt:
+		pass;
 
 def _unserializer(file, offsets):
 	# Helper for _reduce_from_pickle_jar -- takes a filename and
@@ -176,6 +188,17 @@ class Pool:
 		for p in kill:
 			p.terminate()
 
+		self.qcmd = self.qin = self.qout = None
+		del self.ps[:]
+
+	def terminate(self):
+		for p in self.ps:
+			p.terminate()
+
+		self.qcmd = self.qin = self.qout = None
+		if len(self.ps):
+			del self.ps[:]
+
 	def _create_workers(self):
 		""" Lazily create workers, when needed. This routine
 		    creates the worker processes when called the first
@@ -221,33 +244,45 @@ class Pool:
 		# Dispatch/execute
 		if parallel:
 			# Create workers (if not created already)
-			self._create_workers()
+			try:
+				self._create_workers()
 
-			# Initialize this map
-			for q in self.qcmd:
-				q.put( ('MAP', (mapper, mapper_args)) )
+				# Initialize this map
+				for q in self.qcmd:
+					q.put( ('MAP', (mapper, mapper_args)) )
 
-			# Queue the data to operate on
-			i = -1
-			for (i, item) in enumerate(input):
-				self.qin.put( (i, item) )
-			n = i + 1
+				# Queue the data to operate on
+				i = -1
+				for (i, item) in enumerate(input):
+					self.qin.put( (i, item) )
+				n = i + 1
 
-			# Queue the end-of-map markers
-			for _ in xrange(self.nworkers):
-				self.qin.put('DONE')
+				# Queue the end-of-map markers
+				for _ in xrange(self.nworkers):
+					self.qin.put('DONE')
 
-			# yield the outputs
-			k = 0
-			while k != n:
-				ret = self.qout.get()
-				if isinstance(ret, str) and ret == 'DONE':
-					k += 1
-					progress_callback(progress_callback_stage, 'step', input, k, None)
-					continue
+				# yield the outputs
+				k = 0
+				while k != n:
+					(i, result) = self.qout.get()
+					if isinstance(i, str):
+						if i == 'DONE':
+							k += 1
+							progress_callback(progress_callback_stage, 'step', input, k, None)
+							continue
+						if i == 'EXCEPT':
+							# Unhandled Exception was raised in one of the workers.
+							# Terminate the workers and re-raise it.
+							self.terminate()
+							type, value, tb_str = result
+							print >> sys.stderr, 'Remote Traceback (most recent call last):\n', ''.join(tb_str)
+							raise value
 
-				(i, result) = ret
-				yield result
+					yield result
+			except:
+				# Terminate the workers if an exception ocurred
+				self.terminate()
+				raise
 		else:
 			# Execute in-thread, without external workers
 			for (i, item) in enumerate(input):
