@@ -4,7 +4,7 @@ import socket, os, time, sys
 import numpy as np
 import subprocess as sp
 import getopt
-import StringIO
+import cStringIO
 import imp
 import xmlrpclib
 import asyncore
@@ -19,12 +19,73 @@ import cPickle
 import random
 import tempfile
 import mmap
+import struct
+import platform
 from base64 import b64encode, b64decode
 from collections import defaultdict
 
 import core
 
+# Buffer size -- can't be too big on 32bit platforms (otherwise all mmaps
+# won't fit in memory)
+BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 2**40
+
 logger = logging.getLogger('mrp2p')
+
+if False:
+	# Verbose wrappers for debugging
+	class Event(threading._Event):
+		def __init__(self, name, verbose=None):
+			self.__name = name
+			threading._Event.__init__(self, verbose)
+	
+		def __str__(self):
+			return "Event %s" % self.__name
+	
+		def wait(self, timeout=None):
+			ct = threading.current_thread()
+	
+			logger.debug("[%s] Waiting on %s" % (self, ct))
+			while not threading._Event.wait(self, 3):
+				logger.debug("[%s] EVENT EXPIRED ON %s" % (self, ct))
+	
+	class RLock(threading._RLock):
+		def acquire(self):
+			new = not self._is_owned()
+			ct = threading.current_thread()
+	
+			if new:
+				logger.debug("[%s] Acquiring for %s" % (self, ct))
+	
+			for retry in xrange(10):
+				if threading._RLock.acquire(self, blocking=False):
+					break
+				time.sleep(1)
+				logger.debug("[%s] Acquiring for %s (attempt %d)." % (self, ct, retry))
+			else:
+				logger.debug("[%s] DEADLOCKED IN THREAD %s." % (self, ct))
+				raise Exception()
+			
+			if new:
+				logger.debug("[%s] Acquired in %s." % (self, ct))
+	
+		__enter__ = acquire
+	
+		def release(self):
+			ret = threading._RLock.release(self)
+			ct = threading.current_thread()
+			if not self._is_owned():
+				logger.debug("[%s] Releasing on %s" % (self, ct))
+			return ret
+else:
+	RLock = threading.RLock
+	Event = threading.Event
+
+def unpack_callable(func):
+	""" Unpack a (function, function_args) tuple
+	"""
+	func, func_args = (func, ()) if callable(func) or func is None else (func[0], func[1:])
+	return func, func_args
 
 def mrp2p_init():
 	"""
@@ -68,7 +129,7 @@ class TaskSpec(object):
 		# Custom serialization format, because we don't want to use cPickle (unsafe)
 		# and we can't guarantee there won't be any binary characters in argv or env
 
-		out = StringIO.StringIO()
+		out = cStringIO.StringIO()
 
 		out.write(b64encode(self.fn) + '\n')
 		out.write(b64encode(self.cwd) + '\n')
@@ -164,7 +225,10 @@ def _make_buffer_mmap(size, dir=None):
 	fp.close()				# Close immediately to trigger the unlink()-ing of the unrelying file.
 	return mm
 
-KeyChainSentinel = object()
+class KeyChainSentinelClass(object):
+	pass
+
+KeyChainSentinel = KeyChainSentinelClass()
 
 class AckDoneClass(object):
 	def __eq__(self, a):
@@ -185,8 +249,8 @@ class Worker(object):
 		To add a new destination (from a different thread), write
 		to Scatterer's fd to trigger entering the Scatterer's thread.
 		"""
-		class ScattererChannel(asyncore.dispatcher_with_send):
-			bufsize = 2**40 	# buffer size - 1TB (ext3 max. file size is 2TB)
+		class ScattererChannel(asyncore.dispatcher):
+			bufsize = BUFSIZE 	# buffer size - 1TB (ext3 max. file size is 2TB)
 			ctresh  = 50 * 2**20	# compactification treshold (50M)
 
 			addr	= None	# (host, port) destination
@@ -198,26 +262,34 @@ class Worker(object):
 			mm_end	= 0	# end read pointer (less than or equal to mm.tellg()). Used to avoid locking on every writable() call
 
 			serving_stages = None	# The set of stages for which we've sent out keys.
+			asyncore_map = None		# asyncore thread map
+
+			def __hash__(self):
+				return id(self)
+
+			def __eq__(self, b):
+				return id(self) == id(b)
 
 			def finish_stage(self, stage):
 				self.serving_stages.remove(stage)
 
-			def __init__(self, host, port):
+			def __init__(self, host, port, map):
 				# Constructor: this gets called from the Worker's thread,
 				# but we don't initialize the socket or connect to the destination
 				# here, but do it from the asyncore thread (see delayed_init())
 				self.addr = (host, port)
+				self.asyncore_map = map
 
 				self.mm = _make_buffer_mmap(self.bufsize)
 
-				self.lock = threading.RLock()
+				self.lock = RLock()
 				
 				self.serving_stages = set()
 
 			def delayed_init(self, map):
 				# The __init__ equivalent called from asyncore's thread
 				# Connects to the destination host:port
-				super(ScattererChannel, self).__init__()
+				asyncore.dispatcher.__init__(self, map=self.asyncore_map)
 
 				self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
 				self.connect(self.addr)
@@ -233,7 +305,7 @@ class Worker(object):
 				return self.mm_at < self.mm_end
 
 			def handle_write(self):
-				# Write as much as we can to the destination
+				# Write as much as we can to the destination.
 				sent = self.send(self.mm[self.mm_at:self.mm_end])
 				self.mm_at += sent
 
@@ -255,15 +327,19 @@ class Worker(object):
 				# Runs from within a worker thread
 				with self.lock:
 					# Serialize the key/value
-					at = self.mm.tell()
-					self.mm.write('\0'*8)				# 1. [ int64] Payload length (placeholder, filled in 5.)
+					pkt_beg_offs = self.mm.tell()
+					self.mm.seek(8, 1)				# 1. [ int64] Payload length (placeholder, filled in 5.)
+
+					payload_beg_offs = self.mm.tell()
 					self.mm.write(struct.pack('<I', stage))		# 2. [uint32] Stage
+
 					cPickle.dump(k, self.mm, -1)			# 3. [pickle] Key
 					cPickle.dump(v, self.mm, -1)			# 4. [pickle] Value
-					self.mm[at:at+8] = \
-						struct.pack('<Q', self.mm.tell() - at)	# 5. Fill in the length
 
-					self.serving_stages.add(stage)			# Record we've sent out a key for this stage
+					self.mm[pkt_beg_offs:pkt_beg_offs+8] = \
+						struct.pack('<Q', self.mm.tell() - payload_beg_offs)	# 5. Fill in the length
+
+					self.serving_stages.add(stage)			# Remember we've sent out a key for this stage
 
 		parent = None		# Parent Worker instance
 		asyncore_map = None	# asyncore map that this Scatterer participates in
@@ -273,23 +349,32 @@ class Worker(object):
 		key_destinations = None	# Map of (stage, key) -> ScatterChannel
 		stage_destinations=None # Map of (stage) -> set(ScatterChannel)
 
+		pending_channels = None # A list of channels that need to be added to the asyncore map
+		pending_done = None		# A list of stages that have finished (and for which we can release Channels)
+		
+		waiting_ack = None	# dict: stage->number of workers we're waiting to ack they've recvd all of our data
+
 		r_fd = None		# Pipe used to wake up the Scatterer in the asyncore thread (read endpoint)
 		w_fd = None		# Pipe used to wake up the Scatterer in the asyncore thread (write endpoint)
 
 		lock = None		# A lock protecting all member variables
 
-		def __init__(self, parent, curl, asyncore_map):
+		def __init__(self, parent, curl, map):
 			self.parent = parent
-			self.asyncore_map = asyncore_map
+			self.asyncore_map = map
+			self.pending_channels = []
+			self.pending_done = []
+			self.waiting_ack = {}
 			self.coordinator = xmlrpclib.ServerProxy(curl)
 
-			self.lock = threading.RLock()
+			self.lock = RLock()
 
 			self.destinations = {}			# (host,port) -> ScatterChannel map
 			self.key_destinations = {}		# (stage,key) -> ScatterChannel map
+			self.stage_destinations = defaultdict(set)	# (stage) -> set(ScatterChannel) map
 
 			self.r_fd, self.w_fd = os.pipe()	# Set up this object to listed on the pipe from within the asyncore thread
-			super(Scatterer, self).__init__(r_fd, map)
+			asyncore.file_dispatcher.__init__(self, self.r_fd, map)
 
 		def __del__(self):
 			# Close the communication pipe
@@ -328,7 +413,7 @@ class Worker(object):
 				# add any pending channels to the asyncore loop
 				for sc in self.pending_channels:
 					sc.delayed_init(map=self.asyncore_map)
-				del sc.pending_channels[:]
+				del self.pending_channels[:]
 
 				# Find and close any Channels in stages that have finished
 				for stage in self.pending_done:
@@ -361,9 +446,9 @@ class Worker(object):
 			# Called from worker thread when an ack for an
 			# AckDone event is received (see end_stage)
 			with self.lock:
-				self.stage_destinations[stage] -= 1
-				nleft = self.stage_destinations[stage]
-				if nleft == 0:
+				self.waiting_ack[stage] -= 1
+				if self.waiting_ack[stage] == 0:
+					# Queue up for cleanup
 					self.pending_done.append(stage)
 					self.notify()
 
@@ -386,10 +471,13 @@ class Worker(object):
 			# the Worker signals the Coordinator that it has finished
 			# processing the stage 'stage'.
 			with self.lock:
-				self.ending_stages[stage] = len(self.stage_destinations[stage])
+				self.waiting_ack[stage] = len(self.stage_destinations[stage])
 
 				for sc in self.stage_destinations[stage]:
 					sc.queue(stage, AckDoneSentinel, (self.parent.url, stage))
+
+				# Wake up the asyncore thread
+				self.notify()
 
 		def queue(self, stage, kv):
 			# This gets called from the Worker's thread
@@ -400,19 +488,20 @@ class Worker(object):
 			#
 			# TODO: Rewrite this to avoid calling the Coordinator for every key
 			#
-			k, v = kv
+			key, v = kv
 			with self.lock:
 				if (stage, key) in self.key_destinations:
 					# Destination known
 					sc = self.key_destinations[(stage, key)]
 				else:
 					# Unknown (stage, key). Find where to send them
+					logger.debug("Getting destination from coordinator")
 					wurl = self.coordinator.get_destination_for(stage, key)
 					(host, port) = xmlrpclib.ServerProxy(wurl).get_gatherer_addr()
 
 					if (host, port) not in self.destinations:
 						# Open a new channel
-						sc = ScattererChannel(host, port)
+						sc = self.ScattererChannel(host, port, self.asyncore_map)
 						self.pending_channels.append(sc)
 						self.destinations[(host, port)] = sc
 					else:
@@ -422,10 +511,10 @@ class Worker(object):
 					self.key_destinations[(stage, key)] = sc
 					
 					# Store into a list of destinations for this stage
-					self.stage_destinations[stage].append(sc)
+					self.stage_destinations[stage].add(sc)
 
 				# Queue the data to the right channel
-				sc.queue(stage, k, v)
+				sc.queue(stage, key, v)
 
 				# Wake up the asyncore thread
 				self.notify()
@@ -453,7 +542,7 @@ class Worker(object):
 				self.parent = parent
 				self.buf = cStringIO.StringIO()
 
-				super(GathererChannel, self).__init__(sock, map=map)
+				asyncore.dispatcher_with_send.__init__(self, sock, map=map)
 
 			def handle_read(self):
 				# Receive as much as possible into self.buf, and attempt to
@@ -468,45 +557,38 @@ class Worker(object):
 					# TODO: Handle broken connections
 					assert self.buf.getvalue() == '', "Connection broke?"
 
-			def process_buffer():
+			def process_buffer(self):
 				# See if we've received enough data to process one or 
 				# more whole messages, and retire them to the parent's
 				# buffer if we have.
-				at = 0
 				buf = self.buf
 				size = buf.tell()	# Assumes buf's fileptr is at the end!
 
 				buf.seek(0)	# Rewind to start for processing
 				while size - buf.tell() >= 8:
 					# 1.) read and process the packet size
-					s = buf.read(8)
-					pkt_len = struct.unpack('<Q', buf.read(8))		# 1. payload length (int64)
+					pkt_len, = struct.unpack('<Q', buf.read(8))		# 1. payload length (int64)
 
 					# 2.) Give up if the entire packet hasn't been received yet
-					if pkt_len < size - buf.tell():
+					if pkt_len > size - buf.tell():
 						buf.seek(-8, 1)
 						break
 
 					# 3.) Load and store the packet if we received all of it
-					if not self.echo:
-						# Hand off the complete packet to the parent Gatherer
-						# for storage into the correct buffer OR handle
-						# the message right here if the key equals AckDoneSentinel
-						end = buf.tell() + pkt_len
-						stage = struct.unpack('<I', buf.read(8))	# 2. stage (uint32)
-						key = cPickle.load(buf)				# 3. key (pickled)
-						pkl_value = buf.read(end - buf.tell())		# 4. value (pickled)
+					# Hand off the complete packet to the parent Gatherer
+					# for storage into the correct buffer OR handle
+					# the message right here if the key equals AckDoneSentinel
+					end = buf.tell() + pkt_len
+					stage, = struct.unpack('<I', buf.read(4))	# 2. stage (uint32)
+					key = cPickle.load(buf)				# 3. key (pickled)
+					pkl_value = buf.read(end - buf.tell())		# 4. value (pickled)
 
-						# Handle control messages right here
-						if key == AckDoneSentinel:
-							(wurl, stage) = cPickle.loads(pkl_value)
-							xmlrpclib.ServerProxy(wurl).ack_done_producing(stage)
-						else:
-							self.parent.append(stage, key, pkl_value)
+					# Handle control messages right here
+					if key == AckDoneSentinel:
+						(wurl, stage) = cPickle.loads(pkl_value)
+						xmlrpclib.ServerProxy(wurl).ack_done_producing(stage)
 					else:
-						# Just echo back the received data
-						s = buf.read(pkt_len)
-						self.send(s)
+						self.parent.append(stage, key, pkl_value)
 
 				# Keep only the unread bits
 				s = buf.read()
@@ -522,14 +604,14 @@ class Worker(object):
 			next_key = None		# see iteritems() for discussion of this variable
 
 			new_key_evt = None	# Event that is set once new keys become available
-			new_value_evts = None	# dict: key -> threading.Event() which becomes set once new
+			new_value_evts = None	# dict: key -> Event() which becomes set once new
 						# values are available for the given key
 			all_recvd = False	# True if the stage _before_ the one this Buffer is buffering
 						# has ended (i.e., no more key/values are to be received).
 
-			def __init__(size):
-				self.lock = threading.RLock()
-				self.new_key_evts = threading.Event()
+			def __init__(self, size):
+				self.lock = RLock()
+				self.new_key_evt = Event("new_key_evt")
 
 				self.chains = {}
 				self.new_value_evts = {}
@@ -537,7 +619,7 @@ class Worker(object):
 				self.mm = _make_buffer_mmap(size)
 
 				# Ensure the first in a buffer chain is always the chain of keys
-				self.append(stage, KeyChainSentinel, cPickle.dumps((KeyChainSentinel, 0) -1))
+				self.append(KeyChainSentinel, cPickle.dumps((KeyChainSentinel, 0), -1))
 				self.next_key = self.chains[KeyChainSentinel][1]
 
 			def append(self, key, pkl_value):
@@ -561,20 +643,21 @@ class Worker(object):
 						self.chains[key] = (mm.tell(), 0)
 
 					# Add a link to the chain
+					logger.debug("key=%s, offset=%s" % (key, mm.tell()))
 					mm.write(struct.pack('<Q', len(pkl_value)))	# 1) Length of the data (uint64)
 					mm.write(pkl_value)				# 2) The data (pickled)
-					mm.write('\x0f'*8)				# 3) Offset to next item in chain (or 0xFFFFFFFF, if end-of-chain)
+					mm.write('\xff'*8)				# 3) Offset to next item in chain (or 0xFFFFFFFFFFFFFFFF, if end-of-chain)
 
 					# Update the 'last' field in the self.chains dict
-					self.chains[key][1] = mm.tell() - 8
+					self.chains[key] = self.chains[key][0], mm.tell() - 8
 
 					# If this is a new chain, link to it from the primary chain
-					# .. unlesss this is the initialization of the primary chain
+					# .. unless this is the initialization of the primary chain
 					if new_key and key is not KeyChainSentinel:
 						self.append(KeyChainSentinel, cPickle.dumps((key, self.chains[key][0]), -1))
 
 						# Notify listener (Buffer.itervalues instances) that new keys are available
-						c = self.new_key_evt.set()
+						self.new_key_evt.set()
 
 					if key in self.new_value_evts:
 						# Notify the active iterator that a new value was added
@@ -590,7 +673,7 @@ class Worker(object):
 				"""
 				at = first
 				while True:
-					len = struct.unpack('<Q', self.mm[at:at+8])
+					len, = struct.unpack('<Q', self.mm[at:at+8])
 
 					with self.lock:
 						at0 = self.mm.tell()
@@ -599,7 +682,7 @@ class Worker(object):
 							v = cPickle.load(self.mm)
 							at = self.mm.tell()
 						finally:
-							self.seek(at0)
+							self.mm.seek(at0)
 
 					yield v
 
@@ -609,7 +692,7 @@ class Worker(object):
 
 					with self.lock:
 						# Load the position of the next packet
-						offs = struct.unpack('<Q', mm[at:at+8])
+						offs, = struct.unpack('<Q', self.mm[at:at+8])
 						at += offs + 8
 
 			def itervalues(self, key, kevt, at):
@@ -617,106 +700,129 @@ class Worker(object):
 				A blocking generator yielding values associated with 'key' until
 				self.all_recvd is set.
 
-				If no values are curently available, the generator blocks until
-				new values become available (and is signaled via kevt).
+				The caller guarantees that initially there's at least one key available,
+				at offset 'at'. When no more values are available, the generator
+				blocks until new values become available (and is signaled via kevt).
 				"""
-				last0 = None
 				while True:
-					kevt.wait()	# Sleep until new keys are available
-					kevt.clear()
-
 					with self.lock:
 						_, last = self.chains[key]
-						if last0 == last:
-							# If we're at the end of the chain, it's either because
-							# no more data has been received (in which case we wait
-							# for more), or because this stage has been completed
-							# (in which case we return to the caller.)
-							if self.all_recvd:
-								del self.new_value_evts[key]	# Unregister our event
-								return
-							else:
-								continue
-
-						if last0 is not None:
-							at = struct.unpack('<Q', self.mm[last:last+8])
 
 					# yield the available values
 					for v in self.iter_chain(key, at, last):
 						yield v
 
-					last0 = last
+					while True:
+						with self.lock:
+							# See if more data showed up in the meantime.
+							offs, = struct.unpack('<Q', self.mm[last:last+8])
+							all_recvd = self.all_recvd
+							kevt.clear()
 
-			def iteritems(self, stage):
+						if offs == 0xFFFFFFFFFFFFFFFF:
+							# No data currently available
+							if all_recvd:
+								return
+							kevt.wait()
+						else:
+							# More data available
+							at = last + 8 + offs
+							break
+
+			def iteritems(self):
 				# Find keys not yet being processed, and yield
 				# generators that will yield values for those keys
+
+				# FIXME: TODO: take all_recvd into account
 				while True:
 					value_gen = None
 
 					with self.lock:
 						# self.next_key is a offset to the 'offset-to-next' field
 						# of the last processed item (==key) in the KeyChainSentinel key.
-						# If this field is zero, it means no new keys are available
-						# for processing, and the thread should sleep until new keys
-						# become available.
-						nextoffs = self.mm[self.next_key:self.next_key+8]
+						# The reason for this variable is that there may be multiple instances
+						# of iteritems() running in multiple _worker threads (i.e., if we're
+						# processing more than one key at a time). In that case, we want each
+						# instance to get unique keys back.
+						# TODO: A cleaner implementation would pack this into a separate
+						#       object, that would yield iteritems() iterators.
+						nextoffs, = struct.unpack('<Q', self.mm[self.next_key:self.next_key+8])
+						self.new_key_evt.clear()
 
-						if nextoffs != '\x0f'*8:
+						if nextoffs != 0xFFFFFFFFFFFFFFFF:
 							# Load the key
-							pos = self.next_key + nextoffs
+							pos = self.next_key + nextoffs + 8 + 8	# Skip the [len] field
 							at0 = self.mm.tell()
 							try:
-								self.mm.seek(pos+8)
+								self.mm.seek(pos)
 								(key, first) = cPickle.load(self.mm)
-								self.next_key = self.mm.tell()		# Advance next_key
+								self.next_key = self.mm.tell()		# Advance the next_key
 							finally:
 								self.mm.seek(at0)
 
 							# Mark this key as active, and create an Event for it
-							# that will get triggered every time there's new data
-							# available for the key
-							kevt = self.new_value_evts[key] = threading.Event()
+							# that will get triggered every time new data becomes
+							# available for the key.
+							kevt = self.new_value_evts[key] = Event("new_value_evt[%s]" % key)
 							kevt.set()
 
 							# Create the generator of values from this key chain
 							value_gen = self.itervalues(key, kevt, first)
+						else:
+							# Check if this stage was marked as done, exit if so
+							if self.all_recvd:
+								return
 
 					# Note: we're doing this outside the locked section
 					if value_gen is not None:
-						yield key, value_gen
+						try:
+							yield key, value_gen
+						finally:
+							# Remove the event
+							with self.lock:
+								del self.new_value_evts[key]
 					else:
 						# No keys to work on. Sleep waiting for a new one to be added.
-						c.wait()
-						c.clear()
+						self.new_key_evt.wait()
 
-			def stage_ended(self):
-				# Notification from the coordinator that a particular
-				# stage has ended
+			def all_received(self):
+				# Expect to receive no more data in this buffer (because
+				# the stage feeding it has ended)
 				with self.lock:
-					assert not all.recvd
+					assert not self.all_recvd
 					self.all_recvd = True
+
+					# Wake up all threads waiting for new data to let
+					# them know this is it
+					self.new_key_evt.set()
+					for evt in self.new_value_evts.itervalues():
+						evt.set()
 
 		parent = None		# Worker instance
 		asyncore_map = None	# asyncore map that Gatherer participates in
 
 		buffers = {}		# A dictionary of Buffer instances, keyed by stage
 		port = None		# The port we're listening on for incoming Scatterer connections
-		bufsize = 1*2**40	# Buffer size (per stage)
+		bufsize = BUFSIZE	# Buffer size (per stage)
+
+		lock = None		# RLock guarding the buffers variable
 
 		def __init__(self, parent, curl, map):
 			self.parent = parent
 			self.asyncore_map = map
 
+			self.lock = RLock()
 			self.buffers = {}
 
 			# Set up the async server: open a socket to listen on
 			# and store the port in self.port
-			super(Gatherer, self).__init__(map=map)
+			asyncore.dispatcher_with_send.__init__(self, map=map)
 			self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
 			for port in xrange(parent.port, 2**16):
 				try:
 					self.bind(("", port))
 					self.port = port
+					break
 				except socket.error:
 					pass
 
@@ -731,7 +837,8 @@ class Worker(object):
 				if stage in self.buffers:
 					buf = self.buffers[stage]
 				else:
-					buf = self.buffers[stage] = Buffer(self.bufsize)
+					logger.debug("Creating buffer for stage=%d" % stage)
+					buf = self.buffers[stage] = self.Buffer(self.bufsize)
 
 			return buf
 
@@ -747,16 +854,17 @@ class Worker(object):
 
 		def stage_ended(self, stage):
 			# Notification from the coordinator that a particular
-			# stage has ended
-			self.buffers[stage].stage_ended()
+			# stage has ended. That means that all buffers one stage
+			# later should expect no more data.
+			self.buffers[stage+1].all_received()
 
 		def handle_accept(self):
 			# Accept a new connection to this Gatherer (presumably
 			# by another Scatterer)
 			pair = self.accept()
 			if pair is not None:
-				sock, addr = pair
-				GathererChannel(self, sock, self.asyncore_map)
+				sock, _ = pair
+				self.GathererChannel(self, sock, self.asyncore_map)
 
 	server  = None		# XMLRPC server instance
 	hostname = None		# The hostname of this machine
@@ -779,7 +887,7 @@ class Worker(object):
 		self.url = 'http://%s:%s' % (self.hostname, self.port)
 
 		self.running_stage_threads = defaultdict(int)
-		self.lock      = threading.RLock()
+		self.lock      = RLock()
 
 	def get_gatherer_addr(self):
 		# Return the port on which our Gatherer listens
@@ -796,14 +904,22 @@ class Worker(object):
 		asyncore_map = {}
 		self.gatherer  = self.Gatherer(self, curl, map=asyncore_map)
 		self.scatterer = self.Scatterer(self, curl, map=asyncore_map)
-		threading.Thread(target=asyncore.loop, args=asyncore_map).start()
+		th = threading.Thread(name='Scatter/Gather', target=asyncore.loop, kwargs={'timeout': 3600, 'map': asyncore_map})
+		th.daemon = True
+		th.start()
 
 		# Initialize the task:
 		fp = cStringIO.StringIO(b64decode(data))
 		[ self.kernels, self.locals ] = cPickle.load(fp)
 
 		# Place the (pickled) items on the gatherer's queue
-		self.gatherer.append(0, None, fp.read())
+		if False:
+			self.gatherer.append(-1, 0, fp.read())
+		else:
+			items = cPickle.load(fp)
+			for item in items:
+				self.gatherer.append(-1, 0, cPickle.dumps(item))
+		self.stage_ended(-2)
 	
 	def ack_done_producing(self, stage):
 		# Called by a remote Gatherer to notify
@@ -821,15 +937,15 @@ class Worker(object):
 			for bytes in self.server.valiter:
 				self.wfile.write(bytes)
 
-	def _serve_results(kv):
+	def _serve_results(self, kv):
 		"""
 		Open a HTTP port and serve the results back to the client.
 		"""
 		_, v = kv
-		httpd, port = start_server(BaseHTTPServer.HTTPServer, ResultHTTPRequestHandler, self.hostname, self.port)
+		httpd, port = start_server(BaseHTTPServer.HTTPServer, self.ResultHTTPRequestHandler, self.hostname, self.port)
 
 		with self.lock:
-			coordinator.notify_client_of_result("http://%s:%s" % (self.hostname, port))
+			self.coordinator.notify_client_of_result("http://%s:%s" % (self.hostname, port))
 
 		httpd.valiter = v	# The iterator returning the values
 		httpd.handle_request()
@@ -838,11 +954,13 @@ class Worker(object):
 		# Executes the kernel for a given stage in
 		# a separate thread (called from run_stage)
 		with self.lock:
+			logger.info("Worker thread for stage %s active on %s" % (stage, self.url))
 			# stage = -1 and stage = len(kernels) are special (feeder and collector kernels)
 			if stage == -1:
 				def K_start(kv):
 					_, v = kv
-					for k, item in enumerate(v):
+					items = list(v)
+					for k, item in enumerate(items):
 						yield k, item
 				K_fun, K_args = K_start, ()
 			elif stage == len(self.kernels):
@@ -854,7 +972,7 @@ class Worker(object):
 					# stage = 0 kernel has a thin wrapper removing
 					# the keys before passing the values to the mapper
 					def K(kv, args, K_fun, K_args):
-						k, v = kv
+						_, v = kv
 						return K_fun(v, *K_args)
 					K_fun, K_args = K, (args, K_fun, K_args)
 
@@ -875,18 +993,23 @@ class Worker(object):
 				# If this is the last thread left running this stage,
 				# let the Scatterer know we're done producing for stage+1
 				self.scatterer.done_producing(stage+1)
-				
-				# Delete the entry for this stage		
+
+				# Delete the entry for this stage
 				del self.running_stage_threads[stage]
 
 	def run_stage(self, stage):
 		# Start running a stage, in a separate thread
 		# WARNING: This routine must not call back into the
 		#          Coordinator (will deadlock)
+		logger.debug("Starting stage %s on %s" % (stage, self.url))
+		if stage != -1:
+			return
 		with self.lock:
-			assert 0 <= stage <= len(self.kernels)
+			assert -1 <= stage <= len(self.kernels)
 			self.running_stage_threads[stage] += 1
-			wthread = threading.Thread(target=self._worker, args=(stage,))
+			th = threading.Thread(name='Stage %d' % stage, target=self._worker, args=(stage,))
+			th.daemon = True
+			th.start()
 			
 	def stage_ended(self, stage):
 		# Notification from the coordinator that a particular
@@ -906,7 +1029,7 @@ class Peer:
 				Thin layer over the run_stage RPC that records
 				the run in running_stage_threads
 				"""
-				self.running_stage_threads[worker] += 1
+				self.running_stage_threads[stage] += 1
 				return self.__getattr__('run_stage')(stage)
 
 			def __init__(self, url, purl, process=None):
@@ -924,6 +1047,7 @@ class Peer:
 		hostname= None  # Our host name
 		port    = None  # TCP port
 		url     = None  # XMLRPC URL of our server
+		purl	= None	# Parent peer URL
 
 		spec    = None	# TaskSpec instance describing the task
 		data    = None  # Serialized task data, for the workers
@@ -940,16 +1064,17 @@ class Peer:
 		lock    = None	# Lock protecting instance variables
 
 		def __init__(self, server, hostname, parent_url, id, spec, data):
-			self.lock    = threading.RLock()
+			self.lock    = RLock()
 
 			self.pserver = xmlrpclib.ServerProxy(parent_url)
+			self.purl    = parent_url
 			self.server  = server
 
 			self.hostname, self.port = hostname, server.server_address[1]
 			self.url = 'http://%s:%s' % (self.hostname, self.port)
 
 			self.id      = id
-			self.spec    = spec
+			self.spec    = TaskSpec.unserialize(spec)
 			self.data    = data
 			self.queue   = Queue.Queue()
 			self.workers = {}
@@ -977,11 +1102,14 @@ class Peer:
 			Returns an instance of Worker
 			"""
 			logger.debug("Conneecting to remote peer %s" % (purl,))
-			peer = xmlrpclib.ServerProxy(purl) if isinstance(purl, str) else purl
+			if purl == self.purl:
+				peer = self.pserver
+			else:
+				peer = xmlrpclib.ServerProxy(purl)
 
 			# Launch the worker
 			logger.debug("Launch worker for task %s" % (self.id,))
-			wurl = peer.start_worker(self.id, self.spec)
+			wurl = peer.start_worker(self.id, self.spec.serialize())
 			logger.debug("Connecting to worker %s" % (wurl,))
 			worker = self.WorkerProxy(wurl, purl)
 			logger.debug("Connected to %s" % (wurl,))
@@ -992,7 +1120,7 @@ class Peer:
 
 			# Initialize the task on the Worker
 			logger.debug("Calling worker.initialize on %s" % (wurl,))
-			worker.initialize(self.url, data)
+			worker.initialize(self.url, self.data)
 
 			self._progress("WORKER_START", (purl, wurl))
 
@@ -1004,7 +1132,7 @@ class Peer:
 			self._progress("START", None)
 
 			with self.lock:
-				self._start_remote_worker(self.pserver).run_stage(-1)
+				self._start_remote_worker(self.purl).run_stage(-1)
 
 		def stage_thread_ended(self, wurl, stage):
 			# Called by a Worker when one of its threads
@@ -1021,7 +1149,7 @@ class Peer:
 		def stage_ended(self, wurl, stage):
 			# Called by a Worker when all of its threads
 			# executing the stage have finished, and when it has
-			# gotten the acknowledgements from upstream Workers that
+			# gotten the acknowledgments from upstream Workers that
 			# they've received all the stage+1 data it sent them.
 			worker = self.workers[wurl]
 			assert stage not in worker.running_stage_threads	# Should've been deleted in stage_thread_ended()
@@ -1039,7 +1167,10 @@ class Peer:
 				self._progress("STAGE_ENDED", (wurl, stage))
 
 				# Check if this means the whole task has ended
-				if stage == self.spec.nkernels:	# Note: this is not a mistake -- there is one more stage than the number of kernels
+				# Note: this is not a mistake -- there is one more stage than 
+				# the number of kernels - the last stage funnels the data back
+				# to the user
+				if stage == self.spec.nkernels:
 					self._progress("DONE", None)
 					self.shutdown()
 				else:
@@ -1050,7 +1181,12 @@ class Peer:
 							worker.stage_ended(stage)
 
 					# Remove this stage from the destinations map
-					del self.destinations[stage]
+					try:
+						del self.destinations[stage]
+					except KeyError:
+						# Note: having no self.destinations[stage] is legal; means
+						# there were no results generated by the previous stage
+						pass
 
 		def notify_client_of_result(self, rurl):
 			# Called by the last kernel, to notify the client
@@ -1060,7 +1196,7 @@ class Peer:
 		def shutdown(self):
 			# Called to shut down everything.
 			with self.lock:
-				assert len(destinations) == 0
+				assert len(self.destinations) == 0
 				for worker in self.workers.itervalues():
 					assert len(worker.running_stage_threads) == 0
 
@@ -1078,8 +1214,9 @@ class Peer:
 
 				# Refresh the list of unused peers every 60 sec or so...
 				if self.free_peers_last_refresh + 60 < time.time():
-					self.free_peers = list(pserver.list_peers() - set(w.purl for w in self.workers))
+					self.free_peers = list(set(self.pserver.list_peers()) - set(w.purl for w in self.workers.itervalues()))
 					self.free_peers_last_refresh = time.time()
+					logger.debug("Refreshed the list of free peers (%d free)" % len(self.free_peers))
 
 				if len(self.free_peers):
 					# Choose a Peer we're not yet running on
@@ -1088,7 +1225,7 @@ class Peer:
 					self.free_peers.remove(purl)
 				else:
 					# Randomly choose an existing worker
-					worker = random.choice(self.workers.items())
+					worker = random.choice(self.workers.values())
 
 				# Start the stage if not already running
 				if stage not in worker.running_stage_threads:
@@ -1120,7 +1257,7 @@ class Peer:
 		self.workers = {}
 
 		# Global Peer Lock
-		self.lock = threading.RLock()
+		self.lock = RLock()
 
 		# Time when we launched
 		self.t_started = datetime.datetime.now()
@@ -1194,17 +1331,16 @@ class Peer:
 			task_id = "%s.%s" % (self.peer_id, self.coordinator_ctr)
 			self.coordinator_ctr += 1
 
-			server, port = start_threaded_xmlrpc_server(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler, 1023, self.hostname)
+			server, _ = start_threaded_xmlrpc_server(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler, 1023, self.hostname)
 			coordinator = self.coordinators[task_id] = self._Coordinator(server, self.hostname, self.url, task_id, spec, data)
 			server.register_instance(coordinator)
 			server.register_introspection_functions()
-			t = threading.Thread(target=server.serve_forever)
-			t.daemon = True
-			t.start()
+			th = threading.Thread(name='Coordinator %d' % (self.coordinator_ctr-1,), target=server.serve_forever)
+			th.daemon = True
+			th.start()
 
 		# Start the task in the spawned coordinator thread
-		cproxy = xmlrpclib.ServerProxy(coordinator.url)
-		cproxy.start()
+		xmlrpclib.ServerProxy(coordinator.url).start()
 
 		# Begin listening for notifications of events, yield them back to the user
 		for msg in iter(coordinator.queue.get, ("DONE", None)):
@@ -1221,7 +1357,7 @@ class Peer:
 		Return the set of all active Peers
 		"""
 		# Read the first line of each *.peer file in the Directory
-		return set( file(fn).readline().strip() for fn in glob.iglob(self.directory + '/*.peer') )
+		return list( file(fn).readline().strip() for fn in glob.iglob(self.directory + '/*.peer') )
 
 	def start_worker(self, task_id, spec):
 		"""
@@ -1248,7 +1384,7 @@ class Peer:
 					'--worker=%s' % self.hostname,
 					spec.fn
 					] + spec.argv,
-				stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE,
+				stdin=sp.PIPE, stdout=sp.PIPE, stderr=None,
 				cwd=spec.cwd,
 				env=spec.env)
 
@@ -1261,6 +1397,18 @@ class Peer:
 
 			return wurl
 
+	def _cleanup(self):
+		with self.lock:
+			for worker in self.workers.itervalues():
+				if worker.process is not None:
+					logger.info("Terminating process %d" % worker.process.pid)
+					worker.process.terminate()
+					worker.process.communicate()
+
+	def shutdown(self):
+		self.server.shutdown()
+		return 0
+
 	############################
 	# Mock functions
 
@@ -1269,7 +1417,7 @@ class Peer:
 
 	def add(self, x, y) :
 		return x + y
- 
+
 	def div(self, x, y):
 		return float(x) / float(y)
 
@@ -1281,14 +1429,11 @@ class Peer:
 		a = s.mul(x,y)
 		return s.add(a, z)
 
-	def shutdown(self):
-		self.server.shutdown()
-		return 0
-
 class PeerRequestHandler(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler):
 	# Override do_POST() to permit stateful connections
 	# for task submission and progress reporting
 	def do_POST(self):
+		logger.debug("New POST request")
 		if self.path != '/execute':
 			return SimpleXMLRPCServer.SimpleXMLRPCRequestHandler.do_POST(self)
 
@@ -1339,7 +1484,6 @@ class PeerRequestHandler(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler):
 
 	def _parse_request(self):
 		ctype, pdict = cgi.parse_header(self.headers['content-type'])
-		length = int(self.headers['content-length'])
 		if ctype == 'multipart/form-data':
 			return cgi.parse_multipart(self.rfile, pdict)
 		elif ctype == 'application/x-www-form-urlencoded':
@@ -1375,7 +1519,7 @@ if __name__ == '__main__':
 	## Setup logging ##
 	format = '%(asctime)s.%(msecs)03d %(name)s[%(process)d] %(levelname)-8s {%(module)s:%(funcName)s}: %(message)s'
 	datefmt = '%a, %d %b %Y %H:%M:%S'
-	level = logging.DEBUG if (os.getenv("DEBUG", 0) or os.getenv("LOGLEVEL", "info") == "debug") else logging.INFO
+	level = logging.DEBUG if (os.getenv("DEBUG", 0) == "1" or os.getenv("LOGLEVEL", "info") == "debug") else logging.INFO
 	#filename = 'peer.log' if os.getenv("LOG", None) is None else os.getenv("LOG")
 	#logging.basicConfig(filename=filename, format=format, datefmt=datefmt, level=level)
 	logging.basicConfig(format=format, datefmt=datefmt, level=level)
@@ -1399,6 +1543,8 @@ if __name__ == '__main__':
 			hostname = a
 
 	if start_worker:
+		#import pydevd; pydevd.settrace(suspend=False, trace_only_current_thread=False)
+		
 		user_fn = args[0]
 		argv = args[0:]
 
@@ -1449,9 +1595,18 @@ if __name__ == '__main__':
 		try:
 			# Register the Peer in the Peer directory
 			peer._register()
+			threading.current_thread().name = "Peer XMLRPC Server"
 			server.serve_forever()
+		except KeyboardInterrupt:
+			pass;
 		finally:
 			peer._unregister()
+			peer._cleanup()
+
+		logging.debug("Remaining threads:")
+		for th in threading.enumerate():
+			logging.debug(th)
+
 else:
 	mrp2p_init()
 	logger.debug("fn=%s, cwd=%s, argv=%s, len(env)=%s" % (fn, cwd, argv, len(env)))

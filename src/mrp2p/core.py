@@ -149,7 +149,9 @@ import SocketServer
 from SimpleXMLRPCServer import SimpleXMLRPCServer, SimpleXMLRPCRequestHandler
 
 class ThreadedXMLRPCServer(SocketServer.ThreadingMixIn, SimpleXMLRPCServer):
-	pass
+	def __init__(self, *args, **kwargs):
+		self.daemon_threads = True
+		SimpleXMLRPCServer.__init__(self, *args, **kwargs)
 
 class TestObject:
 	def pow(self, x, y):
