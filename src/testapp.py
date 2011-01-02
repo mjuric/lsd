@@ -12,7 +12,7 @@ def mapper(values):
 	for v in values:
 		my = MyClass()
 		my.ct = 1
-		yield v % 512, (my, np.arange(1024))
+		yield v % 512, (my, 0)
 
 def reducer1(kv):
 	k, v = kv

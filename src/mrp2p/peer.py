@@ -473,13 +473,15 @@ class Worker(object):
 
 					self.serving_stages.add(stage)			# Remember we've sent out a key for this stage
 
+		### Scatterer ##################3
 		parent = None		# Parent Worker instance
 		asyncore_map = None	# asyncore map that this Scatterer participates in
 		coordinator = None	# XMLRPC proxy to the Coordinator
 
 		destinations = None	# Map of (host, port) -> ScatterChannel
-		key_destinations = None	# Map of (stage, key) -> ScatterChannel
+		key_destinations = None	# Map of (stage, keyhash) -> ScatterChannel
 		stage_destinations=None # Map of (stage) -> set(ScatterChannel)
+		known_destinations=None # Map of (stage) -> dict(keyhash: wurl)
 
 		pending_channels = None # A list of channels that need to be added to the asyncore map
 		pending_done = None		# A list of stages that have finished (and for which we can release Channels)
@@ -524,8 +526,9 @@ class Worker(object):
 
 			self.lock = RLock()
 
-			self.destinations = {}			# (host,port) -> ScatterChannel map
-			self.key_destinations = {}		# (stage,key) -> ScatterChannel map
+			self.destinations = {}			# (host, port) -> ScatterChannel map
+			self.key_destinations = {}		# (stage, keyhash) -> ScatterChannel map
+			self.known_destinations = defaultdict(dict)	# (stage) -> {(keyhash) -> (wurl)}
 			self.stage_destinations = defaultdict(set)	# (stage) -> set(ScatterChannel) map
 
 			self.r_fd, self.w_fd = os.pipe()	# Set up this object to listed on the pipe from within the asyncore thread
@@ -544,8 +547,8 @@ class Worker(object):
 				keys = [ k for k, v in self.destinations.iteritems() if v in scs ]
 				for k in keys: del self.destinations[k]
 				
-				keys = [ k for k, v in self.key_destinations.iteritems() if v in scs ]
-				for k in keys: del self.key_destinations[k]
+				keyhashes = [ kh for kh, v in self.key_destinations.iteritems() if v in scs ]
+				for kh in keyhashes: del self.key_destinations[kh]
 
 				# Remove the scs from stage_destinations, and remove any
 				# stage_destinations that are left empty because of it
@@ -660,17 +663,19 @@ class Worker(object):
 			# 2. Open a channel to that destination, if it doesn't yet exist (and write on self.w_fd)
 			# 3. Queue up the value on that channel
 			#
-			# TODO: Rewrite this to avoid calling the Coordinator for every key
-			#
 			key, v = kv
+			keyhash = self.parent._hash_key(stage, key)
 			with self.lock:
-				if (stage, key) in self.key_destinations:
+				if (stage, keyhash) in self.key_destinations:
 					# Destination known
-					sc = self.key_destinations[(stage, key)]
+					sc = self.key_destinations[(stage, keyhash)]
 				else:
 					# Unknown (stage, key). Find where to send them
 					#logger.debug("Getting destination from coordinator")
-					wurl = self.coordinator.get_destination_for(stage, cPickle.dumps(key))
+					if keyhash not in self.known_destinations[stage]:
+						self.known_destinations[stage].update(self.coordinator.get_destinations(stage, keyhash))
+
+					wurl = self.known_destinations[stage][keyhash]
 					(host, port) = xmlrpclib.ServerProxy(wurl).get_gatherer_addr()
 
 					if (host, port) not in self.destinations:
@@ -682,7 +687,7 @@ class Worker(object):
 						sc = self.destinations[(host, port)]
 
 					# Remember for later
-					self.key_destinations[(stage, key)] = sc
+					self.key_destinations[(stage, keyhash)] = sc
 					
 					# Store into a list of destinations for this stage
 					self.stage_destinations[stage].add(sc)
@@ -1101,6 +1106,7 @@ class Worker(object):
 	asyncore_thread = None	# AsyncoreThread instance running asyncore.loop with the gatherer and scatterer
 
 	running_stage_threads = None	# defaultdict(int): stage -> number of worker threads processing the keys from stage
+	maxpeers = None		# dict: stage -> maximum number of peers, used to produce keyhashes
 	
 	t_started = None	# Time when we launched
 
@@ -1158,6 +1164,7 @@ class Worker(object):
 		self.url = 'http://%s:%s' % (self.hostname, self.port)
 
 		self.running_stage_threads = defaultdict(int)
+		self.maxpeers = dict()
 		self.lock      = RLock()
 
 		# Time when we launched
@@ -1234,6 +1241,12 @@ class Worker(object):
 		httpd.handle_request()
 		logger.info("Results served")
 
+	def _hash_key(self, stage, key):
+		# Return a hash for the key. The Coordinator will
+		# be queried for the destination based on this hash.
+		keyhash = key.__hash__() % self.maxpeers[stage]
+		return keyhash
+
 	def _worker(self, stage):
 		# Executes the kernel for a given stage in
 		# a separate thread (called from run_stage)
@@ -1295,14 +1308,16 @@ class Worker(object):
 			# let the Scatterer know we're done producing for stage+1
 			self.scatterer.done_producing(stage+1)
 
-	def run_stage(self, stage):#, nthreads=1, npeers=100):
+	def run_stage(self, stage, maxpeers):#, nthreads=1, npeers=100):
 		# Start running a stage, in a separate thread
 		# WARNING: This routine must not call back into the
 		#          Coordinator (will deadlock)
-		logger.debug("Starting stage %s on %s" % (stage, self.url))
+		logger.debug("Starting stage %s on %s (maxpeers=%s)" % (stage, self.url, maxpeers))
 		with self.lock:
 			assert -1 <= stage <= len(self.kernels)
 			self.running_stage_threads[stage] += 1
+			if self.running_stage_threads[stage] == 1:
+				self.maxpeers[stage+1] = maxpeers
 			th = threading.Thread(name='Stage-%02d' % stage, target=self._worker, args=(stage,))
 			th.daemon = True
 			th.start()
@@ -1339,13 +1354,13 @@ class Peer:
 			running_stage_threads = None	# defaultdict(int): the number of threads running each stage on the Worker
 			process               = None	# subprocess.Popen class for local workers, None for remote workers
 
-			def run_stage(self, stage):
+			def run_stage(self, stage, *args, **kwargs):
 				"""
 				Thin layer over the run_stage RPC that records
 				the run in running_stage_threads
 				"""
 				self.running_stage_threads[stage] += 1
-				return self.__getattr__('run_stage')(stage)
+				return self.__getattr__('run_stage')(stage, *args, **kwargs)
 
 			def __init__(self, url, purl, process=None):
 				xmlrpclib.ServerProxy.__init__(self, url)
@@ -1372,7 +1387,9 @@ class Peer:
 		pserver = None  # XMLRPC Proxy to the parent Peer that launched us
 
 		destinations = None	# destinations[stage][key] gives the WorkerProxy that receives (stage, key) data
+		maxpeers = None # dict:stage -> maxpeers
 
+		all_peers = None		# The set of all peers
 		free_peers = None		# The set of currently unused peers
 		free_peers_last_refresh = 0	# The last time when free_peers was refreshed from the Directory
 
@@ -1429,7 +1446,8 @@ class Peer:
 			self.data    = data
 			self.queue   = Queue.Queue()
 			self.workers = {}
-			self.destinations = {}
+			self.destinations = defaultdict(dict)
+			self.maxpeers = dict()
 
 			# Time when we launched
 			self.t_started = datetime.datetime.now()
@@ -1488,14 +1506,6 @@ class Peer:
 					'n_workers': len(self.workers)
 				}
 
-		def start(self):
-			# Called by the Peer that launched us to start the 
-			# first Worker and stage.
-			self._progress("START", None)
-
-			with self.lock:
-				self._start_remote_worker(self.purl).run_stage(-1)
-
 		def stage_thread_ended(self, wurl, stage):
 			# Called by a Worker when one of its threads
 			# executing the stage finishes.
@@ -1541,6 +1551,7 @@ class Peer:
 					# Remove this stage from the destinations map
 					try:
 						del self.destinations[stage]
+						del self.maxpeers[stage]
 					except KeyError:
 						# Note: having no self.destinations[stage] is legal; means
 						# there were no results generated by the previous stage
@@ -1572,41 +1583,75 @@ class Peer:
 			logger.debug("Shutting down server")
 			self.server.shutdown()
 
-		def get_destination_for(self, stage, key):
+		def _refresh_peers(self):
 			"""
-			Get URL of a Gatherer to which to send (stage, key)-keyed items
+			Refresh the lists of all and unused peers
 			"""
-			#logger.debug("Get destination for stage=%s key=%s" % (stage, key))
+			if time.time() < self.free_peers_last_refresh + 60:
+				return
+
+			self.all_peers = set(self.pserver.list_peers())
+			self.free_peers = list(self.all_peers - set(w.purl for w in self.workers.itervalues()))
+			self.free_peers_last_refresh = time.time()
+
+			logger.debug("Refreshed the list of peers (%d all, %d unused)" % (len(self.all_peers), len(self.free_peers)))
+
+		def _maxpeers(self, stage):
+			"""
+			Return the maximum number of Peers that will execute a stage
+			
+			This is taken to be equal to the number of peers that are
+			running at the time of first call for a given stage. If stage
+			is equal to spec.nkernels, 1 is returned (as all results
+			have to be funneled to a single Worker, for the delivery to
+			the user)
+			"""
 			with self.lock:
-				if stage not in self.destinations:
-					self.destinations[stage] = {}
-				if key in self.destinations[stage]:
-					return self.destinations[stage][key].url
+				if stage not in self.maxpeers:
+					if stage == self.spec.nkernels:
+						return 1
+					else:
+						self._refresh_peers()
+						self.maxpeers[stage] = len(self.all_peers)
 
-				# Refresh the list of unused peers every 60 sec or so...
-				if self.free_peers_last_refresh + 60 < time.time():
-					self.free_peers = list(set(self.pserver.list_peers()) - set(w.purl for w in self.workers.itervalues()))
-					self.free_peers_last_refresh = time.time()
-					logger.debug("Refreshed the list of free peers (%d free)" % len(self.free_peers))
+				return self.maxpeers[stage]			
 
-				if len(self.free_peers):
-					# Choose a Peer we're not yet running on
-					purl = random.choice(self.free_peers)
-					worker = self._start_remote_worker(purl)
-					self.free_peers.remove(purl)
-				else:
-					# Randomly choose an existing worker
-					worker = random.choice(self.workers.values())
+		def start(self):
+			# Called by the Peer that launched us to start the 
+			# first Worker and stage.
+			self._progress("START", None)
 
-				# Start the stage if not already running
-				if stage not in worker.running_stage_threads:
-					worker.run_stage(stage)
+			with self.lock:
+				self._start_remote_worker(self.purl).run_stage(-1, self._maxpeers(0))
 
-				# Remember the destination for this key
-				self.destinations[stage][key] = worker
+		def get_destinations(self, stage, key):
+			"""
+			Get all known key->wurl pairs for the stage 'stage', ensuring
+			that key is among them (by creating a new worker, if needed)
+			"""
+			logger.debug("Get destination for stage=%s key=%s" % (stage, key))
+			with self.lock:
+				if key not in self.destinations[stage]:
+					# Refresh the list of unused peers every 60 sec or so...
+					self._refresh_peers()
+	
+					if len(self.free_peers):
+						# Prefer a Peer we're not yet running on
+						purl = random.choice(self.free_peers)
+						worker = self._start_remote_worker(purl)
+						self.free_peers.remove(purl)
+					else:
+						# Randomly choose an existing worker
+						worker = random.choice(self.workers.values())
 
-				# Return the URL
-				return worker.url
+					# Start the stage if not already running
+					if stage not in worker.running_stage_threads:
+						worker.run_stage(stage, self._maxpeers(stage))
+
+					# Remember the destination for this key
+					self.destinations[stage][key] = worker
+
+				return [ (key, worker.url) for key, worker in self.destinations[stage].iteritems() ]
 
 	## Peer #####################
 	def __init__(self, server, port):
