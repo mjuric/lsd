@@ -657,7 +657,7 @@ class Worker(object):
 				else:
 					# Unknown (stage, key). Find where to send them
 					#logger.debug("Getting destination from coordinator")
-					wurl = self.coordinator.get_destination_for(stage, key)
+					wurl = self.coordinator.get_destination_for(stage, cPickle.dumps(key))
 					(host, port) = xmlrpclib.ServerProxy(wurl).get_gatherer_addr()
 
 					if (host, port) not in self.destinations:
