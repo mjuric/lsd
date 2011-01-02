@@ -418,6 +418,16 @@ class Worker(object):
 					with self.lock:
 						self.mm_end = self.mm.tell()
 
+						# See if we can opportunistically compactify
+						# the output buffer
+						if self.mm_at != 0 and self.mm_at == self.mm_end:
+							if self.mm_end > self.ctresh:
+								# Discard dirty pages
+								self.mm.resize(max(count, 1))
+								self.mm.resize(self.bufsize)
+							self.mm.seek(0)
+							self.mm_at = self.mm_end = 0
+
 				#logger.debug("ScatCh.writable: mm_at=%s mm_end=%s" % (self.mm_at, self.mm_end))
 				return self.mm_at < self.mm_end
 
@@ -430,6 +440,7 @@ class Worker(object):
 				# Compactify every time we send >= 50MB
 				if self.mm_at > self.ctresh:
 					with self.lock:
+						logger.debug("Compactifying scatterer buffer")
 						count = self.mm.tell() - self.mm_at
 						self.mm.move(0, self.mm_at, count)
 						self.mm.seek(count)
@@ -438,8 +449,9 @@ class Worker(object):
 						self.mm_end = count
 
 						# Resize to flush the dirty pages
-						self.resize(count)
-						self.resize(self.bufsize)
+						self.mm.resize(max(count, 1))
+						self.mm.resize(self.bufsize)
+						logger.debug("Compactification completed")
 
 			def queue(self, stage, k, v):
 				# Runs from within a worker thread
@@ -1037,7 +1049,19 @@ class Worker(object):
 			return buf
 
 		def iteritems(self, stage):
+			"""
+			Return an iterator returning (key, valueiter) pairs
+			for each key in stage 'stage'. See the documentation of
+			Buffer.iteritems() for more info.
+			"""
 			return self.get_or_create_buffer(stage).iteritems()
+
+		def worker_done_with_stage(self, stage):
+			# Called by the worker thread to signal it's done
+			# processing the data in this stage, and that it can
+			# be safely discarded.
+			logger.debug("Discarding buffer for stage=%s" % (stage,))
+			del self.buffers[stage]
 
 		def append(self, stage, key, pkl_value):
 			"""
@@ -1161,7 +1185,7 @@ class Worker(object):
 		[ self.kernels, self.locals ] = cPickle.load(fp)
 
 		# Place the (pickled) items on the gatherer's queue
-		if False:
+		if True:
 			self.gatherer.append(-1, 0, fp.read())
 		else:
 			items = cPickle.load(fp)
@@ -1219,7 +1243,7 @@ class Worker(object):
 				def K_start(kv):
 					_, v = kv
 					items = list(v)
-					for k, item in enumerate(items):
+					for k, item in enumerate(items[0]):
 						yield k, item
 				K_fun, K_args = K_start, ()
 			elif stage == len(self.kernels):
@@ -1249,6 +1273,9 @@ class Worker(object):
 			for kv in K_fun((key, valgen), *K_args):
 				self.scatterer.queue(stage+1, kv)
 
+		# Let the Gatherer know it can discard data for the processed stage
+		self.gatherer.worker_done_with_stage(stage)
+
 		with self.lock:
 			# Unregister ourselves from the list of active workers
 			self.running_stage_threads[stage] -= 1
@@ -1266,7 +1293,7 @@ class Worker(object):
 			# let the Scatterer know we're done producing for stage+1
 			self.scatterer.done_producing(stage+1)
 
-	def run_stage(self, stage):
+	def run_stage(self, stage):#, nthreads=1, npeers=100):
 		# Start running a stage, in a separate thread
 		# WARNING: This routine must not call back into the
 		#          Coordinator (will deadlock)
@@ -1294,8 +1321,11 @@ class Worker(object):
 			#logger.info("Caling asyncore_thread.close_all")
 			self.asyncore_thread.close_all()
 			#logger.info("Waiting for asyncore thread to join")
-			self.asyncore_thread.join()
-			#logger.info("Shut down the asyncore thread")
+			self.asyncore_thread.join(10)
+			if self.asyncore_thread.is_alive():
+				logger.error("Asyncore thread still alive. asyncore_thread.map=%s" % (self.asyncore_thread.map))
+			else:
+				logger.info("Shut down the asyncore thread")
 
 		self.server.shutdown()
 
@@ -1439,7 +1469,7 @@ class Peer:
 				self.workers[wurl] = worker
 
 			# Initialize the task on the Worker
-			logger.debug("Calling worker.initialize on %s" % (wurl,))
+			#logger.debug("Calling worker.initialize on %s" % (wurl,))
 			worker.initialize(self.url, self.data)
 
 			self._progress("WORKER_START", (purl, wurl))

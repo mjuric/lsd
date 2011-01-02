@@ -6,7 +6,7 @@ import mrp2p.peer
 
 def mapper(values):
 	for v in values:
-		yield v % 16, 1
+		yield v % 512, 1
 
 def reducer1(kv):
 	k, v = kv
@@ -18,7 +18,7 @@ def reducer(kv):
 	yield k, sum(v)
 
 if __name__ == "__main__":
-	v = np.arange(2**10)
+	v = np.arange(4*2**10)
 
 	# Parallel
 	pool = mrp2p.peer.Pool('peers')
