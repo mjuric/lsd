@@ -4,14 +4,20 @@ import numpy as np
 import sys
 import mrp2p.peer
 
+class MyClass(object):
+	nada = "aaa"
+	pass
+
 def mapper(values):
 	for v in values:
-		yield v % 512, 1
+		my = MyClass()
+		my.ct = 1
+		yield v % 512, (my, np.arange(1024))
 
 def reducer1(kv):
 	k, v = kv
 	key = 'even' if k % 2 == 0 else 'odd'
-	yield key, sum(v)
+	yield key, sum(my.ct for my, _ in v)
 
 def reducer(kv):
 	k, v = kv

@@ -423,7 +423,7 @@ class Worker(object):
 						if self.mm_at != 0 and self.mm_at == self.mm_end:
 							if self.mm_end > self.ctresh:
 								# Discard dirty pages
-								self.mm.resize(max(count, 1))
+								self.mm.resize(1)
 								self.mm.resize(self.bufsize)
 							self.mm.seek(0)
 							self.mm_at = self.mm_end = 0
@@ -433,9 +433,10 @@ class Worker(object):
 
 			def handle_write(self):
 				# Write as much as we can to the destination.
+				#sent = self.send(self.mm[self.mm_at:min(self.mm_at+512, self.mm_end)])
 				sent = self.send(self.mm[self.mm_at:self.mm_end])
+				#logger.debug("Wrote out at=%s size=%s sent=%s" % (self.mm_at, self.mm_end-self.mm_at, sent))
 				self.mm_at += sent
-				#logger.debug("ScattererChannel.handle_write wrote out at=%s sent=%s" % (self.mm_at, sent))
 
 				# Compactify every time we send >= 50MB
 				if self.mm_at > self.ctresh:
@@ -721,6 +722,7 @@ class Worker(object):
 				# Receive as much as possible into self.buf, and attempt to
 				# process it if the message is complete.
 				data = self.recv(1*1024*1024)
+#				data = self.recv(4096)
 				if len(data):
 					self.buf.write(data)
 					self.process_buffer()
@@ -1574,6 +1576,7 @@ class Peer:
 			"""
 			Get URL of a Gatherer to which to send (stage, key)-keyed items
 			"""
+			#logger.debug("Get destination for stage=%s key=%s" % (stage, key))
 			with self.lock:
 				if stage not in self.destinations:
 					self.destinations[stage] = {}
@@ -1987,8 +1990,13 @@ if __name__ == '__main__':
 		print worker.url
 		sys.stdout.flush()
 
-		# Start the XMLRPC server
-		server.serve_forever()
+		if os.getenv("PROFILE", 0):
+			import cProfile
+			outfn = os.getenv("PROFILE_LOG", "profile.log") + '.' + str(os.getpid())
+			cProfile.runctx("server.serve_forever()", globals(), locals(), outfn)
+		else:
+			# Start the XMLRPC server
+			server.serve_forever()
 
 		logger.debug("Worker exiting.")
 	else:
