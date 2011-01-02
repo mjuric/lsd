@@ -23,6 +23,7 @@ import struct
 import platform
 from base64 import b64encode, b64decode
 from collections import defaultdict
+import traceback
 
 import core
 
@@ -45,8 +46,8 @@ if False:
 		def wait(self, timeout=None):
 			ct = threading.current_thread()
 	
-			logger.debug("[%s] Waiting on %s" % (self, ct))
-			while not threading._Event.wait(self, 3):
+			#logger.debug("[%s] Waiting on %s" % (self, ct))
+			while not threading._Event.wait(self, 60):
 				logger.debug("[%s] EVENT EXPIRED ON %s" % (self, ct))
 	
 	class RLock(threading._RLock):
@@ -54,32 +55,64 @@ if False:
 			new = not self._is_owned()
 			ct = threading.current_thread()
 	
-			if new:
-				logger.debug("[%s] Acquiring for %s" % (self, ct))
+			#if new:
+			#	logger.debug("[%s] Acquiring for %s" % (self, ct))
 	
-			for retry in xrange(10):
-				if threading._RLock.acquire(self, blocking=False):
-					break
-				time.sleep(1)
-				logger.debug("[%s] Acquiring for %s (attempt %d)." % (self, ct, retry))
-			else:
-				logger.debug("[%s] DEADLOCKED IN THREAD %s." % (self, ct))
-				raise Exception()
+			succ = False
+			while not succ:
+				for retry in xrange(10):
+					if threading._RLock.acquire(self, blocking=False):
+						succ = True
+						break
+					time.sleep(.1)
+				#	logger.debug("[%s] Acquiring for %s (attempt %d)." % (self, ct, retry))
+				else:
+					logger.debug("[%s] DEADLOCKED IN THREAD %s." % (self, ct))
 			
-			if new:
-				logger.debug("[%s] Acquired in %s." % (self, ct))
+			#if new:
+			#	logger.debug("[%s] Acquired in %s." % (self, ct))
 	
 		__enter__ = acquire
 	
 		def release(self):
 			ret = threading._RLock.release(self)
 			ct = threading.current_thread()
-			if not self._is_owned():
-				logger.debug("[%s] Releasing on %s" % (self, ct))
+			#if not self._is_owned():
+			#	logger.debug("[%s] Releasing on %s" % (self, ct))
 			return ret
 else:
 	RLock = threading.RLock
-	Event = threading.Event
+	def Event(name):
+		return threading.Event()
+
+class AsyncoreLogErrorMixIn:
+	"""
+	Mix-in for asyncore.dispatcher to raise an exception on error
+	
+	Otherwise it's a horror to debug.
+	"""
+	def handle_error(self):
+		_, t, v, tbinfo = asyncore.compact_traceback()
+
+		# sometimes a user repr method will crash.
+		try:
+			self_repr = repr(self)
+		except:
+			self_repr = '<__repr__(self) failed for object at %0x>' % id(self)
+
+		logger.error(
+			'uncaptured python exception, closing channel %s (%s:%s %s)' % (
+				self_repr,
+				t,
+				v,
+				tbinfo
+				)
+			)
+		self.handle_close()
+		raise
+
+def dirdict(self):
+	return dict(( (name, getattr(self, name)) for name in dir(self)))
 
 def unpack_callable(func):
 	""" Unpack a (function, function_args) tuple
@@ -201,7 +234,7 @@ class Pool:
 		while True:
 			try:
 				msg, args = cPickle.load(fp)
-				print "PROGRESS:", msg, args
+				print >>sys.stderr, "PROGRESS:", msg, args
 			except EOFError:
 				fp.close()
 				break
@@ -216,6 +249,8 @@ class Pool:
 						yield cPickle.load(rfp)
 				except EOFError:
 					rfp.close()
+
+		print >>sys.stderr, "EXITING map_reduce_chain"
 
 def _make_buffer_mmap(size, dir=None):
 	# Create the temporary memory mapped buffer. It will go away as soon as the mmap is closed, or the process exits.
@@ -236,12 +271,85 @@ class AckDoneClass(object):
 
 AckDoneSentinel = AckDoneClass()
 
+class AsyncoreLoopChannel(AsyncoreLogErrorMixIn, asyncore.file_dispatcher):
+	"""
+	A class that can be used to invoke functions from
+	within an asyncore loop on the asyncore thread.
+	"""
+	r_fd = None		# Pipe used to wake up the Scatterer in the asyncore thread (read endpoint)
+	w_fd = None		# Pipe used to wake up the Scatterer in the asyncore thread (write endpoint)
+	callbacks = None# The callbacks to call when the asyncore loop is entered
+
+	lock = None		# A lock protecting all member variables
+
+	def __init__(self, map):
+		self.lock = RLock()
+		self.callbacks = []
+
+		# Note: r_fd is os.dup()-ed by file_dispatcher
+		self.r_fd, self.w_fd = os.pipe()
+		asyncore.file_dispatcher.__init__(self, self.r_fd, map)
+
+	def close(self):
+		# Close both ends of the communication pipe
+		#logger.debug("Closing %s %s" % (self.w_fd, self.r_fd))
+		os.close(self.w_fd)
+		os.close(self.r_fd)
+
+		asyncore.file_dispatcher.close(self)
+
+	def handle_read(self):
+		# Called from within the asyncore thread when something is
+		# written to w_fd
+		#logger.info("In asyncore thread")
+		with self.lock:
+			# Clear the signal
+			nread = 8192
+			while self.recv(nread) == nread:
+				pass
+
+			# Execute the callbacks
+			for callback in self.callbacks:
+				callback()
+			del self.callbacks[:]
+
+	def schedule(self, callback):
+		# Called from outside the asyncore thread to
+		# schedule a callback be called from the thread,
+		# and to wake the thread up
+		with self.lock:
+			self.callbacks.append(callback)
+			os.write(self.w_fd, '1')
+
+class AsyncoreThread(threading.Thread):
+	__callback_channel = None
+	map = None
+
+	def __init__(self, asyncore_args=(), asyncore_kwargs={}, *args, **kwargs):
+		self.map = {}
+		self.__callback_channel = AsyncoreLoopChannel(self.map)
+
+		asyncore_kwargs = asyncore_kwargs.copy()
+		asyncore_kwargs['map'] = self.map
+		threading.Thread.__init__(self, target=asyncore.loop, args=asyncore_args, kwargs=asyncore_kwargs)
+
+	def schedule(self, callback):
+		# Schedule a callback to be executed from within the asyncore loop
+		self.__callback_channel.schedule(callback)
+		#logger.info("Scheduled")
+
+	def close_all(self, ignore_all=False):
+		# Close all channels, clear the channel map, and
+		# exit the asyncore loop (and therefore the thread).
+		#logger.info(self.map)
+		self.schedule( lambda: asyncore.close_all(self.map, ignore_all) )
+
 class Worker(object):
 	"""
 	The class encapsulating a Worker process, and acting
 	as an XMLRPC method provider.
 	"""
-	class Scatterer(asyncore.file_dispatcher):
+	class Scatterer(AsyncoreLogErrorMixIn, asyncore.file_dispatcher):
 		"""
 		Queue the items for sending into separate buffers, one
 		per each _destination_.
@@ -249,7 +357,7 @@ class Worker(object):
 		To add a new destination (from a different thread), write
 		to Scatterer's fd to trigger entering the Scatterer's thread.
 		"""
-		class ScattererChannel(asyncore.dispatcher):
+		class ScattererChannel(AsyncoreLogErrorMixIn, asyncore.dispatcher):
 			bufsize = BUFSIZE 	# buffer size - 1TB (ext3 max. file size is 2TB)
 			ctresh  = 50 * 2**20	# compactification treshold (50M)
 
@@ -264,6 +372,11 @@ class Worker(object):
 			serving_stages = None	# The set of stages for which we've sent out keys.
 			asyncore_map = None		# asyncore thread map
 
+			def _html_(self):
+				info = "mm.tell()={mmtell}, mm_at={mm_at}, mm_end={mm_end}, stages={serving_stages}" \
+					.format(mmtell=self.mm.tell(), **dirdict(self))
+				return info
+
 			def __hash__(self):
 				return id(self)
 
@@ -271,7 +384,10 @@ class Worker(object):
 				return id(self) == id(b)
 
 			def finish_stage(self, stage):
-				self.serving_stages.remove(stage)
+				#logger.debug("ScattererChannel.finish_stage(stage=%s), serving_stages=%s" % (stage, self.serving_stages))
+				with self.lock:
+					self.serving_stages.remove(stage);
+					return len(self.serving_stages)
 
 			def __init__(self, host, port, map):
 				# Constructor: this gets called from the Worker's thread,
@@ -302,12 +418,14 @@ class Worker(object):
 					with self.lock:
 						self.mm_end = self.mm.tell()
 
+				#logger.debug("ScatCh.writable: mm_at=%s mm_end=%s" % (self.mm_at, self.mm_end))
 				return self.mm_at < self.mm_end
 
 			def handle_write(self):
 				# Write as much as we can to the destination.
 				sent = self.send(self.mm[self.mm_at:self.mm_end])
 				self.mm_at += sent
+				#logger.debug("ScattererChannel.handle_write wrote out at=%s sent=%s" % (self.mm_at, sent))
 
 				# Compactify every time we send >= 50MB
 				if self.mm_at > self.ctresh:
@@ -325,6 +443,7 @@ class Worker(object):
 
 			def queue(self, stage, k, v):
 				# Runs from within a worker thread
+				#logger.debug("Scattering to stage=%s key=%s, val=%s" % (stage, k, v))
 				with self.lock:
 					# Serialize the key/value
 					pkt_beg_offs = self.mm.tell()
@@ -359,6 +478,29 @@ class Worker(object):
 
 		lock = None		# A lock protecting all member variables
 
+		def _html_(self):
+			with self.lock:
+				info = """
+				<h2>Scatterer</h2>
+				<table border=1>
+					<tr><th>Destinations</th><td>{ndest}</td></tr>
+				</table>
+				""".format(ndest=len(self.destinations))
+
+				brows = [
+					'<tr><th>{host}:{port}</th>  <td>{cinfo}</td></tr>'
+					.format(host=host, port=port, cinfo=chan._html_()) for (host, port), chan in self.destinations.iteritems()
+					]
+				info += """
+				<h3>Scatterer destinations</h3>
+				<table border=1>
+					<tr><th>Gatherer addr</th> <th>Channel Info</th></tr>
+					{brows}
+				</table>
+				""".format(brows='\n'.join(brows))
+
+			return info
+
 		def __init__(self, parent, curl, map):
 			self.parent = parent
 			self.asyncore_map = map
@@ -384,7 +526,7 @@ class Worker(object):
 		def close_channels(self, scs):
 			# Must be called from asyncore thread
 			#
-			# Close the channel and remove it from all of our maps
+			# Close the set of channel scs, and remove them from all of our maps
 			with self.lock:
 				keys = [ k for k, v in self.destinations.iteritems() if v in scs ]
 				for k in keys: del self.destinations[k]
@@ -404,6 +546,7 @@ class Worker(object):
 				# Close the Channels (this will close their sockets, remove them from
 				# asyncore map)
 				for sc in scs:
+					logger.debug("Closing channel: %s" % (sc,))
 					sc.close()
 
 		def handle_read(self):
@@ -419,10 +562,12 @@ class Worker(object):
 				for stage in self.pending_done:
 					to_close = set()
 					for sc in self.stage_destinations[stage]:
+						#logger.debug("handle_read: %s" % (self.asyncore_map, ))
 						nleft = sc.finish_stage(stage)
 						if nleft == 0:
-							to_close.append(sc)
+							to_close.add(sc)
 					self.close_channels(to_close)
+					del self.pending_done[:]
 
 				# Clear the signal
 				nread = 8192
@@ -439,6 +584,7 @@ class Worker(object):
 			#
 			# Note: it has to be locked to protect against a
 			#       potential race condition in handle_read().
+			#logger.debug("notify: %s" % (self.asyncore_map,))
 			with self.lock:
 				os.write(self.w_fd, '1')
 
@@ -452,9 +598,17 @@ class Worker(object):
 					self.pending_done.append(stage)
 					self.notify()
 
-					# Notify the Coordinator that this Worker is
-					# completely done with stage=stage-1
-					self.coordinator.stage_ended(self.parent.url, stage-1)
+					self.all_acknowledged(stage)
+
+		def all_acknowledged(self, stage):
+			# Called once all connected endpoints acknowledge
+			# the receipt of our data
+
+			# Notify the Coordinator that this Worker is
+			# completely done with stage=stage-1
+			with self.lock:
+				#logger.debug("All Gatherers ack. receiving data for stage %s" % (stage,))
+				self.coordinator.stage_ended(self.parent.url, stage-1)
 
 		def done_producing(self, stage):
 			# Called from worker thread
@@ -463,7 +617,7 @@ class Worker(object):
 			# to acknowledge they've received all the data sent
 			# to them so far.
 			#
-			# The receiveing Gatherers will respond to the message
+			# The receiving Gatherers will respond to the message
 			# by invoking the Worker's gatherer_ack() XMLRPC routine.
 			#
 			# Each invocation of that routine reduces the "active
@@ -471,13 +625,20 @@ class Worker(object):
 			# the Worker signals the Coordinator that it has finished
 			# processing the stage 'stage'.
 			with self.lock:
+				logger.debug("Done producing data for stage %s" % (stage,))
 				self.waiting_ack[stage] = len(self.stage_destinations[stage])
 
-				for sc in self.stage_destinations[stage]:
-					sc.queue(stage, AckDoneSentinel, (self.parent.url, stage))
+				if len(self.stage_destinations[stage]):
+					# We've emitted data: send requests to endpoints to 
+					# acknowledge receipt.
+					for sc in self.stage_destinations[stage]:
+						sc.queue(stage, AckDoneSentinel, (self.parent.url, stage))
 
-				# Wake up the asyncore thread
-				self.notify()
+					# Wake up the asyncore thread
+					self.notify()
+				else:
+					# We've emitted no data
+					self.all_acknowledged(stage)
 
 		def queue(self, stage, kv):
 			# This gets called from the Worker's thread
@@ -495,7 +656,7 @@ class Worker(object):
 					sc = self.key_destinations[(stage, key)]
 				else:
 					# Unknown (stage, key). Find where to send them
-					logger.debug("Getting destination from coordinator")
+					#logger.debug("Getting destination from coordinator")
 					wurl = self.coordinator.get_destination_for(stage, key)
 					(host, port) = xmlrpclib.ServerProxy(wurl).get_gatherer_addr()
 
@@ -519,7 +680,7 @@ class Worker(object):
 				# Wake up the asyncore thread
 				self.notify()
 
-	class Gatherer(asyncore.dispatcher_with_send):
+	class Gatherer(AsyncoreLogErrorMixIn, asyncore.dispatcher_with_send):
 		"""
 		Collect incoming (key, value) tuplets from other Workers
 		and funnel them into a single stream to be fed to our
@@ -527,7 +688,7 @@ class Worker(object):
 
 		Does this on a per-stage basis (one buffer per stage)
 		"""
-		class GathererChannel(asyncore.dispatcher_with_send):
+		class GathererChannel(AsyncoreLogErrorMixIn, asyncore.dispatcher_with_send):
 			"""
 			A connection to a Scatterer on another Worker.
 			
@@ -548,14 +709,18 @@ class Worker(object):
 				# Receive as much as possible into self.buf, and attempt to
 				# process it if the message is complete.
 				data = self.recv(1*1024*1024)
-				self.buf.write(data)
-				self.process_buffer()
+				if len(data):
+					self.buf.write(data)
+					self.process_buffer()
 
-				if data == '':
-					# The Scatterer has closed the connection.
+			def handle_close(self):
+				# The remote Scatterer has closed the connection.
+				#logger.debug("Remote scatterer disconnected.")
 
-					# TODO: Handle broken connections
-					assert self.buf.getvalue() == '', "Connection broke?"
+				# TODO: Handle broken connections
+				assert self.buf.getvalue() == '', "Connection broke?"
+				
+				self.close()
 
 			def process_buffer(self):
 				# See if we've received enough data to process one or 
@@ -609,6 +774,11 @@ class Worker(object):
 			all_recvd = False	# True if the stage _before_ the one this Buffer is buffering
 						# has ended (i.e., no more key/values are to be received).
 
+			def _html_(self):
+				info = "mm.tell()={mmtell}, next_key={next_key}, all_recvd={all_recvd}" \
+					.format(mmtell=self.mm.tell(), **dirdict(self))
+				return info
+
 			def __init__(self, size):
 				self.lock = RLock()
 				self.new_key_evt = Event("new_key_evt")
@@ -623,7 +793,7 @@ class Worker(object):
 				self.next_key = self.chains[KeyChainSentinel][1]
 
 			def append(self, key, pkl_value):
-				# Appent the pickled value to the chain of values
+				# Append the pickled value to the chain of values
 				# for key 'key'
 
 				with self.lock:
@@ -643,7 +813,7 @@ class Worker(object):
 						self.chains[key] = (mm.tell(), 0)
 
 					# Add a link to the chain
-					logger.debug("key=%s, offset=%s" % (key, mm.tell()))
+					#logger.debug("key=%s, offset=%s, value=%s" % (key, mm.tell(), cPickle.loads(pkl_value)))
 					mm.write(struct.pack('<Q', len(pkl_value)))	# 1) Length of the data (uint64)
 					mm.write(pkl_value)				# 2) The data (pickled)
 					mm.write('\xff'*8)				# 3) Offset to next item in chain (or 0xFFFFFFFFFFFFFFFF, if end-of-chain)
@@ -710,6 +880,7 @@ class Worker(object):
 
 					# yield the available values
 					for v in self.iter_chain(key, at, last):
+						#logger.debug("Consuming %s" % (v,))
 						yield v
 
 					while True:
@@ -733,7 +904,6 @@ class Worker(object):
 				# Find keys not yet being processed, and yield
 				# generators that will yield values for those keys
 
-				# FIXME: TODO: take all_recvd into account
 				while True:
 					value_gen = None
 
@@ -807,6 +977,30 @@ class Worker(object):
 
 		lock = None		# RLock guarding the buffers variable
 
+		def _html_(self):
+			with self.lock:
+				info = """
+				<h2>Gatherer</h2>
+				<table border=1>
+					<tr><th>Port</th><td>{port}</td></tr>
+					<tr><th>BUFSIZE</th><td>{bufsize}</td></tr>
+				</table>
+				""".format(bufsize=self.bufsize, **self.__dict__)
+
+				brows = [
+					'<tr><th>{stage}</th>  <td>{binfo}</td></tr>'
+					.format(stage=stage, binfo=buffer._html_()) for stage, buffer in self.buffers.iteritems()
+					]
+				info += """
+				<h3>Gatherer buffers</h3>
+				<table border=1>
+					<tr><th>Stage</th> <th>Buffer Info</th></tr>
+					{brows}
+				</table>
+				""".format(brows='\n'.join(brows))
+
+			return info
+
 		def __init__(self, parent, curl, map):
 			self.parent = parent
 			self.asyncore_map = map
@@ -837,7 +1031,7 @@ class Worker(object):
 				if stage in self.buffers:
 					buf = self.buffers[stage]
 				else:
-					logger.debug("Creating buffer for stage=%d" % stage)
+					#logger.debug("Creating buffer for stage=%d" % stage)
 					buf = self.buffers[stage] = self.Buffer(self.bufsize)
 
 			return buf
@@ -873,12 +1067,63 @@ class Worker(object):
 
 	kernels = None		# The list of kernels to execute
 	locals  = None		# Local variables to be made available to the kernels (TODO: not implemented yet)
-	
+
+	curl	= None		# Coordinator XMLRPC server URL	
 	coordinator = None	# XMLRPC Proxy to the Coordinator
 	gatherer = None		# Gatherer instance
 	scatterer = None	# Scatterer instance
+	asyncore_thread = None	# AsyncoreThread instance running asyncore.loop with the gatherer and scatterer
 
 	running_stage_threads = None	# defaultdict(int): stage -> number of worker threads processing the keys from stage
+	
+	t_started = None	# Time when we launched
+
+	def _html_(self):
+		with self.lock:
+			"""
+			Return a HTML info page about this Worker
+			"""
+			uptime = datetime.datetime.now() - self.t_started
+	
+			info = """
+			<h1>Worker {hostname}:{port}</h1>
+			
+			<h2>Info</h2>
+			<table border=1>
+				<tr><th>XMLRPC URL</th><td>{url}</td></tr>
+				<tr><th>Uptime</th><td>{uptime}</td></tr>
+				<tr><th>Hostname</th><td>{hostname}</td></tr>
+				<tr><th>Port</th><td>{port}</td></tr>
+				<tr><th>Coordinator</th><td><a href='{curl}'>{curl}</a></td></tr>
+			</table>
+			""".format(uptime=uptime, **self.__dict__)
+
+			srows = [ 
+				'<tr><th>{stage}</th>  <td>{nthreads}</td></tr>'
+				.format(stage=stage, nthreads=nthreads) for stage, nthreads in self.running_stage_threads.iteritems()
+				]
+			info += """
+			<h2>Running stages</h2>
+			<table border=1>
+				<tr><th>Stage</th> <th>nthreads</th></tr>
+				{srows}
+			</table>
+			""".format(srows='\n'.join(srows))
+
+		info += self.gatherer._html_()
+		info += self.scatterer._html_()
+
+		return info
+
+	def stat(self):
+		# Return basic statistics about this server
+		with self.lock:
+			return {
+				'url': self.url,
+				't_started': self.t_started,
+				't_now': datetime.datetime.now(),
+				'running_stages': self.running_stage_threads.items()
+			}
 
 	def __init__(self, server, hostname):
 		self.server = server
@@ -889,6 +1134,9 @@ class Worker(object):
 		self.running_stage_threads = defaultdict(int)
 		self.lock      = RLock()
 
+		# Time when we launched
+		self.t_started = datetime.datetime.now()
+
 	def get_gatherer_addr(self):
 		# Return the port on which our Gatherer listens
 		return (self.hostname, self.gatherer.port)
@@ -897,16 +1145,16 @@ class Worker(object):
 		# Initialize the connection back to the Coordinator
 		# WARNING: This routine MUST NOT call back the Coordinator
 		#          or else it will deadlock
+		self.curl = curl
 		self.coordinator = xmlrpclib.ServerProxy(curl)
 
 		# Initialize Gatherer and Scatterer threads, with the asyncore
 		# loop running in a separate thread
-		asyncore_map = {}
-		self.gatherer  = self.Gatherer(self, curl, map=asyncore_map)
-		self.scatterer = self.Scatterer(self, curl, map=asyncore_map)
-		th = threading.Thread(name='Scatter/Gather', target=asyncore.loop, kwargs={'timeout': 3600, 'map': asyncore_map})
-		th.daemon = True
-		th.start()
+		self.asyncore_thread = AsyncoreThread(name='Scatter-Gather', asyncore_kwargs={'timeout': 3600})
+		self.gatherer  = self.Gatherer(self, curl, map=self.asyncore_thread.map)
+		self.scatterer = self.Scatterer(self, curl, map=self.asyncore_thread.map)
+		self.asyncore_thread.daemon = True
+		self.asyncore_thread.start()
 
 		# Initialize the task:
 		fp = cStringIO.StringIO(b64decode(data))
@@ -934,21 +1182,31 @@ class Worker(object):
 			self.send_header("Content-type", "binary/octet-stream")
 			self.end_headers()
 
-			for bytes in self.server.valiter:
-				self.wfile.write(bytes)
+			for v in self.server.valiter:
+				cPickle.dump(v, self.wfile, -1)
+
+		def log_message(self, format, *args):
+			# Need to override this, otherwise log messages will
+			# wind up on stderr
+			logger.info("ResultHTTPRequestHandler: " + format % args)
 
 	def _serve_results(self, kv):
 		"""
 		Open a HTTP port and serve the results back to the client.
 		"""
+		if False:
+			# Force this method to be compiled as a generator
+			yield None
+
 		_, v = kv
-		httpd, port = start_server(BaseHTTPServer.HTTPServer, self.ResultHTTPRequestHandler, self.hostname, self.port)
+		httpd, port = start_server(BaseHTTPServer.HTTPServer, self.ResultHTTPRequestHandler, self.port, self.hostname)
 
 		with self.lock:
 			self.coordinator.notify_client_of_result("http://%s:%s" % (self.hostname, port))
 
 		httpd.valiter = v	# The iterator returning the values
 		httpd.handle_request()
+		logger.info("Results served")
 
 	def _worker(self, stage):
 		# Executes the kernel for a given stage in
@@ -956,6 +1214,7 @@ class Worker(object):
 		with self.lock:
 			logger.info("Worker thread for stage %s active on %s" % (stage, self.url))
 			# stage = -1 and stage = len(kernels) are special (feeder and collector kernels)
+			# stage = 0 and stage = len(kernels)-1 have wrappers to make them look like reducers
 			if stage == -1:
 				def K_start(kv):
 					_, v = kv
@@ -964,7 +1223,7 @@ class Worker(object):
 						yield k, item
 				K_fun, K_args = K_start, ()
 			elif stage == len(self.kernels):
-				K_fun, K_args = self.gatherer.serve_results, ()
+				K_fun, K_args = self._serve_results, ()
 			else:
 				K_fun, K_args = unpack_callable(self.kernels[stage])
 
@@ -976,6 +1235,15 @@ class Worker(object):
 						return K_fun(v, *K_args)
 					K_fun, K_args = K, (args, K_fun, K_args)
 
+				if stage == len(self.kernels)-1:
+					# last stage has a wrapper keying the outputs
+					# to the same value (so they get redirected to
+					# the collector)
+					def K(kv, args, K_fun, K_args):
+						for res in K_fun(kv, *K_args):
+							yield (0, res)
+					K_fun, K_args = K, (args, K_fun, K_args)
+
 		# Do the actual work
 		for key, valgen in self.gatherer.iteritems(stage):
 			for kv in K_fun((key, valgen), *K_args):
@@ -984,37 +1252,52 @@ class Worker(object):
 		with self.lock:
 			# Unregister ourselves from the list of active workers
 			self.running_stage_threads[stage] -= 1
-			
-			# Let the coordinator know a stage thread has ended
-			# (this is mostly for statistics/debugging purpuses for now)
-			self.coordinator.stage_thread_ended(self.url, stage)
-	
-			if self.running_stage_threads[stage] == 0:
-				# If this is the last thread left running this stage,
-				# let the Scatterer know we're done producing for stage+1
-				self.scatterer.done_producing(stage+1)
+			last_thread = self.running_stage_threads[stage] == 0
 
+			# Let the coordinator know a stage thread has ended
+			self.coordinator.stage_thread_ended(self.url, stage)
+
+		if last_thread:
+			with self.lock:
 				# Delete the entry for this stage
 				del self.running_stage_threads[stage]
+
+			# If this is the last thread left running this stage,
+			# let the Scatterer know we're done producing for stage+1
+			self.scatterer.done_producing(stage+1)
 
 	def run_stage(self, stage):
 		# Start running a stage, in a separate thread
 		# WARNING: This routine must not call back into the
 		#          Coordinator (will deadlock)
 		logger.debug("Starting stage %s on %s" % (stage, self.url))
-		if stage != -1:
-			return
 		with self.lock:
 			assert -1 <= stage <= len(self.kernels)
 			self.running_stage_threads[stage] += 1
-			th = threading.Thread(name='Stage %d' % stage, target=self._worker, args=(stage,))
+			th = threading.Thread(name='Stage-%02d' % stage, target=self._worker, args=(stage,))
 			th.daemon = True
 			th.start()
-			
+
 	def stage_ended(self, stage):
 		# Notification from the coordinator that a particular
 		# stage has ended
 		self.gatherer.stage_ended(stage)
+
+	def shutdown(self):
+		# Command from the Coordinator to shut down
+		logger.info("Shutting down worker %s" % (self.url,))
+		with self.lock:
+			# Assert all jobs have finished
+			assert len(self.running_stage_threads) == 0, str(self.running_stage_threads)
+
+			# Close the Gatherer and the Scatterer
+			#logger.info("Caling asyncore_thread.close_all")
+			self.asyncore_thread.close_all()
+			#logger.info("Waiting for asyncore thread to join")
+			self.asyncore_thread.join()
+			#logger.info("Shut down the asyncore thread")
+
+		self.server.shutdown()
 
 class Peer:
 	class _Coordinator(object):
@@ -1042,7 +1325,7 @@ class Peer:
 				self.running_stage_threads = defaultdict(int)
 
 		## _Coordinator ####################
-		id	= None	# Unique task ID
+		id		= None	# Unique task ID
 		server  = None  # XMLRPCServer instance for this Coordinator (note: this is _not_ the Peer that launched it)
 		hostname= None  # Our host name
 		port    = None  # TCP port
@@ -1062,6 +1345,42 @@ class Peer:
 		free_peers_last_refresh = 0	# The last time when free_peers was refreshed from the Directory
 
 		lock    = None	# Lock protecting instance variables
+		t_started = None # Time (datetime) when we were started
+
+		def _html_(self):
+			with self.lock:
+				"""
+				Return a HTML info page about this Coordinator
+				"""
+				uptime = datetime.datetime.now() - self.t_started
+		
+				info = """
+				<h1>Coordinator {hostname}:{port}</h1>
+				
+				<h2>Info</h2>
+				<table border=1>
+					<tr><th>XMLRPC URL</th><td>{url}</td></tr>
+					<tr><th>Uptime</th><td>{uptime}</td></tr>
+					<tr><th>Hostname</th><td>{hostname}</td></tr>
+					<tr><th>Port</th><td>{port}</td></tr>
+					<tr><th>Task ID</th><td>{id}</td></tr>
+					<tr><th>Parent Peer</th><td><a href='{purl}'>{purl}</a></td></tr>
+				</table>
+				""".format(uptime=uptime, **self.__dict__)
+
+				wrows = [ 
+					'<tr><th><a href="{wurl}">{wurl}</a></th>  <td>{t_started}</td> <td>{t_now}</td> <td>{running_stages}</td>  </tr>'
+					.format(wurl=wurl, **worker.stat()) for wurl, worker in self.workers.iteritems()
+					]
+				info += """
+				<h1>Workers</h1>
+				<table border=1>
+					<tr><th>Worker</th> <th>Started On</th> <th>Local Time</th> <th>Running stages</th></tr>
+					{crows}
+				</table>
+				""".format(crows='\n'.join(wrows))
+		
+			return info
 
 		def __init__(self, server, hostname, parent_url, id, spec, data):
 			self.lock    = RLock()
@@ -1079,6 +1398,9 @@ class Peer:
 			self.queue   = Queue.Queue()
 			self.workers = {}
 			self.destinations = {}
+
+			# Time when we launched
+			self.t_started = datetime.datetime.now()
 
 		def __str__(self):
 			s = self.__class__.__name__ + ":\n"
@@ -1110,9 +1432,7 @@ class Peer:
 			# Launch the worker
 			logger.debug("Launch worker for task %s" % (self.id,))
 			wurl = peer.start_worker(self.id, self.spec.serialize())
-			logger.debug("Connecting to worker %s" % (wurl,))
 			worker = self.WorkerProxy(wurl, purl)
-			logger.debug("Connected to %s" % (wurl,))
 
 			# Store the worker into our list of workers
 			with self.lock:
@@ -1125,6 +1445,16 @@ class Peer:
 			self._progress("WORKER_START", (purl, wurl))
 
 			return worker
+
+		def stat(self):
+			# Return basic statistics about this server
+			with self.lock:
+				return {
+					'task_id': str(self.id),
+					't_started': self.t_started,
+					't_now': datetime.datetime.now(),
+					'n_workers': len(self.workers)
+				}
 
 		def start(self):
 			# Called by the Peer that launched us to start the 
@@ -1143,43 +1473,39 @@ class Peer:
 
 				self._progress("THREAD_ENDED_ON_WORKER", (wurl, stage, worker.running_stage_threads[stage]))
 
-				if worker.running_stage_threads[stage] == 0:
-					del worker.running_stage_threads[stage]
-
 		def stage_ended(self, wurl, stage):
 			# Called by a Worker when all of its threads
 			# executing the stage have finished, and when it has
 			# gotten the acknowledgments from upstream Workers that
 			# they've received all the stage+1 data it sent them.
-			worker = self.workers[wurl]
-			assert stage not in worker.running_stage_threads	# Should've been deleted in stage_thread_ended()
+			with self.lock:
+				worker = self.workers[wurl]
+				assert worker.running_stage_threads[stage] == 0
+				del worker.running_stage_threads[stage]
 
-			self._progress("STAGE_ENDED_ON_WORKER", (wurl, stage))
+				logger.debug("Worker %s notified us that stage %s has ended" % (wurl, stage))
+				self._progress("STAGE_ENDED_ON_WORKER", (wurl, stage))
 
-			# Check if this stage is done on all workers
-			for worker in self.workers.itervalues():
-				if stage in worker.running_stage_threads:
-					break
-			else:
-				# This stage was not found in any of the worker's
-				# running_stage_threads. Means this stage for the
-				# entire task has ended.
-				self._progress("STAGE_ENDED", (wurl, stage))
-
-				# Check if this means the whole task has ended
-				# Note: this is not a mistake -- there is one more stage than 
-				# the number of kernels - the last stage funnels the data back
-				# to the user
-				if stage == self.spec.nkernels:
-					self._progress("DONE", None)
-					self.shutdown()
+				# Check if this stage is done on all workers
+				logger.debug("%d Workers active" % len(self.workers))
+				for worker in self.workers.itervalues():
+					if stage in worker.running_stage_threads:
+						logger.debug("Stage %d active on worker %s" % (stage, worker.url))
+						break
+					else:
+						logger.debug("%s -> %s" % (worker.url, worker.running_stage_threads))
 				else:
+					# This stage was not found in any of the worker's
+					# running_stage_threads. Means this stage for the
+					# entire task has ended.
+					self._progress("STAGE_ENDED", (wurl, stage))
+	
 					# Let Workers processing stage+1 know that the
 					# previous stage has finished
 					for worker in self.workers.itervalues():
 						if stage+1 in worker.running_stage_threads:
 							worker.stage_ended(stage)
-
+	
 					# Remove this stage from the destinations map
 					try:
 						del self.destinations[stage]
@@ -1187,6 +1513,14 @@ class Peer:
 						# Note: having no self.destinations[stage] is legal; means
 						# there were no results generated by the previous stage
 						pass
+	
+					# Check if the whole task has ended
+					# Note: this is not a mistake -- there is one more stage than 
+					# the number of kernels - the last stage funneled the data back
+					# to the user.
+					if stage == self.spec.nkernels:
+						self._progress("DONE", None)
+						self.shutdown()
 
 		def notify_client_of_result(self, rurl):
 			# Called by the last kernel, to notify the client
@@ -1199,7 +1533,11 @@ class Peer:
 				assert len(self.destinations) == 0
 				for worker in self.workers.itervalues():
 					assert len(worker.running_stage_threads) == 0
+					logger.debug("Shutting down worker %s for task %s" % (worker.url, self.url))
+					worker.shutdown()
+					logger.debug("Shutdown complete")
 
+			logger.debug("Shutting down server")
 			self.server.shutdown()
 
 		def get_destination_for(self, stage, key):
@@ -1262,41 +1600,45 @@ class Peer:
 		# Time when we launched
 		self.t_started = datetime.datetime.now()
 
-	def stat(self):
-		# Return basic statistics about this server
-		return {
-			'peer_id': str(self.peer_id),
-			't_started': self.t_started,
-			't_now': datetime.datetime.now(),
-			'n_coordinators': len(self.coordinators),
-			'n_workers': len(self.workers)
-		}
+	def _html_(self):
+		with self.lock:
+			"""
+			Return a HTML info page about this Peer
+			"""
+			uptime = datetime.datetime.now() - self.t_started
+	
+			info = """
+			<h1>Peer {hostname}:{port}</h1>
+			
+			<h2>Info</h2>
+			<table border=1>
+				<tr><th>XMLRPC URL</th><td>{url}</td></tr>
+				<tr><th>Uptime</th><td>{uptime}</td></tr>
+				<tr><th>Hostname</th><td>{hostname}</td></tr>
+				<tr><th>Port</th><td>{port}</td></tr>
+				<tr><th>Peer ID</th><td>{peer_id}</td></tr>
+				<tr><th>Peer Directory Entry</th><td>{directory_entry}</td></tr>
+			</table>
+			""".format(uptime=uptime, **self.__dict__)
 
-	def _info(self):
-		"""
-		Return a HTML info page about this Peer
-		"""
-		uptime = datetime.datetime.now() - self.t_started
-
-		info = """
-		<h1>Peer {hostname}:{port}</h1>
-		
-		<h2>Info</h2>
-		<table border=1>
-			<tr><th>XMLRPC URL</th><td>{url}</td></tr>
-			<tr><th>Uptime</th><td>{uptime}</td></tr>
-			<tr><th>Hostname</th><td>{hostname}</td></tr>
-			<tr><th>Port</th><td>{port}</td></tr>
-			<tr><th>Peer ID</th><td>{peer_id}</td></tr>
-			<tr><th>Peer Directory Entry</th><td>{directory_entry}</td></tr>
-		</table>
-		""".format(uptime=uptime, **self.__dict__)
-
+			crows = [ 
+				'<tr><th><a href="{curl}">{curl}</a></th>  <td>{task_id}</td> <td>{t_started}</td> <td>{t_now}</td> <td>{n_workers}</td>  </tr>'
+				.format(curl=coordinator.url, **coordinator.stat()) for coordinator in self.coordinators.itervalues()
+				]
+			info += """
+			<h1>Coordinated tasks</h1>
+			<table border=1>
+				<tr><th>Coordinator</th> <th>Task ID</th> <th>Started On</th> <th>Local Time</th> <th>Workers</th></tr>
+				{crows}
+			</table>
+			""".format(crows='\n'.join(crows))
+	
 		# Add info about the peers
 		peers = self.list_peers()
 		prows = [ 
 			'<tr><th><a href="{purl}">{purl}</a></th>  <td>{peer_id}</td><td>{t_started}</td><td>{t_now}</td><td>{n_coordinators}</td><td>{n_workers}</td>  </tr>'
-			.format(purl=purl, **xmlrpclib.ServerProxy(purl).stat()) for purl in peers ]
+			.format(purl=purl, **xmlrpclib.ServerProxy(purl).stat()) for purl in peers
+			]
 		info += """
 		<h2>Peers</h2>
 		Active peers: {npeers}
@@ -1331,11 +1673,11 @@ class Peer:
 			task_id = "%s.%s" % (self.peer_id, self.coordinator_ctr)
 			self.coordinator_ctr += 1
 
-			server, _ = start_threaded_xmlrpc_server(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler, 1023, self.hostname)
+			server, _ = start_threaded_xmlrpc_server(HTMLAndXMLRPCRequestHandler, 1023, self.hostname)
 			coordinator = self.coordinators[task_id] = self._Coordinator(server, self.hostname, self.url, task_id, spec, data)
 			server.register_instance(coordinator)
 			server.register_introspection_functions()
-			th = threading.Thread(name='Coordinator %d' % (self.coordinator_ctr-1,), target=server.serve_forever)
+			th = threading.Thread(name='Coord-%03d' % (self.coordinator_ctr-1,), target=server.serve_forever)
 			th.daemon = True
 			th.start()
 
@@ -1344,14 +1686,37 @@ class Peer:
 
 		# Begin listening for notifications of events, yield them back to the user
 		for msg in iter(coordinator.queue.get, ("DONE", None)):
-			print "In loop: ", msg
+			logger.debug("Progress msg to client: %s" % (msg,))
 			yield msg
 
 		# delete this Coordinator task
 		with self.lock:
 			del self.coordinators[task_id]
 
+		th.join()
+		logger.info("Done running task %s" % (task_id,))
+
+	def _cleanup(self):
+		with self.lock:
+			for worker in self.workers.itervalues():
+				if worker.process is not None:
+					logger.info("Terminating process %d" % worker.process.pid)
+					worker.process.terminate()
+					worker.process.communicate()
+
 	############################
+	# Peer: public XMLRPC API
+	def stat(self):
+		# Return basic statistics about this server
+		with self.lock:
+			return {
+				'peer_id': str(self.peer_id),
+				't_started': self.t_started,
+				't_now': datetime.datetime.now(),
+				'n_coordinators': len(self.coordinators),
+				'n_workers': len(self.workers)
+			}
+
 	def list_peers(self):
 		"""
 		Return the set of all active Peers
@@ -1395,19 +1760,22 @@ class Peer:
 			worker = self._Coordinator.WorkerProxy(wurl, self.url, worker_process)
 			self.workers[task_id] = worker
 
+			# Launch a thread to monitor when the process exits
+			th = threading.Thread(name="PMon-%s" % (worker_process.pid,), target=self._monitor_worker_process, args=(task_id, worker,))
+			th.start()
+
 			return wurl
 
-	def _cleanup(self):
+	def _monitor_worker_process(self, task_id, worker):
+		# Called as a separate thread to monitor worker process progress
+		# and remove it from self.workers map once it terminates
+		retcode = worker.process.wait()
 		with self.lock:
-			for worker in self.workers.itervalues():
-				if worker.process is not None:
-					logger.info("Terminating process %d" % worker.process.pid)
-					worker.process.terminate()
-					worker.process.communicate()
+			logger.info("Worker %s (pid=%s) exited with retcode=%s" % (worker.url, worker.process.pid, retcode))
+			del self.workers[task_id]
 
 	def shutdown(self):
-		self.server.shutdown()
-		return 0
+		return self.server.shutdown()
 
 	############################
 	# Mock functions
@@ -1429,14 +1797,36 @@ class Peer:
 		a = s.mul(x,y)
 		return s.add(a, z)
 
-class PeerRequestHandler(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler):
+class HTMLAndXMLRPCRequestHandler(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler):
+	def do_GET(self):
+		fun = '_html_' + self.path[1:]
+
+		f = getattr(self.server.instance, fun, None) 
+		if f is None:
+			self._err_404("Function %s not found" % (fun,))
+		else:
+			self.send_response(200)
+			self.send_header("Content-type", "text/html")
+			self.end_headers()
+
+			self.wfile.write(f())
+
+	def _err_404(self, response):
+		# Report a 404 error
+		self.send_response(404)
+		self.send_header("Content-type", "text/plain")
+		self.send_header("Content-length", str(len(response)))
+		self.end_headers()
+		self.wfile.write(response)
+
+class PeerRequestHandler(HTMLAndXMLRPCRequestHandler):
 	# Override do_POST() to permit stateful connections
 	# for task submission and progress reporting
 	def do_POST(self):
-		logger.debug("New POST request")
 		if self.path != '/execute':
-			return SimpleXMLRPCServer.SimpleXMLRPCRequestHandler.do_POST(self)
+			return HTMLAndXMLRPCRequestHandler.do_POST(self)
 
+		logger.debug("New client connection")
 		req = self._parse_request()
 
 		#if True:
@@ -1466,22 +1856,6 @@ class PeerRequestHandler(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler):
 			cPickle.dump(msg, self.wfile, -1)
 			self.wfile.flush()
 
-	def do_GET(self):
-		# Print out some statistics
-		self.send_response(200)
-		self.send_header("Content-type", "text/html")
-		self.end_headers()
-
-		self.wfile.write(self.server.instance._info())
-
-	def _err_404(self, response):
-		# Report a 404 error
-		self.send_response(404)
-		self.send_header("Content-type", "text/plain")
-		self.send_header("Content-length", str(len(response)))
-		self.end_headers()
-		self.wfile.write(response)
-
 	def _parse_request(self):
 		ctype, pdict = cgi.parse_header(self.headers['content-type'])
 		if ctype == 'multipart/form-data':
@@ -1504,20 +1878,21 @@ class PeerRequestHandler(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler):
 		else:
 			return None
 
-def start_server(ServerClass, HandlerClass, port=1023, addr=''):
+def start_server(ServerClass, HandlerClass, port=1023, addr='', **kwargs):
 	# Find the next available port
 	while port < 2**16:
 		try:
-			return ServerClass((addr, port), HandlerClass, allow_none=True), port
+			server = ServerClass((addr, port), HandlerClass, **kwargs)
+			return server, port
 		except socket.error:
 			port += 1
 
-def start_threaded_xmlrpc_server(Handler, port=1023, addr=''):
-	return start_server(core.ThreadedXMLRPCServer, Handler)
+def start_threaded_xmlrpc_server(HandlerClass, port=1023, addr=''):
+	return start_server(core.ThreadedXMLRPCServer, HandlerClass, allow_none=True, logRequests=False)
 
 if __name__ == '__main__':
 	## Setup logging ##
-	format = '%(asctime)s.%(msecs)03d %(name)s[%(process)d] %(levelname)-8s {%(module)s:%(funcName)s}: %(message)s'
+	format = '%(asctime)s.%(msecs)03d %(name)s[%(process)d] %(threadName)-15s %(levelname)-8s {%(module)s:%(funcName)s}: %(message)s'
 	datefmt = '%a, %d %b %Y %H:%M:%S'
 	level = logging.DEBUG if (os.getenv("DEBUG", 0) == "1" or os.getenv("LOGLEVEL", "info") == "debug") else logging.INFO
 	#filename = 'peer.log' if os.getenv("LOG", None) is None else os.getenv("LOG")
@@ -1549,7 +1924,7 @@ if __name__ == '__main__':
 		argv = args[0:]
 
 		# Start the worker server
-		server, port = start_threaded_xmlrpc_server(SimpleXMLRPCServer.SimpleXMLRPCRequestHandler, 1023, hostname)
+		server, port = start_threaded_xmlrpc_server(HTMLAndXMLRPCRequestHandler, 1023, hostname)
 		worker = Worker(server, hostname)
 		server.register_instance(worker)
 		server.register_introspection_functions()
@@ -1584,6 +1959,8 @@ if __name__ == '__main__':
 
 		# Start the XMLRPC server
 		server.serve_forever()
+
+		logger.debug("Worker exiting.")
 	else:
 		# Start the server
 		logger.debug("Launching peer XMLRPC server")

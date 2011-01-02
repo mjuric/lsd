@@ -145,12 +145,14 @@ Schematic of a Peer node and the Worker:
 
 """
 
+import sys
 import SocketServer
 from SimpleXMLRPCServer import SimpleXMLRPCServer, SimpleXMLRPCRequestHandler
 
 class ThreadedXMLRPCServer(SocketServer.ThreadingMixIn, SimpleXMLRPCServer):
 	def __init__(self, *args, **kwargs):
-		self.daemon_threads = True
+		#print >>sys.stderr, kwargs
+		#self.daemon_threads = True
 		SimpleXMLRPCServer.__init__(self, *args, **kwargs)
 
 class TestObject:
