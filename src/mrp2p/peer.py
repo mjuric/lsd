@@ -85,6 +85,21 @@ else:
 	def Event(name):
 		return threading.Event()
 
+if os.getenv("PROFILE", 0):
+	import cProfile
+	outfn = os.getenv("PROFILE_LOG", "profile.log") + '.' + str(os.getpid())
+	#cProfile.runctx("server.serve_forever()", globals(), locals(), outfn)
+
+	class Thread(threading.Thread):
+		def run(self):
+			profiler = cProfile.Profile()
+			try:
+				return profiler.runcall(threading.Thread.run, self)
+			finally:
+				profiler.dump_stats('%s.%s.profile' % (outfn, self.name,))
+else:
+	from threading import Thread
+
 class AsyncoreLogErrorMixIn:
 	"""
 	Mix-in for asyncore.dispatcher to raise an exception on error
@@ -321,7 +336,7 @@ class AsyncoreLoopChannel(AsyncoreLogErrorMixIn, asyncore.file_dispatcher):
 			self.callbacks.append(callback)
 			os.write(self.w_fd, '1')
 
-class AsyncoreThread(threading.Thread):
+class AsyncoreThread(Thread):
 	__callback_channel = None
 	map = None
 
@@ -331,7 +346,8 @@ class AsyncoreThread(threading.Thread):
 
 		asyncore_kwargs = asyncore_kwargs.copy()
 		asyncore_kwargs['map'] = self.map
-		threading.Thread.__init__(self, target=asyncore.loop, args=asyncore_args, kwargs=asyncore_kwargs)
+		Thread.__init__(self, target=asyncore.loop, args=asyncore_args, kwargs=asyncore_kwargs, *args, **kwargs)
+		logger.error(self.name)
 
 	def schedule(self, callback):
 		# Schedule a callback to be executed from within the asyncore loop
@@ -1318,7 +1334,7 @@ class Worker(object):
 			self.running_stage_threads[stage] += 1
 			if self.running_stage_threads[stage] == 1:
 				self.maxpeers[stage+1] = maxpeers
-			th = threading.Thread(name='Stage-%02d' % stage, target=self._worker, args=(stage,))
+			th = Thread(name='Stage-%02d' % stage, target=self._worker, args=(stage,))
 			th.daemon = True
 			th.start()
 
@@ -1755,7 +1771,7 @@ class Peer:
 			coordinator = self.coordinators[task_id] = self._Coordinator(server, self.hostname, self.url, task_id, spec, data)
 			server.register_instance(coordinator)
 			server.register_introspection_functions()
-			th = threading.Thread(name='Coord-%03d' % (self.coordinator_ctr-1,), target=server.serve_forever)
+			th = Thread(name='Coord-%03d' % (self.coordinator_ctr-1,), target=server.serve_forever)
 			th.daemon = True
 			th.start()
 
@@ -1839,7 +1855,7 @@ class Peer:
 			self.workers[task_id] = worker
 
 			# Launch a thread to monitor when the process exits
-			th = threading.Thread(name="PMon-%s" % (worker_process.pid,), target=self._monitor_worker_process, args=(task_id, worker,))
+			th = Thread(name="PMon-%s" % (worker_process.pid,), target=self._monitor_worker_process, args=(task_id, worker,))
 			th.start()
 
 			return wurl
@@ -2035,7 +2051,9 @@ if __name__ == '__main__':
 		print worker.url
 		sys.stdout.flush()
 
-		if os.getenv("PROFILE", 0):
+		Thread(target=np.arange, args=(2000,)).start()
+
+		if 0 and os.getenv("PROFILE", 0):
 			import cProfile
 			outfn = os.getenv("PROFILE_LOG", "profile.log") + '.' + str(os.getpid())
 			cProfile.runctx("server.serve_forever()", globals(), locals(), outfn)
