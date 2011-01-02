@@ -34,54 +34,98 @@ BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 2**40
 logger = logging.getLogger('mrp2p')
 
 if False:
-	# Verbose wrappers for debugging
-	class Event(threading._Event):
-		def __init__(self, name, verbose=None):
-			self.__name = name
-			threading._Event.__init__(self, verbose)
+	if True:
+		class RLock(threading._RLock):
+			def __init__(self, name):
+				self.__name = name
+				self.__t = 0.
+				threading._RLock.__init__(self)
+
+			def acquire(self):
+				if not self._is_owned():
+					self.__t0 = time.time()
+				threading._RLock.acquire(self)
+
+			__enter__ = acquire
+
+			def release(self):
+				threading._RLock.release(self)
+				if not self._is_owned():
+					self.__t += time.time() - self.__t0
+
+			def __del__(self):
+				logger.info("RLock timing: %s, %.4f" % (self.__name, self.__t))
+
+		class Event(threading._Event):
+			def __init__(self, name, verbose=None):
+				self.__name = name
+				self.__t = 0
+				threading._Event.__init__(self, verbose)
 	
-		def __str__(self):
-			return "Event %s" % self.__name
+			def __str__(self):
+				return "Event %s" % self.__name
+
+			def wait(self, timeout=None):
+				ct = threading.current_thread()
+
+				t0 = time.time()
+				threading._Event.wait(self, timeout)
+				self.__t += time.time() - t0
+
+#			def __del__(self):
+#				logger.info("Event wait timing: %s, %.4f" % (self.__name, self.__t))
+
+	else:
+		# Verbose wrappers for debugging
+		class Event(threading._Event):
+			def __init__(self, name, verbose=None):
+				self.__name = name
+				threading._Event.__init__(self, verbose)
 	
-		def wait(self, timeout=None):
-			ct = threading.current_thread()
+			def __str__(self):
+				return "Event %s" % self.__name
 	
-			#logger.debug("[%s] Waiting on %s" % (self, ct))
-			while not threading._Event.wait(self, 60):
-				logger.debug("[%s] EVENT EXPIRED ON %s" % (self, ct))
+			def wait(self, timeout=None):
+				ct = threading.current_thread()
 	
-	class RLock(threading._RLock):
-		def acquire(self):
-			new = not self._is_owned()
-			ct = threading.current_thread()
+				#logger.debug("[%s] Waiting on %s" % (self, ct))
+				while not threading._Event.wait(self, 60):
+					logger.debug("[%s] EVENT EXPIRED ON %s" % (self, ct))
+
+		class RLock(threading._RLock):
+			def acquire(self):
+				new = not self._is_owned()
+				ct = threading.current_thread()
 	
-			#if new:
-			#	logger.debug("[%s] Acquiring for %s" % (self, ct))
+				#if new:
+				#	logger.debug("[%s] Acquiring for %s" % (self, ct))
 	
-			succ = False
-			while not succ:
-				for retry in xrange(10):
-					if threading._RLock.acquire(self, blocking=False):
-						succ = True
-						break
-					time.sleep(.1)
-				#	logger.debug("[%s] Acquiring for %s (attempt %d)." % (self, ct, retry))
-				else:
-					logger.debug("[%s] DEADLOCKED IN THREAD %s." % (self, ct))
+				succ = False
+				while not succ:
+					for retry in xrange(10):
+						if threading._RLock.acquire(self, blocking=False):
+							succ = True
+							break
+						time.sleep(.1)
+					#	logger.debug("[%s] Acquiring for %s (attempt %d)." % (self, ct, retry))
+					else:
+						logger.debug("[%s] DEADLOCKED IN THREAD %s." % (self, ct))
 			
-			#if new:
-			#	logger.debug("[%s] Acquired in %s." % (self, ct))
+				#if new:
+				#	logger.debug("[%s] Acquired in %s." % (self, ct))
 	
-		__enter__ = acquire
+			__enter__ = acquire
 	
-		def release(self):
-			ret = threading._RLock.release(self)
-			ct = threading.current_thread()
-			#if not self._is_owned():
-			#	logger.debug("[%s] Releasing on %s" % (self, ct))
-			return ret
+			def release(self):
+				ret = threading._RLock.release(self)
+				ct = threading.current_thread()
+				#if not self._is_owned():
+				#	logger.debug("[%s] Releasing on %s" % (self, ct))
+				return ret
 else:
-	RLock = threading.RLock
+	def RLock(name):
+		return threading.RLock()
+
 	def Event(name):
 		return threading.Event()
 
@@ -298,7 +342,7 @@ class AsyncoreLoopChannel(AsyncoreLogErrorMixIn, asyncore.file_dispatcher):
 	lock = None		# A lock protecting all member variables
 
 	def __init__(self, map):
-		self.lock = RLock()
+		self.lock = RLock("AsyncoreLoopChannel")
 		self.callbacks = []
 
 		# Note: r_fd is os.dup()-ed by file_dispatcher
@@ -388,6 +432,8 @@ class Worker(object):
 			serving_stages = None	# The set of stages for which we've sent out keys.
 			asyncore_map = None		# asyncore thread map
 
+			gatherer = None
+
 			def _html_(self):
 				info = "mm.tell()={mmtell}, mm_at={mm_at}, mm_end={mm_end}, stages={serving_stages}" \
 					.format(mmtell=self.mm.tell(), **dirdict(self))
@@ -405,7 +451,7 @@ class Worker(object):
 					self.serving_stages.remove(stage);
 					return len(self.serving_stages)
 
-			def __init__(self, host, port, map):
+			def __init__(self, host, port, map, localgs):
 				# Constructor: this gets called from the Worker's thread,
 				# but we don't initialize the socket or connect to the destination
 				# here, but do it from the asyncore thread (see delayed_init())
@@ -414,8 +460,11 @@ class Worker(object):
 
 				self.mm = _make_buffer_mmap(self.bufsize)
 
-				self.lock = RLock()
-				
+				self.lock = RLock("ScatterChannel")
+
+				if localgs is not None:
+					self.gatherer, self.scatterer = localgs
+
 				self.serving_stages = set()
 
 			def delayed_init(self, map):
@@ -470,24 +519,35 @@ class Worker(object):
 						self.mm.resize(self.bufsize)
 						logger.debug("Compactification completed")
 
+			def _queue_direct(self, stage, k, v):
+				# Don't go through the socket for local writes
+				if k != AckDoneSentinel:
+					pkl_value = cPickle.dumps(v, -1)
+					self.gatherer.append(stage, k, pkl_value)
+				else:
+					self.scatterer.ack_done_producing(stage)
+
 			def queue(self, stage, k, v):
 				# Runs from within a worker thread
 				#logger.debug("Scattering to stage=%s key=%s, val=%s" % (stage, k, v))
-				with self.lock:
-					# Serialize the key/value
-					pkt_beg_offs = self.mm.tell()
-					self.mm.seek(8, 1)				# 1. [ int64] Payload length (placeholder, filled in 5.)
+				if self.gatherer is not None:
+					self._queue_direct(stage, k, v)
+				else:
+					with self.lock:
+						# Serialize the key/value
+						pkt_beg_offs = self.mm.tell()
+						self.mm.seek(8, 1)				# 1. [ int64] Payload length (placeholder, filled in 5.)
 
-					payload_beg_offs = self.mm.tell()
-					self.mm.write(struct.pack('<I', stage))		# 2. [uint32] Stage
+						payload_beg_offs = self.mm.tell()
+						self.mm.write(struct.pack('<I', stage))		# 2. [uint32] Stage
 
-					cPickle.dump(k, self.mm, -1)			# 3. [pickle] Key
-					cPickle.dump(v, self.mm, -1)			# 4. [pickle] Value
+						cPickle.dump(k, self.mm, -1)			# 3. [pickle] Key
+						cPickle.dump(v, self.mm, -1)			# 4. [pickle] Value
 
-					self.mm[pkt_beg_offs:pkt_beg_offs+8] = \
-						struct.pack('<Q', self.mm.tell() - payload_beg_offs)	# 5. Fill in the length
+						self.mm[pkt_beg_offs:pkt_beg_offs+8] = \
+							struct.pack('<Q', self.mm.tell() - payload_beg_offs)	# 5. Fill in the length
 
-					self.serving_stages.add(stage)			# Remember we've sent out a key for this stage
+				self.serving_stages.add(stage)			# Remember we've sent out a key for this stage
 
 		### Scatterer ##################3
 		parent = None		# Parent Worker instance
@@ -540,7 +600,7 @@ class Worker(object):
 			self.waiting_ack = {}
 			self.coordinator = xmlrpclib.ServerProxy(curl)
 
-			self.lock = RLock()
+			self.lock = RLock("Scatterer")
 
 			self.destinations = {}			# (host, port) -> ScatterChannel map
 			self.key_destinations = {}		# (stage, keyhash) -> ScatterChannel map
@@ -694,9 +754,15 @@ class Worker(object):
 					wurl = self.known_destinations[stage][keyhash]
 					(host, port) = xmlrpclib.ServerProxy(wurl).get_gatherer_addr()
 
+					if self.parent.get_gatherer_addr() == (host, port):
+						localgs = (self.parent.gatherer, self)
+						logger.info("The destination is local.")
+					else:
+						localgs = None
+
 					if (host, port) not in self.destinations:
 						# Open a new channel
-						sc = self.ScattererChannel(host, port, self.asyncore_map)
+						sc = self.ScattererChannel(host, port, self.asyncore_map, localgs)
 						self.pending_channels.append(sc)
 						self.destinations[(host, port)] = sc
 					else:
@@ -815,7 +881,7 @@ class Worker(object):
 				return info
 
 			def __init__(self, size):
-				self.lock = RLock()
+				self.lock = RLock("Buffer")
 				self.new_key_evt = Event("new_key_evt")
 
 				self.chains = {}
@@ -855,6 +921,10 @@ class Worker(object):
 
 					# Update the 'last' field in the self.chains dict
 					self.chains[key] = self.chains[key][0], mm.tell() - 8
+					
+					#logger.info("at=%s, last_written=%s" % (mm.tell(), len(pkl_value)))
+					#if len(pkl_value) > 30000:
+					#	logger.info(cPickle.loads(pkl_value))
 
 					# If this is a new chain, link to it from the primary chain
 					# .. unless this is the initialization of the primary chain
@@ -1040,7 +1110,7 @@ class Worker(object):
 			self.parent = parent
 			self.asyncore_map = map
 
-			self.lock = RLock()
+			self.lock = RLock("Gatherer")
 			self.buffers = {}
 
 			# Set up the async server: open a socket to listen on
@@ -1083,7 +1153,7 @@ class Worker(object):
 			# Called by the worker thread to signal it's done
 			# processing the data in this stage, and that it can
 			# be safely discarded.
-			logger.debug("Discarding buffer for stage=%s" % (stage,))
+			logger.info("Discarding buffer for stage=%s" % (stage,))
 			del self.buffers[stage]
 
 		def append(self, stage, key, pkl_value):
@@ -1181,7 +1251,7 @@ class Worker(object):
 
 		self.running_stage_threads = defaultdict(int)
 		self.maxpeers = dict()
-		self.lock      = RLock()
+		self.lock      = RLock("Worker")
 
 		# Time when we launched
 		self.t_started = datetime.datetime.now()
@@ -1215,7 +1285,7 @@ class Worker(object):
 		else:
 			items = cPickle.load(fp)
 			for item in items:
-				self.gatherer.append(-1, 0, cPickle.dumps(item))
+				self.gatherer.append(-1, 0, cPickle.dumps(item, -1))
 		self.stage_ended(-2)
 	
 	def ack_done_producing(self, stage):
@@ -1287,7 +1357,9 @@ class Worker(object):
 					# the keys before passing the values to the mapper
 					def K(kv, args, K_fun, K_args):
 						_, v = kv
-						return K_fun(v, *K_args)
+						for val in v:
+							for res in K_fun(val, *K_args):
+								yield res
 					K_fun, K_args = K, (args, K_fun, K_args)
 
 				if stage == len(self.kernels)-1:
@@ -1448,7 +1520,7 @@ class Peer:
 			return info
 
 		def __init__(self, server, hostname, parent_url, id, spec, data):
-			self.lock    = RLock()
+			self.lock    = RLock("Coordinator")
 
 			self.pserver = xmlrpclib.ServerProxy(parent_url)
 			self.purl    = parent_url
@@ -1689,7 +1761,7 @@ class Peer:
 		self.workers = {}
 
 		# Global Peer Lock
-		self.lock = RLock()
+		self.lock = RLock("Peer")
 
 		# Time when we launched
 		self.t_started = datetime.datetime.now()
@@ -1771,7 +1843,7 @@ class Peer:
 			coordinator = self.coordinators[task_id] = self._Coordinator(server, self.hostname, self.url, task_id, spec, data)
 			server.register_instance(coordinator)
 			server.register_introspection_functions()
-			th = Thread(name='Coord-%03d' % (self.coordinator_ctr-1,), target=server.serve_forever)
+			th = Thread(name='Coord-%03d' % (self.coordinator_ctr-1,), target=server.serve_forever, kwargs={'poll_interval': 0.1})
 			th.daemon = True
 			th.start()
 

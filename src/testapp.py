@@ -3,16 +3,16 @@
 import numpy as np
 import sys
 import mrp2p.peer
+import lsd.pool2
 
 class MyClass(object):
 	nada = "aaa"
 	pass
 
-def mapper(values):
-	for v in values:
-		my = MyClass()
-		my.ct = 1
-		yield v % 512, (my, 0)
+def mapper(v):
+	my = MyClass()
+	my.ct = 1
+	yield v % 512, (my, 1)
 
 def reducer1(kv):
 	k, v = kv
@@ -24,10 +24,13 @@ def reducer(kv):
 	yield k, sum(v)
 
 if __name__ == "__main__":
-	v = np.arange(4*2**10)
+	v = np.arange(128*2**10)
 
 	# Parallel
-	pool = mrp2p.peer.Pool('peers')
+	if True:
+		pool = mrp2p.peer.Pool('peers')
+	else:
+		pool = lsd.pool2.Pool()
 	res1 = []
 	for res in pool.map_reduce_chain(v, [mapper, reducer1, reducer]):
 		print >>sys.stderr, "Result: ", res
