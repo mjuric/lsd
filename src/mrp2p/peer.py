@@ -24,6 +24,7 @@ import platform
 from base64 import b64encode, b64decode
 from collections import defaultdict
 import traceback
+import weakref
 
 import core
 
@@ -33,7 +34,7 @@ BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 2**40
 
 logger = logging.getLogger('mrp2p')
 
-if True:
+if False:
 	if True:
 		class RLock(threading._RLock):
 			def __init__(self, name):
@@ -130,6 +131,9 @@ else:
 
 	def Event(name):
 		return threading.Event()
+
+	def Lock(name):
+		return threading.Lock()
 
 if os.getenv("PROFILE", 0):
 	import cProfile
@@ -809,9 +813,12 @@ class Worker(object):
 			parent = None	# Parent Gatherer
 			buf = None	# cStringIO instance where we buffer the incoming packet, until it's complete
 
+			buffer_cache = None	# WeakValueDictionary to Buffers (to avoid locking the parent when fetching one)
+
 			def __init__(self, parent, sock, map):
 				self.parent = parent
 				self.buf = cStringIO.StringIO()
+				self.buffer_cache = weakref.WeakValueDictionary()
 
 				asyncore.dispatcher_with_send.__init__(self, sock, map=map)
 
@@ -864,7 +871,12 @@ class Worker(object):
 						(wurl, stage) = cPickle.loads(pkl_value)
 						xmlrpclib.ServerProxy(wurl).ack_done_producing(stage)
 					else:
-						self.parent.append(stage, key, pkl_value)
+						# Commit to the apropriate stage Buffer
+						try:
+							buffer = self.buffer_cache[stage]
+						except KeyError:
+							buffer = self.buffer_cache[stage] = self.parent.get_or_create_buffer(stage)
+						buffer.append(stage, key, pkl_value)
 
 				# Keep only the unread bits
 				s = buf.read()
@@ -885,13 +897,8 @@ class Worker(object):
 			all_recvd = False	# True if the stage _before_ the one this Buffer is buffering
 						# has ended (i.e., no more key/values are to be received).
 
-			def _html_(self):
-				info = "mm.tell()={mmtell}, next_key={next_key}, all_recvd={all_recvd}" \
-					.format(mmtell=self.mm.tell(), **dirdict(self))
-				return info
-
 			def __init__(self, size):
-				self.lock = RLock("Buffer")
+				self.lock = Lock("Buffer")
 				self.new_key_evt = Event("new_key_evt")
 
 				self.chains = {}
@@ -903,50 +910,54 @@ class Worker(object):
 				self.append(KeyChainSentinel, cPickle.dumps((KeyChainSentinel, 0), -1))
 				self.next_key = self.chains[KeyChainSentinel][1]
 
+			def _html_(self):
+				info = "mm.tell()={mmtell}, next_key={next_key}, all_recvd={all_recvd}" \
+					.format(mmtell=self.mm.tell(), **dirdict(self))
+				return info
+
 			def append(self, key, pkl_value):
+				with self.lock:
+					return self._append(key, pkl_value)
+
+			def _append(self, key, pkl_value):
 				# Append the pickled value to the chain of values
 				# for key 'key'
 
-				with self.lock:
-					# Find/create the chain for the key, append pickled value
-					mm = self.mm
+				# Find/create the chain for the key, append pickled value
+				mm = self.mm
 
-					try:
-						# Find the value chain of this key
-						last = self.chains[key][1]
+				try:
+					# Find the value chain of this key
+					last = self.chains[key][1]
 
-						# Store the offset to the next link in the chain
-						mm[last:last+8] = struct.pack('<Q', mm.tell() - (last+8))
-						new_key = False
-					except KeyError:
-						# This is a new value chain.
-						new_key = True
-						self.chains[key] = (mm.tell(), 0)
+					# Store the offset to the next link in the chain
+					mm[last:last+8] = struct.pack('<Q', mm.tell() - (last+8))
+					new_key = False
+				except KeyError:
+					# This is a new value chain.
+					new_key = True
+					self.chains[key] = (mm.tell(), 0)
 
-					# Add a link to the chain
-					#logger.debug("key=%s, offset=%s, value=%s" % (key, mm.tell(), cPickle.loads(pkl_value)))
-					mm.write(struct.pack('<Q', len(pkl_value)))	# 1) Length of the data (uint64)
-					mm.write(pkl_value)				# 2) The data (pickled)
-					mm.write('\xff'*8)				# 3) Offset to next item in chain (or 0xFFFFFFFFFFFFFFFF, if end-of-chain)
+				# Add a link to the chain
+				#logger.debug("key=%s, offset=%s, value=%s" % (key, mm.tell(), cPickle.loads(pkl_value)))
+				mm.write(struct.pack('<Q', len(pkl_value)))	# 1) Length of the data (uint64)
+				mm.write(pkl_value)				# 2) The data (pickled)
+				mm.write('\xff'*8)				# 3) Offset to next item in chain (or 0xFFFFFFFFFFFFFFFF, if end-of-chain)
 
-					# Update the 'last' field in the self.chains dict
-					self.chains[key] = self.chains[key][0], mm.tell() - 8
-					
-					#logger.info("at=%s, last_written=%s" % (mm.tell(), len(pkl_value)))
-					#if len(pkl_value) > 30000:
-					#	logger.info(cPickle.loads(pkl_value))
+				# Update the 'last' field in the self.chains dict
+				self.chains[key] = self.chains[key][0], mm.tell() - 8
 
-					# If this is a new chain, link to it from the primary chain
-					# .. unless this is the initialization of the primary chain
-					if new_key and key is not KeyChainSentinel:
-						self.append(KeyChainSentinel, cPickle.dumps((key, self.chains[key][0]), -1))
+				# If this is a new chain, link to it from the primary chain
+				# .. unless this is the initialization of the primary chain
+				if new_key and key is not KeyChainSentinel:
+					self._append(KeyChainSentinel, cPickle.dumps((key, self.chains[key][0]), -1))
 
-						# Notify listener (Buffer.itervalues instances) that new keys are available
-						self.new_key_evt.set()
+					# Notify listener (Buffer.itervalues instances) that new keys are available
+					self.new_key_evt.set()
 
-					if key in self.new_value_evts:
-						# Notify the active iterator that a new value was added
-						self.new_value_evts[key].set()
+				if key in self.new_value_evts:
+					# Notify the active iterator that a new value was added
+					self.new_value_evts[key].set()
 
 			def iter_chain(self, key, first, last):
 				"""
@@ -980,7 +991,7 @@ class Worker(object):
 						offs, = struct.unpack('<Q', self.mm[at:at+8])
 						at += offs + 8
 
-			def itervalues(self, key, kevt, at):
+			def itervalues(self, key, at):
 				"""
 				A blocking generator yielding values associated with 'key' until
 				self.all_recvd is set.
@@ -989,6 +1000,7 @@ class Worker(object):
 				at offset 'at'. When no more values are available, the generator
 				blocks until new values become available (and is signaled via kevt).
 				"""
+				kevt = None
 				while True:
 					with self.lock:
 						_, last = self.chains[key]
@@ -1003,12 +1015,20 @@ class Worker(object):
 							# See if more data showed up in the meantime.
 							offs, = struct.unpack('<Q', self.mm[last:last+8])
 							all_recvd = self.all_recvd
-							kevt.clear()
+							if kevt is not None:
+								kevt.clear()
 
 						if offs == 0xFFFFFFFFFFFFFFFF:
 							# No data currently available
 							if all_recvd:
 								return
+
+							if kevt is None:
+								# Create an Event that will get triggered when new data becomes
+								# available for the key.
+								with self.lock:
+									kevt = self.new_value_evts[key] = Event("new_value_evt[%s]" % key)
+
 							kevt.wait()
 						else:
 							# More data available
@@ -1032,7 +1052,9 @@ class Worker(object):
 						# TODO: A cleaner implementation would pack this into a separate
 						#       object, that would yield iteritems() iterators.
 						nextoffs, = struct.unpack('<Q', self.mm[self.next_key:self.next_key+8])
-						self.new_key_evt.clear()
+
+						if self.new_key_evt.is_set():
+							self.new_key_evt.clear()
 
 						if nextoffs != 0xFFFFFFFFFFFFFFFF:
 							# Load the key
@@ -1045,27 +1067,22 @@ class Worker(object):
 							finally:
 								self.mm.seek(at0)
 
-							# Mark this key as active, and create an Event for it
-							# that will get triggered every time new data becomes
-							# available for the key.
-							kevt = self.new_value_evts[key] = Event("new_value_evt[%s]" % key)
-							kevt.set()
-
 							# Create the generator of values from this key chain
-							value_gen = self.itervalues(key, kevt, first)
+							value_gen = self.itervalues(key, first)
 						else:
 							# Check if this stage was marked as done, exit if so
 							if self.all_recvd:
 								return
 
-					# Note: we're doing this outside the locked section
+					# Note: we're doing this outside of the locked section
 					if value_gen is not None:
 						try:
 							yield key, value_gen
 						finally:
-							# Remove the event
+							# Cleanup
 							with self.lock:
-								del self.new_value_evts[key]
+								if key in self.new_value_evts:
+									del self.new_value_evts[key]
 					else:
 						# No keys to work on. Sleep waiting for a new one to be added.
 						self.new_key_evt.wait()
@@ -1083,14 +1100,36 @@ class Worker(object):
 					for evt in self.new_value_evts.itervalues():
 						evt.set()
 
+		## Gatherer #######################################################3
 		parent = None		# Worker instance
 		asyncore_map = None	# asyncore map that Gatherer participates in
 
-		buffers = {}		# A dictionary of Buffer instances, keyed by stage
 		port = None		# The port we're listening on for incoming Scatterer connections
 		bufsize = BUFSIZE	# Buffer size (per stage)
 
-		lock = None		# RLock guarding the buffers variable
+		buffers = {}		# A dictionary of Buffer instances, keyed by stage
+		lock = None		# Lock guarding the buffers variable
+
+		def __init__(self, parent, curl, map):
+			self.parent = parent
+			self.asyncore_map = map
+
+			self.lock = Lock("Gatherer")
+			self.buffers = {}
+
+			# Set up the async server: open a socket to listen on
+			# and store the port in self.port
+			asyncore.dispatcher_with_send.__init__(self, map=map)
+			self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+			for port in xrange(parent.port, 2**16):
+				try:
+					self.bind(("", port))
+					self.port = port
+					break
+				except socket.error:
+					pass
+
+			self.listen(100)
 
 		def _html_(self):
 			with self.lock:
@@ -1116,38 +1155,22 @@ class Worker(object):
 
 			return info
 
-		def __init__(self, parent, curl, map):
-			self.parent = parent
-			self.asyncore_map = map
-
-			self.lock = RLock("Gatherer")
-			self.buffers = {}
-
-			# Set up the async server: open a socket to listen on
-			# and store the port in self.port
-			asyncore.dispatcher_with_send.__init__(self, map=map)
-			self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-			for port in xrange(parent.port, 2**16):
-				try:
-					self.bind(("", port))
-					self.port = port
-					break
-				except socket.error:
-					pass
-
-			self.listen(100)
-
 		def get_or_create_buffer(self, stage):
+			with self.lock:
+				return self._get_or_create_buffer(stage)
+
+		def _get_or_create_buffer(self, stage):
 			"""
 			Return or create a Buffer instance for stage
+			
+			NOT LOCKED
 			"""
-			with self.lock:
-				# Find/create the mmap for the requested stage
-				if stage in self.buffers:
-					buf = self.buffers[stage]
-				else:
-					#logger.debug("Creating buffer for stage=%d" % stage)
-					buf = self.buffers[stage] = self.Buffer(self.bufsize)
+			# Find/create the mmap for the requested stage
+			if stage in self.buffers:
+				buf = self.buffers[stage]
+			else:
+				#logger.debug("Creating buffer for stage=%d" % stage)
+				buf = self.buffers[stage] = self.Buffer(self.bufsize)
 
 			return buf
 
@@ -1157,27 +1180,34 @@ class Worker(object):
 			for each key in stage 'stage'. See the documentation of
 			Buffer.iteritems() for more info.
 			"""
-			return self.get_or_create_buffer(stage).iteritems()
+			with self.lock:
+				return self._get_or_create_buffer(stage).iteritems()
 
 		def worker_done_with_stage(self, stage):
 			# Called by the worker thread to signal it's done
 			# processing the data in this stage, and that it can
 			# be safely discarded.
 			logger.info("Discarding buffer for stage=%s" % (stage,))
-			del self.buffers[stage]
+			with self.lock:
+				del self.buffers[stage]
 
 		def append(self, stage, key, pkl_value):
 			"""
 			Store a (key, pkl_value) pair into the buffer for
 			the selected stage.
 			"""
-			return self.get_or_create_buffer(stage).append(key, pkl_value)
+			with self.lock:
+				buffer = self._get_or_create_buffer(stage)
+
+			return buffer.append(key, pkl_value)
 
 		def stage_ended(self, stage):
 			# Notification from the coordinator that a particular
 			# stage has ended. That means that all buffers one stage
 			# later should expect no more data.
-			self.buffers[stage+1].all_received()
+			with self.lock:
+				buffer = self.buffers[stage+1]
+			return buffer.all_received()
 
 		def handle_accept(self):
 			# Accept a new connection to this Gatherer (presumably
