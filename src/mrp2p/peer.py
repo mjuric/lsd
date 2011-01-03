@@ -34,8 +34,39 @@ BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 2**40
 
 logger = logging.getLogger('mrp2p')
 
-if False:
+def RLock(name):
+	return threading.RLock()
+
+def Event(name):
+	return threading.Event()
+
+def Lock(name):
+	return threading.Lock()
+
+if True:
 	if True:
+		class Lock(object):
+			def __init__(self, name):
+				self.__name = name
+				self.__t = 0.
+				self.__n = 0
+				self.lock = threading.Lock()
+
+			def acquire(self):
+				self.__t0 = time.time()
+				self.lock.acquire()
+				self.__n += 1
+
+			def release(self, *dummy):
+				self.lock.release()
+				self.__t += time.time() - self.__t0
+
+			__enter__ = acquire
+			__exit__ = release
+
+			def __del__(self):
+				logger.info("Lock timing: %s, %.4f, n=%d" % (self.__name, self.__t, self.__n))
+
 		class RLock(threading._RLock):
 			def __init__(self, name):
 				self.__name = name
@@ -63,20 +94,20 @@ if False:
 			def __init__(self, name, verbose=None):
 				self.__name = name
 				self.__t = 0
+				self.__n = 0
 				threading._Event.__init__(self, verbose)
 	
 			def __str__(self):
 				return "Event %s" % self.__name
 
 			def wait(self, timeout=None):
-				ct = threading.current_thread()
-
 				t0 = time.time()
 				threading._Event.wait(self, timeout)
 				self.__t += time.time() - t0
+				self.__n += 1
 
-#			def __del__(self):
-#				logger.info("Event wait timing: %s, %.4f" % (self.__name, self.__t))
+			def __del__(self):
+				logger.info("Event wait timing: %s, %.4f, n=%d" % (self.__name, self.__t, self.__n))
 
 	else:
 		# Verbose wrappers for debugging
@@ -125,15 +156,6 @@ if False:
 				#if not self._is_owned():
 				#	logger.debug("[%s] Releasing on %s" % (self, ct))
 				return ret
-else:
-	def RLock(name):
-		return threading.RLock()
-
-	def Event(name):
-		return threading.Event()
-
-	def Lock(name):
-		return threading.Lock()
 
 if os.getenv("PROFILE", 0):
 	import cProfile
@@ -876,7 +898,7 @@ class Worker(object):
 							buffer = self.buffer_cache[stage]
 						except KeyError:
 							buffer = self.buffer_cache[stage] = self.parent.get_or_create_buffer(stage)
-						buffer.append(stage, key, pkl_value)
+						buffer.append(key, pkl_value)
 
 				# Keep only the unread bits
 				s = buf.read()
@@ -892,13 +914,17 @@ class Worker(object):
 			next_key = None		# see iteritems() for discussion of this variable
 
 			new_key_evt = None	# Event that is set once new keys become available
-			new_value_evts = None	# dict: key -> Event() which becomes set once new
+			new_value_evts = None	# dict: key -> (Event(), size) which becomes set once new
 						# values are available for the given key
 			all_recvd = False	# True if the stage _before_ the one this Buffer is buffering
 						# has ended (i.e., no more key/values are to be received).
 
-			def __init__(self, size):
-				self.lock = Lock("Buffer")
+			vtresh = 0; #2**20	# The size of data in bytes that we'll wait to get buffered before
+							# we trigger a new_value_evts[key] event and let the _worker know
+							# more is available (performance optimization)
+
+			def __init__(self, size, stage):
+				self.lock = Lock("Buffer(stage=%s)" % stage)
 				self.new_key_evt = Event("new_key_evt")
 
 				self.chains = {}
@@ -911,8 +937,9 @@ class Worker(object):
 				self.next_key = self.chains[KeyChainSentinel][1]
 
 			def _html_(self):
-				info = "mm.tell()={mmtell}, next_key={next_key}, all_recvd={all_recvd}" \
-					.format(mmtell=self.mm.tell(), **dirdict(self))
+				with self.lock:
+					info = "mm.tell()={mmtell}, next_key={next_key}, all_recvd={all_recvd}" \
+						.format(mmtell=self.mm.tell(), **dirdict(self))
 				return info
 
 			def append(self, key, pkl_value):
@@ -956,42 +983,50 @@ class Worker(object):
 					self.new_key_evt.set()
 
 				if key in self.new_value_evts:
-					# Notify the active iterator that a new value was added
-					self.new_value_evts[key].set()
+					# Notify the active iterator that new values are available, if we
+					# collected a reasonable quantity of those. Some buffering here should
+					# help improve performance
+					evt, size = self.new_value_evts[key]
+					if size >= self.vtresh:
+						#logger.info("Got key=%s val=%s" % (key, cPickle.loads(pkl_value)))
+						evt.set()
+						size = 0
+					else:
+						# Update collected size
+						size += len(pkl_value)
+					self.new_value_evts[key] = evt, size
 
-			def iter_chain(self, key, first, last):
+			def iterate_chain_piece(self, key, first, last):
 				"""
-				A generator traversing a key chain from [first, last)
+				A generator traversing a chain or values from [first, last)
+				without locking.
 
 				first is the offset in self.mm where the [len] field of the
-				first packet to be read is. last is the offset to the [offset-to-next]
-				field of the last packet to be read.
+				first packet to be read is.
+				last is the offset to the [offset-to-next] field of the last
+				packet to be read.
+
+				The caller must ensure there's valid data between (first, last)
+				and that the data does not change while this generator exists.
 				"""
 				at = first
 				while True:
 					len, = struct.unpack('<Q', self.mm[at:at+8])
-
-					with self.lock:
-						at0 = self.mm.tell()
-						try:
-							self.mm.seek(at+8)
-							v = cPickle.load(self.mm)
-							at = self.mm.tell()
-						finally:
-							self.mm.seek(at0)
+					at += 8
+					v = cPickle.loads(self.mm[at:at+len])
+					at += len
 
 					yield v
 
+					# Reached the end of chain?
 					if at == last:
-						# Reached the end of chain
 						break
 
-					with self.lock:
-						# Load the position of the next packet
-						offs, = struct.unpack('<Q', self.mm[at:at+8])
-						at += offs + 8
+					# Load the position of the next packet
+					offs, = struct.unpack('<Q', self.mm[at:at+8])
+					at += offs + 8
 
-			def itervalues(self, key, at):
+			def itervalues(self, key, at, last, all_recvd = False):
 				"""
 				A blocking generator yielding values associated with 'key' until
 				self.all_recvd is set.
@@ -1000,45 +1035,60 @@ class Worker(object):
 				at offset 'at'. When no more values are available, the generator
 				blocks until new values become available (and is signaled via kevt).
 				"""
-				kevt = None
-				while True:
-					with self.lock:
-						_, last = self.chains[key]
-
-					# yield the available values
-					for v in self.iter_chain(key, at, last):
-						#logger.debug("Consuming %s" % (v,))
-						yield v
-
+				val_evt = None
+				try:
 					while True:
-						with self.lock:
-							# See if more data showed up in the meantime.
-							offs, = struct.unpack('<Q', self.mm[last:last+8])
-							all_recvd = self.all_recvd
-							if kevt is not None:
-								kevt.clear()
+						# yield the available values
+						for v in self.iterate_chain_piece(key, at, last):
+							#logger.debug("Consuming %s" % (v,))
+							yield v
 
-						if offs == 0xFFFFFFFFFFFFFFFF:
-							# No data currently available
-							if all_recvd:
-								return
-
-							if kevt is None:
-								# Create an Event that will get triggered when new data becomes
-								# available for the key.
-								with self.lock:
-									kevt = self.new_value_evts[key] = Event("new_value_evt[%s]" % key)
-
-							kevt.wait()
-						else:
-							# More data available
-							at = last + 8 + offs
+						# If we already know this stage has ended, no need to
+						# enter the lock to check (this is a common case, as
+						# usually there are more keys than reducers and we'll
+						# usually only have to wait on the first key)
+						if all_recvd:
 							break
+
+						while True:
+							with self.lock:
+								# See if more data showed up in the meantime.
+								_, new_last = self.chains[key]
+								offs, = struct.unpack('<Q', self.mm[last:last+8])
+								all_recvd = self.all_recvd
+								if val_evt is not None:
+									val_evt.clear()
+
+							# No data currently available ?
+							if offs == 0xFFFFFFFFFFFFFFFF:
+								# All done?
+								if all_recvd:
+									raise StopIteration()
+
+								# Wait for more
+								if val_evt is None:
+									val_evt = Event("new_value_evt[%s]" % key)
+									with self.lock:
+										# Register so that append() and all_received() trip us
+										self.new_value_evts[key] = val_evt, 0
+								#logger.info("Here")
+								val_evt.wait()
+								logger.info("Woken up key=%s" % key)
+							else:
+								# More data is available
+								at = last + 8 + offs
+								last = new_last
+								break
+				except StopIteration:
+					pass
+				finally:
+					if val_evt is not None:
+						with self.lock:
+							del self.new_value_evts[key]
 
 			def iteritems(self):
 				# Find keys not yet being processed, and yield
 				# generators that will yield values for those keys
-
 				while True:
 					value_gen = None
 
@@ -1053,9 +1103,6 @@ class Worker(object):
 						#       object, that would yield iteritems() iterators.
 						nextoffs, = struct.unpack('<Q', self.mm[self.next_key:self.next_key+8])
 
-						if self.new_key_evt.is_set():
-							self.new_key_evt.clear()
-
 						if nextoffs != 0xFFFFFFFFFFFFFFFF:
 							# Load the key
 							pos = self.next_key + nextoffs + 8 + 8	# Skip the [len] field
@@ -1068,7 +1115,8 @@ class Worker(object):
 								self.mm.seek(at0)
 
 							# Create the generator of values from this key chain
-							value_gen = self.itervalues(key, first)
+							_, last = self.chains[key]
+							value_gen = self.itervalues(key, first, last, self.all_recvd)
 						else:
 							# Check if this stage was marked as done, exit if so
 							if self.all_recvd:
@@ -1076,28 +1124,23 @@ class Worker(object):
 
 					# Note: we're doing this outside of the locked section
 					if value_gen is not None:
-						try:
-							yield key, value_gen
-						finally:
-							# Cleanup
-							with self.lock:
-								if key in self.new_value_evts:
-									del self.new_value_evts[key]
+						yield key, value_gen
 					else:
 						# No keys to work on. Sleep waiting for a new one to be added.
 						self.new_key_evt.wait()
+						self.new_key_evt.clear()
 
 			def all_received(self):
 				# Expect to receive no more data in this buffer (because
 				# the stage feeding it has ended)
 				with self.lock:
-					assert not self.all_recvd
+					assert not self.all_recvd	# Should not receive this more than once
 					self.all_recvd = True
 
 					# Wake up all threads waiting for new data to let
 					# them know this is it
 					self.new_key_evt.set()
-					for evt in self.new_value_evts.itervalues():
+					for evt, _ in self.new_value_evts.itervalues():
 						evt.set()
 
 		## Gatherer #######################################################3
@@ -1170,7 +1213,7 @@ class Worker(object):
 				buf = self.buffers[stage]
 			else:
 				#logger.debug("Creating buffer for stage=%d" % stage)
-				buf = self.buffers[stage] = self.Buffer(self.bufsize)
+				buf = self.buffers[stage] = self.Buffer(self.bufsize, stage)
 
 			return buf
 
@@ -1195,6 +1238,9 @@ class Worker(object):
 			"""
 			Store a (key, pkl_value) pair into the buffer for
 			the selected stage.
+			
+			Note: GathererChannels bypass this and call append()
+			      directly on Buffers (optimization)
 			"""
 			with self.lock:
 				buffer = self._get_or_create_buffer(stage)
@@ -1207,6 +1253,7 @@ class Worker(object):
 			# later should expect no more data.
 			with self.lock:
 				buffer = self.buffers[stage+1]
+
 			return buffer.all_received()
 
 		def handle_accept(self):
