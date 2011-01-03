@@ -33,18 +33,20 @@ BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 2**40
 
 logger = logging.getLogger('mrp2p')
 
-if False:
+if True:
 	if True:
 		class RLock(threading._RLock):
 			def __init__(self, name):
 				self.__name = name
 				self.__t = 0.
+				self.__n = 0
 				threading._RLock.__init__(self)
 
 			def acquire(self):
 				if not self._is_owned():
 					self.__t0 = time.time()
 				threading._RLock.acquire(self)
+				self.__n += 1
 
 			__enter__ = acquire
 
@@ -54,7 +56,7 @@ if False:
 					self.__t += time.time() - self.__t0
 
 			def __del__(self):
-				logger.info("RLock timing: %s, %.4f" % (self.__name, self.__t))
+				logger.info("RLock timing: %s, %.4f, n=%d" % (self.__name, self.__t, self.__n))
 
 		class Event(threading._Event):
 			def __init__(self, name, verbose=None):
@@ -420,6 +422,7 @@ class Worker(object):
 		class ScattererChannel(AsyncoreLogErrorMixIn, asyncore.dispatcher):
 			bufsize = BUFSIZE 	# buffer size - 1TB (ext3 max. file size is 2TB)
 			ctresh  = 50 * 2**20	# compactification treshold (50M)
+			stresh  = 50*1024**1024	# send treshold (we won't send until this much data has been buffered)
 
 			addr	= None	# (host, port) destination
 
@@ -433,6 +436,8 @@ class Worker(object):
 			asyncore_map = None		# asyncore thread map
 
 			gatherer = None
+			parent = None
+			_force_flush = False
 
 			def _html_(self):
 				info = "mm.tell()={mmtell}, mm_at={mm_at}, mm_end={mm_end}, stages={serving_stages}" \
@@ -494,13 +499,15 @@ class Worker(object):
 							self.mm_at = self.mm_end = 0
 
 				#logger.debug("ScatCh.writable: mm_at=%s mm_end=%s" % (self.mm_at, self.mm_end))
-				return self.mm_at < self.mm_end
+				wrt = self.mm_end - self.mm_at > self.stresh or (self._force_flush and self.mm_end != self.mm_at)
+				#logger.info("mm_at=%s mm_end=%s, wrt = %s" % (self.mm_at, self.mm_end, wrt))
+				return wrt
 
 			def handle_write(self):
 				# Write as much as we can to the destination.
-				#sent = self.send(self.mm[self.mm_at:min(self.mm_at+512, self.mm_end)])
+				#sent = self.send(self.mm[self.mm_at:min(self.mm_at+1024, self.mm_end)])
 				sent = self.send(self.mm[self.mm_at:self.mm_end])
-				#logger.debug("Wrote out at=%s size=%s sent=%s" % (self.mm_at, self.mm_end-self.mm_at, sent))
+				#logger.info("Wrote out at=%s size=%s sent=%s" % (self.mm_at, self.mm_end-self.mm_at, sent))
 				self.mm_at += sent
 
 				# Compactify every time we send >= 50MB
@@ -519,19 +526,22 @@ class Worker(object):
 						self.mm.resize(self.bufsize)
 						logger.debug("Compactification completed")
 
-			def _queue_direct(self, stage, k, v):
-				# Don't go through the socket for local writes
-				if k != AckDoneSentinel:
-					pkl_value = cPickle.dumps(v, -1)
-					self.gatherer.append(stage, k, pkl_value)
-				else:
+			def flush(self, stage, wurl):
+				# Make sure everything has been sent and received
+				if self.gatherer is not None:
 					self.scatterer.ack_done_producing(stage)
+				else:
+					self.queue(stage, AckDoneSentinel, (wurl, stage))
+
+				self._force_flush = True
 
 			def queue(self, stage, k, v):
 				# Runs from within a worker thread
 				#logger.debug("Scattering to stage=%s key=%s, val=%s" % (stage, k, v))
 				if self.gatherer is not None:
-					self._queue_direct(stage, k, v)
+					# Don't go through the socket for local writes
+					pkl_value = cPickle.dumps(v, -1)
+					self.gatherer.append(stage, k, pkl_value)
 				else:
 					with self.lock:
 						# Serialize the key/value
@@ -724,7 +734,7 @@ class Worker(object):
 					# We've emitted data: send requests to endpoints to 
 					# acknowledge receipt.
 					for sc in self.stage_destinations[stage]:
-						sc.queue(stage, AckDoneSentinel, (self.parent.url, stage))
+						sc.flush(stage, self.parent.url)
 
 					# Wake up the asyncore thread
 					self.notify()
