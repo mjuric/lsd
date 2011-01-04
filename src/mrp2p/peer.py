@@ -21,6 +21,7 @@ import tempfile
 import mmap
 import struct
 import platform
+import gc
 from base64 import b64encode, b64decode
 from collections import defaultdict
 import traceback
@@ -128,7 +129,7 @@ if True:
 
 		class RLock(threading._RLock):
 			def acquire(self):
-				new = not self._is_owned()
+				#new = not self._is_owned()
 				ct = threading.current_thread()
 	
 				#if new:
@@ -152,7 +153,7 @@ if True:
 	
 			def release(self):
 				ret = threading._RLock.release(self)
-				ct = threading.current_thread()
+				#ct = threading.current_thread()
 				#if not self._is_owned():
 				#	logger.debug("[%s] Releasing on %s" % (self, ct))
 				return ret
@@ -448,7 +449,7 @@ class Worker(object):
 		class ScattererChannel(AsyncoreLogErrorMixIn, asyncore.dispatcher):
 			bufsize = BUFSIZE 	# buffer size - 1TB (ext3 max. file size is 2TB)
 			ctresh  = 50 * 2**20	# compactification treshold (50M)
-			stresh  = 50*1024**1024	# send treshold (we won't send until this much data has been buffered)
+			stresh  = 50 * 2**20	# send treshold (we won't send until this much data has been buffered)
 
 			addr	= None	# (host, port) destination
 
@@ -461,9 +462,35 @@ class Worker(object):
 			serving_stages = None	# The set of stages for which we've sent out keys.
 			asyncore_map = None		# asyncore thread map
 
-			gatherer = None
-			parent = None
-			_force_flush = False
+			# Variables of relevance only if scattering to self
+			gatherer = None			# Pointer to Gatherer (if scattering to self)
+			scatterer = None		# Pointer to the Scatterer (if scattering to self)
+
+			_force_flush = False	# Set to True if flush() was called
+
+			def __init__(self, host, port, map, localgs):
+				# Constructor: this gets called from the Worker's thread,
+				# but we don't initialize the socket or connect to the destination
+				# here, but do it from the asyncore thread (see delayed_init())
+				self.addr = (host, port)
+				self.asyncore_map = map
+
+				self.mm = _make_buffer_mmap(self.bufsize)
+
+				self.lock = Lock("ScatterChannel")
+
+				if localgs is not None:
+					self.gatherer, self.scatterer = localgs
+
+				self.serving_stages = set()
+
+			def delayed_init(self, map):
+				# The __init__ equivalent called from asyncore's thread
+				# Connects to the destination host:port
+				asyncore.dispatcher.__init__(self, map=self.asyncore_map)
+
+				self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+				self.connect(self.addr)
 
 			def _html_(self):
 				info = "mm.tell()={mmtell}, mm_at={mm_at}, mm_end={mm_end}, stages={serving_stages}" \
@@ -482,35 +509,12 @@ class Worker(object):
 					self.serving_stages.remove(stage);
 					return len(self.serving_stages)
 
-			def __init__(self, host, port, map, localgs):
-				# Constructor: this gets called from the Worker's thread,
-				# but we don't initialize the socket or connect to the destination
-				# here, but do it from the asyncore thread (see delayed_init())
-				self.addr = (host, port)
-				self.asyncore_map = map
-
-				self.mm = _make_buffer_mmap(self.bufsize)
-
-				self.lock = RLock("ScatterChannel")
-
-				if localgs is not None:
-					self.gatherer, self.scatterer = localgs
-
-				self.serving_stages = set()
-
-			def delayed_init(self, map):
-				# The __init__ equivalent called from asyncore's thread
-				# Connects to the destination host:port
-				asyncore.dispatcher.__init__(self, map=self.asyncore_map)
-
-				self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-				self.connect(self.addr)
-
 			def writable(self):
 				# We're writable only if the buffer isn't empty
 				if self.mm_at == self.mm_end:
 					# Check if extra stuff has been added to
 					# the buffer
+					#logger.info("__del__ writable")
 					with self.lock:
 						self.mm_end = self.mm.tell()
 
@@ -526,7 +530,7 @@ class Worker(object):
 
 				#logger.debug("ScatCh.writable: mm_at=%s mm_end=%s" % (self.mm_at, self.mm_end))
 				wrt = self.mm_end - self.mm_at > self.stresh or (self._force_flush and self.mm_end != self.mm_at)
-				#logger.info("mm_at=%s mm_end=%s, wrt = %s" % (self.mm_at, self.mm_end, wrt))
+				#logger.info("__del__ mm_at=%s mm_end=%s, wrt=%s" % (self.mm_at, self.mm_end, wrt))
 				return wrt
 
 			def handle_write(self):
@@ -555,7 +559,10 @@ class Worker(object):
 			def flush(self, stage, wurl):
 				# Make sure everything has been sent and received
 				if self.gatherer is not None:
-					self.scatterer.ack_done_producing(stage)
+					# HACK: This would get called by the gatherer, upon receiving
+					# the sentinel, but we call it here directly, assuming we're
+					# being called by the Scatterer (that has acquired self.lock)
+					self.scatterer._ack_done_producing(stage)
 				else:
 					self.queue(stage, AckDoneSentinel, (wurl, stage))
 
@@ -605,6 +612,16 @@ class Worker(object):
 
 		lock = None		# A lock protecting all member variables
 
+		def _close(self):
+			del self.parent
+			del self.asyncore_map
+			del self.coordinator
+			del self.key_destinations
+			del self.stage_destinations
+			del self.known_destinations
+			logger.info("Deleting Scatterer lock __del__")
+			del self.lock
+
 		def _html_(self):
 			with self.lock:
 				info = """
@@ -636,7 +653,7 @@ class Worker(object):
 			self.waiting_ack = {}
 			self.coordinator = xmlrpclib.ServerProxy(curl)
 
-			self.lock = RLock("Scatterer")
+			self.lock = Lock("Scatterer")
 
 			self.destinations = {}			# (host, port) -> ScatterChannel map
 			self.key_destinations = {}		# (stage, keyhash) -> ScatterChannel map
@@ -651,58 +668,61 @@ class Worker(object):
 			os.close(self.r_fd)
 			os.close(self.w_fd)
 
-		def close_channels(self, scs):
+		def _close_channels(self, scs):
 			# Must be called from asyncore thread
 			#
 			# Close the set of channel scs, and remove them from all of our maps
-			with self.lock:
-				keys = [ k for k, v in self.destinations.iteritems() if v in scs ]
-				for k in keys: del self.destinations[k]
-				
-				keyhashes = [ kh for kh, v in self.key_destinations.iteritems() if v in scs ]
-				for kh in keyhashes: del self.key_destinations[kh]
+			#
+			# NOTE: Does not lock
+			keys = [ k for k, v in self.destinations.iteritems() if v in scs ]
+			for k in keys: del self.destinations[k]
+			
+			keyhashes = [ kh for kh, v in self.key_destinations.iteritems() if v in scs ]
+			for kh in keyhashes: del self.key_destinations[kh]
 
-				# Remove the scs from stage_destinations, and remove any
-				# stage_destinations that are left empty because of it
-				stages = [ k for k, v in self.stage_destinations.iteritems() if len(v & scs) ]
-				for stage in stages:
-					s = self.stage_destinations[stage]
-					s -= scs
-					if len(s) == 0:
-						del self.stage_destinations[stage]
+			# Remove the scs from stage_destinations, and remove any
+			# stage_destinations that are left empty because of it
+			stages = [ k for k, v in self.stage_destinations.iteritems() if len(v & scs) ]
+			for stage in stages:
+				s = self.stage_destinations[stage]
+				s -= scs
+				if len(s) == 0:
+					del self.stage_destinations[stage]
 
-				# Close the Channels (this will close their sockets, remove them from
-				# asyncore map)
-				for sc in scs:
-					logger.debug("Closing channel: %s" % (sc,))
-					sc.close()
+			# Close the Channels (this will close their sockets, remove them from
+			# asyncore map)
+			for sc in scs:
+				logger.debug("Closing channel: %s" % (sc,))
+				sc.close()
 
 		def handle_read(self):
 			# Called from within the asyncore thread when something is
 			# written to w_fd
 			with self.lock:
-				# add any pending channels to the asyncore loop
-				for sc in self.pending_channels:
-					sc.delayed_init(map=self.asyncore_map)
-				del self.pending_channels[:]
-
-				# Find and close any Channels in stages that have finished
-				for stage in self.pending_done:
-					to_close = set()
-					for sc in self.stage_destinations[stage]:
-						#logger.debug("handle_read: %s" % (self.asyncore_map, ))
-						nleft = sc.finish_stage(stage)
-						if nleft == 0:
-							to_close.add(sc)
-					self.close_channels(to_close)
-					del self.pending_done[:]
-
 				# Clear the signal
 				nread = 8192
 				while self.recv(nread) == nread:
 					pass
 
-		def notify(self):
+				# add any pending channels to the asyncore loop
+				if len(self.pending_channels):
+					for sc in self.pending_channels:
+						sc.delayed_init(map=self.asyncore_map)
+					del self.pending_channels[:]
+
+				# Find and close any Channels in stages that have finished
+				if len(self.pending_done):
+					for stage in self.pending_done:
+						to_close = set()
+						for sc in self.stage_destinations[stage]:
+							#logger.debug("handle_read: %s" % (self.asyncore_map, ))
+							nleft = sc.finish_stage(stage)
+							if nleft == 0:
+								to_close.add(sc)
+						self._close_channels(to_close)
+					del self.pending_done[:]
+
+		def _notify(self):
 			# Called from outside the asyncore thread
 			#
 			# Signal to wake up the asyncore thread (to leave
@@ -710,33 +730,32 @@ class Worker(object):
 			# as well as re-check the .writable() property of
 			# all ScatterChannel instances)
 			#
-			# Note: it has to be locked to protect against a
-			#       potential race condition in handle_read().
 			#logger.debug("notify: %s" % (self.asyncore_map,))
-			with self.lock:
-				os.write(self.w_fd, '1')
+			os.write(self.w_fd, '1')
 
 		def ack_done_producing(self, stage):
+			with self.lock:
+				self._ack_done_producing(stage)
+
+		def _ack_done_producing(self, stage):
 			# Called from worker thread when an ack for an
 			# AckDone event is received (see end_stage)
-			with self.lock:
-				self.waiting_ack[stage] -= 1
-				if self.waiting_ack[stage] == 0:
-					# Queue up for cleanup
-					self.pending_done.append(stage)
-					self.notify()
+			self.waiting_ack[stage] -= 1
+			if self.waiting_ack[stage] == 0:
+				# Queue up for cleanup
+				self.pending_done.append(stage)
+				self._notify()
 
-					self.all_acknowledged(stage)
+				self._all_acknowledged(stage)
 
-		def all_acknowledged(self, stage):
+		def _all_acknowledged(self, stage):
 			# Called once all connected endpoints acknowledge
 			# the receipt of our data
-
 			# Notify the Coordinator that this Worker is
 			# completely done with stage=stage-1
-			with self.lock:
-				#logger.debug("All Gatherers ack. receiving data for stage %s" % (stage,))
-				self.coordinator.stage_ended(self.parent.url, stage-1)
+
+			#logger.debug("All Gatherers ack. receiving data for stage %s" % (stage,))
+			self.coordinator.stage_ended(self.parent.url, stage-1)
 
 		def done_producing(self, stage):
 			# Called from worker thread
@@ -763,10 +782,10 @@ class Worker(object):
 						sc.flush(stage, self.parent.url)
 
 					# Wake up the asyncore thread
-					self.notify()
+					self._notify()
 				else:
 					# We've emitted no data
-					self.all_acknowledged(stage)
+					self._all_acknowledged(stage)
 
 		def queue(self, stage, kv):
 			# This gets called from the Worker's thread
@@ -810,11 +829,11 @@ class Worker(object):
 					# Store into a list of destinations for this stage
 					self.stage_destinations[stage].add(sc)
 
-				# Queue the data to the right channel
-				sc.queue(stage, key, v)
+			# Queue the data to the right channel
+			sc.queue(stage, key, v)
 
-				# Wake up the asyncore thread
-				self.notify()
+			# Wake up the asyncore thread
+			self._notify()
 
 	class Gatherer(AsyncoreLogErrorMixIn, asyncore.dispatcher_with_send):
 		"""
@@ -1073,7 +1092,7 @@ class Worker(object):
 										self.new_value_evts[key] = val_evt, 0
 								#logger.info("Here")
 								val_evt.wait()
-								logger.info("Woken up key=%s" % key)
+								#logger.info("Woken up key=%s" % key)
 							else:
 								# More data is available
 								at = last + 8 + offs
@@ -1521,6 +1540,11 @@ class Worker(object):
 
 		self.server.shutdown()
 
+		# Help the garbage collector a bit
+		self.scatterer._close()
+		del self.scatterer
+		del self.gatherer
+
 class Peer:
 	class _Coordinator(object):
 		class WorkerProxy(xmlrpclib.ServerProxy):
@@ -1949,6 +1973,11 @@ class Peer:
 		th.join()
 		logger.info("Done running task %s" % (task_id,))
 
+		# Garbage collect to free up resources
+		del th, server, coordinator
+		logger.info("Garbage collecting __del__")
+		gc.collect()
+
 	def _cleanup(self):
 		with self.lock:
 			for worker in self.workers.itervalues():
@@ -2219,6 +2248,9 @@ if __name__ == '__main__':
 		else:
 			# Start the XMLRPC server
 			server.serve_forever()
+
+		logger.info("Garbage collecting __del__")
+		gc.collect()
 
 		logger.debug("Worker exiting.")
 	else:
