@@ -33,7 +33,7 @@ import core
 
 # Buffer size -- can't be too big on 32bit platforms (otherwise all mmaps
 # won't fit in memory)
-BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 2**40
+BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 200 * 2**30
 
 logger = logging.getLogger('mrp2p')
 
@@ -440,165 +440,178 @@ class Worker(object):
 	The class encapsulating a Worker process, and acting
 	as an XMLRPC method provider.
 	"""
-	class Scatterer(AsyncoreLogErrorMixIn, asyncore.file_dispatcher):
+
+	class OutputBuffer(object):
 		"""
-		Queue the items for sending into separate buffers, one
-		per each _destination_.
-		
-		To add a new destination (from a different thread), write
-		to Scatterer's fd to trigger entering the Scatterer's thread.
+		Output buffer for the workers, one per worker thread
 		"""
-		class ScattererChannel(AsyncoreLogErrorMixIn, asyncore.dispatcher):
-			bufsize = BUFSIZE 	# buffer size - 1TB (ext3 max. file size is 2TB)
-			ctresh  = 50 * 2**20	# compactification treshold (50M)
-			stresh  = 50 * 2**20	# send treshold (we won't send until this much data has been buffered)
+		bufsize = BUFSIZE 	# buffer size - 1TB (ext3 max. file size is 2TB)
 
-			addr	= None	# (host, port) destination
+		stage = None		# Destination stage for the contents of this buffer
 
-			lock    = None	# The lock guarding mm, mm_* vars, and serving_stages
-			mm	= None	# Buffer memory map
+		mm = None		# Memory map buffer used for buffering
+		lastq = None		# dequeue containing the last watermark
 
-			mm_at	= 0	# read pointer in the buffer (data before this have been scattered)
-			mm_end	= 0	# end read pointer (less than or equal to mm.tellg()). Used to avoid locking on every writable() call
-
-			serving_stages = None	# The set of stages for which we've sent out keys.
-			asyncore_map = None		# asyncore thread map
-
-			# Variables of relevance only if scattering to self
-			gatherer = None			# Pointer to Gatherer (if scattering to self)
-			scatterer = None		# Pointer to the Scatterer (if scattering to self)
-
-			_force_flush = False	# Set to True if flush() was called
-
-			def __init__(self, host, port, map, localgs):
-				# Constructor: this gets called from the Worker's thread,
-				# but we don't initialize the socket or connect to the destination
-				# here, but do it from the asyncore thread (see delayed_init())
-				self.addr = (host, port)
-				self.asyncore_map = map
-
-				self.mm = _make_buffer_mmap(self.bufsize)
-
-				self.lock = Lock("ScatterChannel")
-
-				if localgs is not None:
-					self.gatherer, self.scatterer = localgs
-
-				self.serving_stages = set()
-
-			def delayed_init(self, map):
-				# The __init__ equivalent called from asyncore's thread
-				# Connects to the destination host:port
-				asyncore.dispatcher.__init__(self, map=self.asyncore_map)
-
-				self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-				self.connect(self.addr)
-
-			def _html_(self):
-				info = "mm.tell()={mmtell}, mm_at={mm_at}, mm_end={mm_end}, stages={serving_stages}" \
-					.format(mmtell=self.mm.tell(), **dirdict(self))
-				return info
-
-			def __hash__(self):
-				return id(self)
-
-			def __eq__(self, b):
-				return id(self) == id(b)
-
-			def finish_stage(self, stage):
-				#logger.debug("ScattererChannel.finish_stage(stage=%s), serving_stages=%s" % (stage, self.serving_stages))
-				with self.lock:
-					self.serving_stages.remove(stage);
-					return len(self.serving_stages)
-
-			def writable(self):
-				# We're writable only if the buffer isn't empty
-				if self.mm_at == self.mm_end:
-					# Check if extra stuff has been added to
-					# the buffer
-					#logger.info("__del__ writable")
-					with self.lock:
-						self.mm_end = self.mm.tell()
-
-						# See if we can opportunistically compactify
-						# the output buffer
-						if self.mm_at != 0 and self.mm_at == self.mm_end:
-							if self.mm_end > self.ctresh:
-								# Discard dirty pages
-								self.mm.resize(1)
-								self.mm.resize(self.bufsize)
-							self.mm.seek(0)
-							self.mm_at = self.mm_end = 0
-
-				#logger.debug("ScatCh.writable: mm_at=%s mm_end=%s" % (self.mm_at, self.mm_end))
-				wrt = self.mm_end - self.mm_at > self.stresh or (self._force_flush and self.mm_end != self.mm_at)
-				#logger.info("__del__ mm_at=%s mm_end=%s, wrt=%s" % (self.mm_at, self.mm_end, wrt))
-				return wrt
-
-			def handle_write(self):
-				# Write as much as we can to the destination.
-				#sent = self.send(self.mm[self.mm_at:min(self.mm_at+1024, self.mm_end)])
-				sent = self.send(self.mm[self.mm_at:self.mm_end])
-				#logger.info("Wrote out at=%s size=%s sent=%s" % (self.mm_at, self.mm_end-self.mm_at, sent))
-				self.mm_at += sent
-
-				# Compactify every time we send >= 50MB
-				if self.mm_at > self.ctresh:
-					with self.lock:
-						logger.debug("Compactifying scatterer buffer")
-						count = self.mm.tell() - self.mm_at
-						self.mm.move(0, self.mm_at, count)
-						self.mm.seek(count)
-
-						self.mm_at  = 0
-						self.mm_end = count
-
-						# Resize to flush the dirty pages
-						self.mm.resize(max(count, 1))
-						self.mm.resize(self.bufsize)
-						logger.debug("Compactification completed")
-
-			def flush(self, stage, wurl):
-				# Make sure everything has been sent and received
-				if self.gatherer is not None:
-					# HACK: This would get called by the gatherer, upon receiving
-					# the sentinel, but we call it here directly, assuming we're
-					# being called by the Scatterer (that has acquired self.lock)
-					self.scatterer._ack_done_producing(stage)
-				else:
-					self.queue(stage, AckDoneSentinel, (wurl, stage))
-
-				self._force_flush = True
-
-			def queue(self, stage, k, v):
-				# Runs from within a worker thread
-				#logger.debug("Scattering to stage=%s key=%s, val=%s" % (stage, k, v))
-				if self.gatherer is not None:
-					# Don't go through the socket for local writes
-					pkl_value = cPickle.dumps(v, -1)
-					self.gatherer.append(stage, k, pkl_value)
-				else:
-					with self.lock:
-						# Serialize the key/value
-						pkt_beg_offs = self.mm.tell()
-						self.mm.seek(8, 1)				# 1. [ int64] Payload length (placeholder, filled in 5.)
-
-						payload_beg_offs = self.mm.tell()
-						self.mm.write(struct.pack('<I', stage))		# 2. [uint32] Stage
-
-						cPickle.dump(k, self.mm, -1)			# 3. [pickle] Key
-						cPickle.dump(v, self.mm, -1)			# 4. [pickle] Value
-
-						self.mm[pkt_beg_offs:pkt_beg_offs+8] = \
-							struct.pack('<Q', self.mm.tell() - payload_beg_offs)	# 5. Fill in the length
-
-				self.serving_stages.add(stage)			# Remember we've sent out a key for this stage
-
-		### Scatterer ##################3
+		evt = None		# Event to set to signal when there's more data
 		parent = None		# Parent Worker instance
-		asyncore_map = None	# asyncore map that this Scatterer participates in
+		gatherer = None		# Destination Gatherer instance, if local
+
+		# Variables for use by the Scatterer thread
+		at = None	# Read position within the buffer
+		end = None	# Read stop position within the buffer
+		hash = None	# The last hash that was read
+		length = None	# The number of bytes remaining to the end of the packet that was last read
+
+		def __init__(self, parent, stage, evt, gatherer):
+			self.stage = stage
+
+			self.mm = _make_buffer_mmap(self.bufsize)
+		
+			self.evt = evt
+			self.lastq = collections.deque(maxlen=1)
+
+			self.hash_key = parent._hash_key
+
+			if gatherer is None:
+				self.queue = _queue_remote
+			else:
+				self.queue = _queue_direct
+
+		def queue_eof(self):
+			# Queue the EOF marker
+			# Runs from the worker thread
+			self.hash_key = lambda x: 0xFFFFFFFF
+			self.queue((None, None))
+
+		def _queue_remote(kv):
+			# Queue the (key, value) into the buffer
+			# Runs from the worker thread
+
+			key, value = kv
+			#logger.debug("Scattering to stage=%s key=%s, val=%s" % (stage, k, v))
+			# Prepend key hash
+			self.mm.write(struct.pack('<I', self.hash_key(key)))	# 0. [uint32] Key hash
+
+			# store the message
+			Worker.OutputBuffer.serialize_message(self.mm, key, value)
+
+			# Notify the scatterer
+			self.lastq.append(mm.tell())
+			if not evt.is_set():
+				evt.set()
+
+		def _queue_direct(kv):
+			# Don't go through the socket for local writes
+			# Runs from the worker thread
+			key, value = kv
+			pkl_value = cPickle.dumps(value, -1)
+			self.gatherer.append(stage, key, pkl_value)
+
+		@staticmethod
+		def serialize_message(fp, stage, key, value):
+			# Serialize the key/value. This defines the packet format
+			# on the wire.
+			pkt_beg = fp.tell()
+			fp.seek(8, 1)					# 1. [ int64] Payload length (placeholder, filled in 5.)
+
+			payload_beg = fp.tell()
+			fp.write(struct.pack('<I', stage))		# 2. [uint32] Stage
+
+			cPickle.dump(k, fp, -1)				# 3. [pickle] Key
+			cPickle.dump(v, fp, -1)				# 4. [pickle] Value
+
+			end = fp.tell()
+			fp.seek(pkt_beg)
+			fp.write(struct.pack('<Q', end - payload_beg))	# 5. Fill in the length
+			fp.seek(end)
+
+	class Scatterer(object):
+		class ScattererChannel:
+			"""
+			A buffered connection, one per connected gatherer
+			"""
+			margin = 4 * 2**10	# A margin to ensure there's always enough buffer space to queue an AckDoneSentinel
+			bufsize = 512 * 2**10	# 512k buffer
+
+			buf = None		# Output buffer
+			at = None		# Read pointer position
+			size = None		# Number of bytes in the buffer
+
+			sock = None		# Connected socket
+
+			rdbuf = None		# Input buffer (for ack. messages)
+
+			def __init__(self, parent, host, port):
+				self.buf = memoryview(bytearray(self.bufsize + self.margin))
+				self.at = 0
+				self.size = 0
+				self.sock = sock
+				self.parent = parent
+
+				self.rdbuf = cStringIO.StringIO()
+				self.want_read = 0
+
+				sock = socket.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+				sock.connect((host, port))
+
+				parent.epoll.register(sc.sock, 0)
+
+			def close():
+				self.parent.epoll.unregister(sc.sock)
+				self.sock.close()
+
+			def queue(self, mm, offs, maxlen, extra=0):
+				# Fill up the buffer from the given object,
+				# not exceeding its size
+				beg = self.size
+				length = min(self.bufsize + extra - beg, maxlen)
+				self.buf[beg:beg+length] = mm[offs:offs+length]
+				self.size += length
+				return length
+
+			def queue_eof(self, stage):
+				# Queue the end-of-stage marker
+				fp = cStringIO.StringIO()
+				Worker.OutputBuffer.serialize_message(fp, stage, AckDoneSentinel, stage)
+				pkt = fp.get_value()
+				self.queue(pkt, 0, len(pkt), extra=self.margin)
+
+			def send(self):
+				self.at += self.sock.send(buf[self.at:size])
+
+				if self.at == bufsize:
+					self.at = self.size = 0
+
+			def recv_ack(self):
+				data = self.sock.recv(4096)
+				self.rdbuf.write(data)
+
+				# Process as much as possible
+				stages = []
+				if self.rdbuf.tell() >= 4:
+					s = self.rdbuf.get_value()
+					rem = s[-(len(s)%4):]
+					self.rdbuf.truncate(0)
+					self.rdbuf.write(rem)
+
+					for at in xrange(0, len(s), 4):
+						stage, = struct.unpack('<I', s[at:at+4])
+						stages.append(stage)
+
+				return stages
+
+			def add_want_read(self, inc):
+				self.want_read += inc
+				self.epoll_flags = select.EPOLLOUT if self.want_read == 0 else (select.EPOLLIN | select.EPOLLOUT)
+
+			def want_poll(self):
+				return self.at < self.size or self.want_read
+
+		### Scatterer ###################
+		parent = None		# Parent Worker instance
 		coordinator = None	# XMLRPC proxy to the Coordinator
 
+		fd_destinations = None	# Map of (fd) -> ScatterChannel
 		destinations = None	# Map of (host, port) -> ScatterChannel
 		key_destinations = None	# Map of (stage, keyhash) -> ScatterChannel
 		stage_destinations=None # Map of (stage) -> set(ScatterChannel)
@@ -609,18 +622,30 @@ class Worker(object):
 		
 		waiting_ack = None	# dict: stage->number of workers we're waiting to ack they've recvd all of our data
 
-		r_fd = None		# Pipe used to wake up the Scatterer in the asyncore thread (read endpoint)
-		w_fd = None		# Pipe used to wake up the Scatterer in the asyncore thread (write endpoint)
-
 		lock = None		# A lock protecting all member variables
+
+		def __init__(self, parent, curl):
+			self.parent = parent
+			self.pending_channels = []
+			self.pending_done = []
+			self.waiting_ack = {}
+			self.coordinator = xmlrpclib.ServerProxy(curl)
+
+			self.ctl = collections.deque()
+			self.ctl_evt = Event("Scatterer")
+			self.buffers = defaultdict(set)		# Output buffers that the worker writes to (keyed by stage)
+
+			epoll = select.epoll()
+
+			self.known_destinations = defaultdict(dict)			# (stage) -> {(keyhash) -> (wurl)}
+			self.stage_destinations = defaultdict(set)			# (stage) -> set(ScatterChannel) map
+			self.destinations = weakref.WeakValueDictionary()		# (host, port) -> ScatterChannel map
+			self.fd_destinations = weakref.WeakValueDictionary()		# fd -> ScatterChannel map
+			self.key_destinations = weakref.WeakValueDictionary()		# (stage, keyhash) -> ScatterChannel map
 
 		def _close(self):
 			del self.parent
-			del self.asyncore_map
 			del self.coordinator
-			del self.key_destinations
-			del self.stage_destinations
-			del self.known_destinations
 			logger.info("Deleting Scatterer lock __del__")
 			del self.lock
 
@@ -647,158 +672,40 @@ class Worker(object):
 
 			return info
 
-		def __init__(self, parent, curl, map):
-			self.parent = parent
-			self.asyncore_map = map
-			self.pending_channels = []
-			self.pending_done = []
-			self.waiting_ack = {}
-			self.coordinator = xmlrpclib.ServerProxy(curl)
-
-			self.lock = Lock("Scatterer")
-
-			self.destinations = {}			# (host, port) -> ScatterChannel map
-			self.key_destinations = {}		# (stage, keyhash) -> ScatterChannel map
-			self.known_destinations = defaultdict(dict)	# (stage) -> {(keyhash) -> (wurl)}
-			self.stage_destinations = defaultdict(set)	# (stage) -> set(ScatterChannel) map
-
-			self.r_fd, self.w_fd = os.pipe()	# Set up this object to listed on the pipe from within the asyncore thread
-			asyncore.file_dispatcher.__init__(self, self.r_fd, map)
-
-		def __del__(self):
-			# Close the communication pipe
-			os.close(self.r_fd)
-			os.close(self.w_fd)
-
-		def _close_channels(self, scs):
-			# Must be called from asyncore thread
-			#
-			# Close the set of channel scs, and remove them from all of our maps
-			#
-			# NOTE: Does not lock
-			keys = [ k for k, v in self.destinations.iteritems() if v in scs ]
-			for k in keys: del self.destinations[k]
-			
-			keyhashes = [ kh for kh, v in self.key_destinations.iteritems() if v in scs ]
-			for kh in keyhashes: del self.key_destinations[kh]
-
-			# Remove the scs from stage_destinations, and remove any
-			# stage_destinations that are left empty because of it
-			stages = [ k for k, v in self.stage_destinations.iteritems() if len(v & scs) ]
-			for stage in stages:
-				s = self.stage_destinations[stage]
-				s -= scs
-				if len(s) == 0:
-					del self.stage_destinations[stage]
-
-			# Close the Channels (this will close their sockets, remove them from
-			# asyncore map)
-			for sc in scs:
-				logger.debug("Closing channel: %s" % (sc,))
-				sc.close()
-
-		def handle_read(self):
-			# Called from within the asyncore thread when something is
-			# written to w_fd
-			with self.lock:
-				# Clear the signal
-				nread = 8192
-				while self.recv(nread) == nread:
-					pass
-
-				# add any pending channels to the asyncore loop
-				if len(self.pending_channels):
-					for sc in self.pending_channels:
-						sc.delayed_init(map=self.asyncore_map)
-					del self.pending_channels[:]
-
-				# Find and close any Channels in stages that have finished
-				if len(self.pending_done):
-					for stage in self.pending_done:
-						to_close = set()
-						for sc in self.stage_destinations[stage]:
-							#logger.debug("handle_read: %s" % (self.asyncore_map, ))
-							nleft = sc.finish_stage(stage)
-							if nleft == 0:
-								to_close.add(sc)
-						self._close_channels(to_close)
-					del self.pending_done[:]
-
-		def _notify(self):
-			# Called from outside the asyncore thread
-			#
-			# Signal to wake up the asyncore thread (to leave
-			# the select() call and invoke self.handle_read(),
-			# as well as re-check the .writable() property of
-			# all ScatterChannel instances)
-			#
-			#logger.debug("notify: %s" % (self.asyncore_map,))
-			os.write(self.w_fd, '1')
-
-		def ack_done_producing(self, stage):
-			with self.lock:
-				self._ack_done_producing(stage)
-
-		def _ack_done_producing(self, stage):
-			# Called from worker thread when an ack for an
-			# AckDone event is received (see end_stage)
-			self.waiting_ack[stage] -= 1
-			if self.waiting_ack[stage] == 0:
-				# Queue up for cleanup
-				self.pending_done.append(stage)
-				self._notify()
-
-				self._all_acknowledged(stage)
-
 		def _all_acknowledged(self, stage):
 			# Called once all connected endpoints acknowledge
-			# the receipt of our data
-			# Notify the Coordinator that this Worker is
+			# the receipt of our data. Clean up and
+			# notify the Coordinator that this Worker is
 			# completely done with stage=stage-1
 
-			#logger.debug("All Gatherers ack. receiving data for stage %s" % (stage,))
+			logger.debug("All Gatherers ack. receiving data for stage %s" % (stage,))
+
+			del self.stage_destinations[stage]
+			del self.buffers[stage]
+
 			self.coordinator.stage_ended(self.parent.url, stage-1)
 
-		def done_producing(self, stage):
-			# Called from worker thread
-			#
-			# Send a control message to all connected Gatherers
-			# to acknowledge they've received all the data sent
-			# to them so far.
-			#
-			# The receiving Gatherers will respond to the message
-			# by invoking the Worker's gatherer_ack() XMLRPC routine.
-			#
-			# Each invocation of that routine reduces the "active
-			# destination counter" by one. When the counter reaches zero,
-			# the Worker signals the Coordinator that it has finished
-			# processing the stage 'stage'.
-			with self.lock:
-				logger.debug("Done producing data for stage %s" % (stage,))
-				self.waiting_ack[stage] = len(self.stage_destinations[stage])
+		def queue_from(self, buffer):
+			# Called from run() to transfer data to output buffers.
+			# Auto-creates the output buffers/connection when needed, after querying
+			# the Coordinator for destinations.
+			if len(buffer.lastq):
+				buffer.end = buffer.lastq.popleft()
 
-				if len(self.stage_destinations[stage]):
-					# We've emitted data: send requests to endpoints to 
-					# acknowledge receipt.
-					for sc in self.stage_destinations[stage]:
-						sc.flush(stage, self.parent.url)
+			while buffer.at != buffer.end:
+				if buffer.hash is None:
+					# Get a new packet
+					buffer.hash, = struct.unpack('<I', buf.mm[self.at:self.at+4])
+					self.at += 4
+					buffer.length, = struct.unpack('<Q', buf.mm[self.at:self.at+8]) + 8 # The extra is for pkt. len
 
-					# Wake up the asyncore thread
-					self._notify()
-				else:
-					# We've emitted no data
-					self._all_acknowledged(stage)
+				# Look for the end-of-buffer marker
+				if buffer.hash == 0xFFFFFFFF:
+					raise EOFError
 
-		def queue(self, stage, kv):
-			# This gets called from the Worker's thread
-			#
-			# 1. Find the destination for the key
-			# 2. Open a channel to that destination, if it doesn't yet exist (and write on self.w_fd)
-			# 3. Queue up the value on that channel
-			#
-			key, v = kv
-			keyhash = self.parent._hash_key(stage, key)
-			with self.lock:
+				# Find the destination channel
+				stage = buffer.stage
+				hashkey = buffer.hash
 				if (stage, keyhash) in self.key_destinations:
 					# Destination known
 					sc = self.key_destinations[(stage, keyhash)]
@@ -819,23 +726,120 @@ class Worker(object):
 
 					if (host, port) not in self.destinations:
 						# Open a new channel
-						sc = self.ScattererChannel(host, port, self.asyncore_map, localgs)
-						self.pending_channels.append(sc)
+						sc = self.ScattererChannel(parent, host, port)
 						self.destinations[(host, port)] = sc
 					else:
 						sc = self.destinations[(host, port)]
 
 					# Remember for later
 					self.key_destinations[(stage, keyhash)] = sc
-					
+
 					# Store into a list of destinations for this stage
 					self.stage_destinations[stage].add(sc)
+					
+					# Store it into fd->destination map
+					self.fd_destinations[sc.sock.fileno()] = sc
 
-			# Queue the data to the right channel
-			sc.queue(stage, key, v)
+				# Queue the data to the right buffer
+				stored = sc.queue(buffer.mm, at, buffer.length)
+				buffer.at += stored
 
-			# Wake up the asyncore thread
-			self._notify()
+				if stored == buffer.length:
+					buffer.hash = None
+				else:
+					# Exit if we've filled up the buffer
+					buffer.length -= stored
+					break
+
+		def new_output_buffer(self, stage):
+			"""
+			Create a new output buffer and add it to the
+			list of buffers
+			"""
+			ob = Worker.OutputBuffer(parent, stage, self.ctl_evt, None)
+			self.ctl.append(lambda: self.buffers[stage].append(ob))
+			return ob
+
+		def run(self):
+			"""
+			Main loop.
+			"""
+			try:
+				while True:
+					# Check for control messages
+					while len(self.ctl):
+						callback = self.ctl.popleft()
+						callback()
+
+					# Get new data (if any) and move it to the output buffers
+					for buffer in self.all_buffers:
+						try:
+							self.queue_from(buffer)
+						except EOFError:
+							# remove this buffer from the set
+							self.buffers[buffer.stage].remove(buffer)
+							if len(self.buffers[buffer.stage]) == 0:
+								# All workers for this stage have ended;
+								# Enqueue an ACK request to the Gatherers
+								for sc in self.stage_destinations[stage]:
+									sc.queue_eof(stage+1)
+									sc.add_want_read(1)
+								# Handle the case where we produced no data
+								if len(self.stage.destinations[stage]) == 0:
+									self._all_acknowledged()
+
+					# Get only the output buffers with data available
+					scs = dict(( (fd, sc) for sc in self.fd_destinations.iteritems() if sc.want_poll() ))
+
+					# If no data is available, sleep until there is some
+					if len(scs) == 0:
+						# Wait for new data
+						ctl_evt.wait()
+						ctl_evt.clear()
+						continue
+
+					# Arm only the sockets for which we have data
+					for fd, sc in scs.iteritems():
+						self.epoll.modify(fd, sc.epoll_flags)
+
+					# Write while there's something to write,
+					# or until we make ~10 runs around the loop at which
+					# point recheck the buffers (this is for fairness, to prevent
+					# the outputing of one big buffer to tie up the others for
+					# a long time)
+					for _ in xrange(10):
+						# Wait for readiness
+						events = self.epoll.poll(0.05)
+
+						for fd, ev in events:
+							# Check for disconnects
+							if ev & select.EPOLLHUP:
+								scs[fd].close()
+								del scs[fd]
+								del self.fd_destinations[fd]
+
+							# Write stuff out
+							if ev & select.EPOLLOUT:
+								sc = scs[fd]
+								sc.send()
+								if not sc.have_data_to_send():
+									del scs[fd]
+									self.epoll.modify(fd, 0)
+
+							# Read back ACK messages
+							if ev & select.EPOLLIN:
+								sc = scs[fd]
+								stages = sc.recv_ack()
+								for stage in stages:
+									self.stage_destinations[stage].remove(sc)
+									sc.add_want_read(-1)
+									if(len(self.stage.destinations[stage]) == 0):
+										self._all_acknowledged()
+
+						if not len(scs):
+							break
+			finally:
+				epoll.close()
 
 	class Gatherer(AsyncoreLogErrorMixIn, asyncore.dispatcher_with_send):
 		"""
@@ -911,8 +915,8 @@ class Worker(object):
 
 					# Handle control messages right here
 					if key == AckDoneSentinel:
-						(wurl, stage) = cPickle.loads(pkl_value)
-						xmlrpclib.ServerProxy(wurl).ack_done_producing(stage)
+						# Respond by echoing back the stage, in struct-packed format
+						self.send(struct.pack('<I', stage))
 					else:
 						# Commit to the apropriate stage Buffer
 						try:
@@ -1377,11 +1381,15 @@ class Worker(object):
 
 		# Initialize Gatherer and Scatterer threads, with the asyncore
 		# loop running in a separate thread
-		self.asyncore_thread = AsyncoreThread(name='Scatter-Gather', asyncore_kwargs={'timeout': 3600})
+		self.asyncore_thread = AsyncoreThread(name='Gather', asyncore_kwargs={'timeout': 3600})
 		self.gatherer  = self.Gatherer(self, curl, map=self.asyncore_thread.map)
-		self.scatterer = self.Scatterer(self, curl, map=self.asyncore_thread.map)
 		self.asyncore_thread.daemon = True
 		self.asyncore_thread.start()
+
+		self.scatterer = self.Scatterer(self, curl)
+		self.scatterer_thread = Thread(target=self.scatterer.run)
+		self.scatterer_thread.daemon = True
+		self.scatterer_thread.start()
 
 		# Initialize the task:
 		fp = cStringIO.StringIO(b64decode(data))
@@ -1395,12 +1403,6 @@ class Worker(object):
 			for item in items:
 				self.gatherer.append(-1, 0, cPickle.dumps(item, -1))
 		self.stage_ended(-2)
-	
-	def ack_done_producing(self, stage):
-		# Called by a remote Gatherer to notify
-		# our scatterer that it has received the AckDone
-		# message
-		self.scatterer.ack_done_producing(stage)
 
 	class ResultHTTPRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 		def do_GET(self):
@@ -1441,7 +1443,8 @@ class Worker(object):
 		keyhash = binascii.crc32(str(hash(key))) % self.maxpeers[stage]
 		return keyhash
 
-	def _worker(self, stage):
+
+	def _worker(self, stage, output):
 		# Executes the kernel for a given stage in
 		# a separate thread (called from run_stage)
 		with self.lock:
@@ -1482,7 +1485,7 @@ class Worker(object):
 		# Do the actual work
 		for key, valgen in self.gatherer.iteritems(stage):
 			for kv in K_fun((key, valgen), *K_args):
-				self.scatterer.queue(stage+1, kv)
+				output.queue(kv)
 
 		# Let the Gatherer know it can discard data for the processed stage
 		self.gatherer.worker_done_with_stage(stage)
@@ -1502,7 +1505,7 @@ class Worker(object):
 
 			# If this is the last thread left running this stage,
 			# let the Scatterer know we're done producing for stage+1
-			self.scatterer.done_producing(stage+1)
+			output.queue_eof()
 
 	def run_stage(self, stage, maxpeers):#, nthreads=1, npeers=100):
 		# Start running a stage, in a separate thread
@@ -1514,7 +1517,8 @@ class Worker(object):
 			self.running_stage_threads[stage] += 1
 			if self.running_stage_threads[stage] == 1:
 				self.maxpeers[stage+1] = maxpeers
-			th = Thread(name='Stage-%02d' % stage, target=self._worker, args=(stage,))
+			ob = self.scatterer.new_output_buffer(stage)
+			th = Thread(name='Stage-%02d' % stage, target=self._worker, args=(stage, ob))
 			th.daemon = True
 			th.start()
 
