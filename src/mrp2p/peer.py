@@ -22,8 +22,10 @@ import mmap
 import struct
 import platform
 import gc
+import binascii
 from base64 import b64encode, b64decode
 from collections import defaultdict
+from heapq import heappop, heappush, heapify
 import traceback
 import weakref
 
@@ -1436,7 +1438,7 @@ class Worker(object):
 	def _hash_key(self, stage, key):
 		# Return a hash for the key. The Coordinator will
 		# be queried for the destination based on this hash.
-		keyhash = key.__hash__() % self.maxpeers[stage]
+		keyhash = binascii.crc32(str(hash(key))) % self.maxpeers[stage]
 		return keyhash
 
 	def _worker(self, stage):
@@ -1551,7 +1553,21 @@ class Peer:
 			url                   = None	# URL of the Worker
 			purl		      = None	# URL of the Worker's Peer
 			running_stage_threads = None	# defaultdict(int): the number of threads running each stage on the Worker
+			nkeys                 = None	# defaultdict(int): the number of keys assigned to this worker, per stage
 			process               = None	# subprocess.Popen class for local workers, None for remote workers
+
+			def __eq__(self, other):
+				return self.url == other.url
+
+			def __hash__(self):
+				return hash(self.url)
+
+			def __lt__(self, other):
+				return self.url < other.url
+
+			#def __getattr__(self, name):
+			#	logger.debug("GETATTR: %s" % name)
+			#	return xmlrpclib.ServerProxy.__getattr__(self, name)
 
 			def run_stage(self, stage, *args, **kwargs):
 				"""
@@ -1569,6 +1585,7 @@ class Peer:
 				self.process = process
 			
 				self.running_stage_threads = defaultdict(int)
+				self.nkeys = defaultdict(int)
 
 		## _Coordinator ####################
 		id		= None	# Unique task ID
@@ -1582,6 +1599,7 @@ class Peer:
 		data    = None  # Serialized task data, for the workers
 
 		workers = None	# dict: wurl -> WorkerProxy for workers working on the task
+		worker_heap = None # list of (nkeys, worker) acting as a heap, to quickly find a least busy worker
 		queue   = None  # Queue for the Coordinator to message the launching Peer with task progress
 		pserver = None  # XMLRPC Proxy to the parent Peer that launched us
 
@@ -1645,6 +1663,7 @@ class Peer:
 			self.data    = data
 			self.queue   = Queue.Queue()
 			self.workers = {}
+			self.worker_heap = []
 			self.destinations = defaultdict(dict)
 			self.maxpeers = dict()
 
@@ -1664,6 +1683,8 @@ class Peer:
 		def _progress(self, cmd, msg):
 			# Send a message to the calling thread
 			# with the progress info
+			#
+			# The queue is thread-safe
 			self.queue.put((cmd, msg))
 
 		def _start_remote_worker(self, purl):
@@ -1673,6 +1694,8 @@ class Peer:
 			Returns an instance of Worker
 			"""
 			logger.debug("Conneecting to remote peer %s" % (purl,))
+			assert purl in self.free_peers
+
 			if purl == self.purl:
 				peer = self.pserver
 			else:
@@ -1685,7 +1708,10 @@ class Peer:
 
 			# Store the worker into our list of workers
 			with self.lock:
+				assert wurl not in self.workers
 				self.workers[wurl] = worker
+				self.free_peers.remove(purl)
+				heappush(self.worker_heap, (0, worker))
 
 			# Initialize the task on the Worker
 			#logger.debug("Calling worker.initialize on %s" % (wurl,))
@@ -1722,7 +1748,12 @@ class Peer:
 			with self.lock:
 				worker = self.workers[wurl]
 				assert worker.running_stage_threads[stage] == 0
+				# Decrease this worker's load and rebuild worker_heap
+				self.worker_heap = [ (load - w.nkeys[stage] if w is worker else load, w) for load, w in self.worker_heap ]
+				heapify(self.worker_heap)
+				#
 				del worker.running_stage_threads[stage]
+				del worker.nkeys[stage]
 
 				logger.debug("Worker %s notified us that stage %s has ended" % (wurl, stage))
 				self._progress("STAGE_ENDED_ON_WORKER", (wurl, stage))
@@ -1782,11 +1813,11 @@ class Peer:
 			logger.debug("Shutting down server")
 			self.server.shutdown()
 
-		def _refresh_peers(self):
+		def _refresh_peers(self, force=False):
 			"""
 			Refresh the lists of all and unused peers
 			"""
-			if time.time() < self.free_peers_last_refresh + 60:
+			if not force and time.time() < self.free_peers_last_refresh + 60:
 				return
 
 			self.all_peers = set(self.pserver.list_peers())
@@ -1820,28 +1851,45 @@ class Peer:
 			# first Worker and stage.
 			self._progress("START", None)
 
+			# Pre-launch all workers
+			self._refresh_peers(force=True)
+			ths = []
+			for purl in self.all_peers:
+				th = Thread(target=self._start_remote_worker, args=(purl,))
+				th.start()
+				ths.append(th)
+			for th in ths:
+				th.join()
+
+			# Start the first stage on one of the workers
 			with self.lock:
-				self._start_remote_worker(self.purl).run_stage(-1, self._maxpeers(0))
+				nkeys, worker = heappop(self.worker_heap)
+				worker.run_stage(-1, self._maxpeers(0))
+				worker.nkeys[-1] += 1
+				heappush(self.worker_heap, (nkeys+1, worker))
 
 		def get_destinations(self, stage, key):
 			"""
 			Get all known key->wurl pairs for the stage 'stage', ensuring
-			that key is among them (by creating a new worker, if needed)
+			that 'key' is among them (by creating a new worker, if needed)
 			"""
-			logger.debug("Get destination for stage=%s key=%s" % (stage, key))
+			logger.info("Get destination for stage=%s key=%s" % (stage, key))
 			with self.lock:
 				if key not in self.destinations[stage]:
 					# Refresh the list of unused peers every 60 sec or so...
 					self._refresh_peers()
-	
+
+					logging.debug("Here: free_peers=%s", self.free_peers)
 					if len(self.free_peers):
 						# Prefer a Peer we're not yet running on
 						purl = random.choice(self.free_peers)
 						worker = self._start_remote_worker(purl)
-						self.free_peers.remove(purl)
+						nkeys = 0
 					else:
-						# Randomly choose an existing worker
-						worker = random.choice(self.workers.values())
+						# Choose an existing worker with least amount
+						# of keys
+						#worker = random.choice(self.workers.values())
+						nkeys, worker = heappop(self.worker_heap)
 
 					# Start the stage if not already running
 					if stage not in worker.running_stage_threads:
@@ -1849,6 +1897,12 @@ class Peer:
 
 					# Remember the destination for this key
 					self.destinations[stage][key] = worker
+
+					worker.nkeys[stage] += 1
+					nkeys += 1
+					heappush(self.worker_heap, (nkeys, worker))
+
+					logger.info("Returning %s (load: nkeys=%s)" % (worker.url, nkeys))
 
 				return [ (key, worker.url) for key, worker in self.destinations[stage].iteritems() ]
 
