@@ -25,7 +25,7 @@ def reducer(kv):
 
 if __name__ == "__main__":
 	v = np.arange(128*2**10)
-	#v = np.arange(8*2**10)
+	#v = np.arange(8*1024)
 
 	# Parallel
 	if True:

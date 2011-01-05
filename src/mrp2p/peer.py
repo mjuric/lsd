@@ -47,7 +47,7 @@ def Event(name):
 def Lock(name):
 	return threading.Lock()
 
-if True:
+if False:
 	if True:
 		class Lock(object):
 			def __init__(self, name):
@@ -486,7 +486,7 @@ class Worker(object):
 		def queue_eof(self):
 			# Queue the EOF marker
 			# Runs from the worker thread
-			logger.debug("QUEUE EOF stage=%s " % (self.stage,))
+			#logger.info("QUEUE EOF stage=%s " % (self.stage,))
 			self.hash_key = lambda stage, key: 0xFFFFFFFF
 			self.queue((None, None))
 
@@ -547,6 +547,9 @@ class Worker(object):
 			at = None		# Read pointer position
 			size = None		# Number of bytes in the buffer
 
+			incomplete = False	# Flag set to True when queue() fails to queue the entire packet
+			pending_eofs = []	# Stages to which to sent the EOF as soon as possible
+
 			sock = None		# Connected socket
 
 			rdbuf = None					# Input buffer (for ack. messages)
@@ -563,6 +566,8 @@ class Worker(object):
 				self.rdbuf = cStringIO.StringIO()
 				self.want_read = 0
 
+				self.pending_eofs = []
+
 				self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 				self.sock.connect((host, port))
 				self.sock.setblocking(0)
@@ -575,23 +580,58 @@ class Worker(object):
 				self.buf = None
 
 			def queue(self, mm, offs, maxlen, extra=0):
-				# Fill up the buffer from the given object,
-				# not exceeding its size
+				# Store the packet of the remaining length 'maxlen'
+				# into the buffer. If we fail to do so, set the
+				# incomplete flag, expecting that the caller will
+				# retry sometime in the future.
+
 				beg = self.size
 				length = min(self.bufsize + extra - beg, maxlen)
+
 				self.buf[beg:beg+length] = mm[offs:offs+length]
 				self.size += length
+
+				# Record if we're in "incomplete packet" state
+				self.incomplete = length != maxlen
+
+				self._flush_eofs()
+
 				return length
 
 			def queue_eof(self, stage):
-				# Queue the end-of-stage marker
-				fp = cStringIO.StringIO()
-				Worker.OutputBuffer.serialize_message(fp, stage, AckDoneSentinel, stage)
-				pkt = fp.getvalue()
-				self.queue(pkt, 0, len(pkt), extra=self.margin)
+				# Record the end-of-stage marker, taking into account
+				# that there may be a partially queued packet in the
+				# buffer.
+
+				self.pending_eofs.append(stage)
+
+				if not self._flush_eofs():
+					logger.warning("Delaying EOF transmission")
+
+			def _flush_eofs(self):
+				# Queue pending EOFs, if possible
+				if len(self.pending_eofs) == 0 or self.incomplete:
+					return False
+
+				# Do this before looping, as self.queue() calls us.
+				eofs = self.pending_eofs
+				self.pending_eofs = []
+
+				for stage in eofs:
+					fp = cStringIO.StringIO()
+					Worker.OutputBuffer.serialize_message(fp, stage, AckDoneSentinel, stage)
+					pkt = fp.getvalue()
+					queued = self.queue(pkt, 0, len(pkt), extra=self.margin)
+					assert queued == len(pkt)
+					logger.debug("EOF queued for stage=%s" % stage)
+
+				return True
 
 			def send(self):
-				self.at += self.sock.send(self.buf[self.at:self.size])
+				self._flush_eofs()
+
+				sent = self.sock.send(self.buf[self.at:self.size])
+				self.at += sent
 
 				if self.at == self.size:
 					self.at = self.size = 0
@@ -621,7 +661,7 @@ class Worker(object):
 
 			def epoll_flags(self):
 				eflags = 0
-				if self.at < self.size:	eflags |= select.EPOLLOUT
+				if self.at < self.size:		eflags |= select.EPOLLOUT
 				if self.want_read:		eflags |= select.EPOLLIN
 				return eflags
 
@@ -716,23 +756,28 @@ class Worker(object):
 			self.coordinator.stage_ended(self.parent.url, stage-1)
 			logger.debug("RETURNED Calling coordinator.stage_ended")
 
-		def queue_from(self, buffer):
+		def queue_from(self, buffer, single_packet=False):
 			# Called from run() to transfer data to output buffers.
 			# Auto-creates the output buffers/connection when needed, after querying
 			# the Coordinator for destinations.
 			if len(buffer.lastq):
 				buffer.end = buffer.lastq.popleft()
 
+			#logger.debug("buffer.hash = %s, single_packet = %s" % (buffer.hash, single_packet))
+			stored = 0
 			while buffer.at != buffer.end:
 				if buffer.hash is None:
+					assert not single_packet
 					# Get a new packet
 					buffer.hash, = struct.unpack('<I', buffer.mm[buffer.at:buffer.at+4])
 					buffer.at += 4 # Move to the beginning of the packet
 					buffer.length, = struct.unpack('<Q', buffer.mm[buffer.at:buffer.at+8])
 					buffer.length += 8 # The extra is for pkt. len
+					buffer.full_length = buffer.length # Full length of the packet
 
 				# Look for the end-of-buffer marker
 				if buffer.hash == 0xFFFFFFFF:
+					assert not single_packet
 					raise EOFError
 
 				# Find the destination channel
@@ -742,6 +787,7 @@ class Worker(object):
 					# Destination known
 					sc = self.key_destinations[(stage, keyhash)]
 				else:
+					assert not single_packet
 					# Unknown (stage, key). Find where to send them
 					logger.debug("Getting destination from coordinator")
 					if keyhash not in self.known_destinations[stage]:
@@ -768,13 +814,21 @@ class Worker(object):
 				# Queue the data to the right buffer
 				stored = sc.queue(buffer.mm, buffer.at, buffer.length)
 				buffer.at += stored
+				buffer.length -= stored
 
-				if stored == buffer.length:
+				if buffer.length == 0:
+					# We've read the entire packet
 					buffer.hash = None
+					if single_packet:
+						#logger.debug("Single packet")
+						break
 				else:
 					# Exit if we've filled up the buffer
-					buffer.length -= stored
 					break
+
+			# Return True if we managed to queue an entire packet, or
+			# if we haven't even begun.
+			return buffer.hash is None or buffer.length == buffer.full_length
 
 		def new_output_buffer(self, stage):
 			"""
@@ -801,6 +855,7 @@ class Worker(object):
 			Main loop.
 			"""
 			try:
+				incompletely_buffered = set()
 				while True:
 					# Check for control messages
 					while len(self.ctl):
@@ -808,30 +863,37 @@ class Worker(object):
 						callback()
 						logger.debug("Running callback, all_buffers=%s" % (self.all_buffers,))
 	
-					# Get new data (if any) and move it to the output buffers
+					# Get new data (if any) and queue it to the output buffers
+					# First try to complete the queuing of any incompletely
+					# written packets from the previous iteration
+					ib2 = set()
+					for buffer in incompletely_buffered:
+						if not self.queue_from(buffer, single_packet=True):
+							ib2.add(buffer)
+					incompletely_buffered = ib2
+
 					for buffer in self.all_buffers:
 						try:
-							self.queue_from(buffer)
+							if not self.queue_from(buffer):
+								incompletely_buffered.add(buffer)
 						except EOFError:
-							# remove this buffer from the set
-							logger.debug(" buffers[%s]=%s" % (buffer.stage, self.buffers[buffer.stage]))
+							# We've exhausted this buffer. Remove it
+							# from the set
 							self.buffers[buffer.stage].remove(buffer)
-							logger.debug("xbuffers[%s]=%s, %s" % (buffer.stage, self.buffers[buffer.stage], buffer))
-							#self.ctl.append(lambda buffer=buffer: self.all_buffers.remove(buffer))
-							self.ctl.append(lambda buffer=buffer: (self.all_buffers.remove(buffer), logger.debug("Removed %s" % (buffer,))))
+							self.ctl.append(lambda buffer=buffer: self.all_buffers.remove(buffer))
+
+							# If all workers processing this stage have ended,
+							# enqueue the EOF signal for remote Gatherers
 							if len(self.buffers[buffer.stage]) == 0:
-								# All workers for this stage have ended;
-								# Enqueue an ACK request to the Gatherers
 								for sc in self.stage_destinations[buffer.stage]:
 									sc.queue_eof(buffer.stage)
 									sc.add_want_read(1)
-								# Handle the case where a stage emitted no data
+
+								# Handle the case where a stage emitted no data.
 								if len(self.stage_destinations[buffer.stage]) == 0:
 									self._all_acknowledged(buffer.stage)
 
-					# Get only the output buffers with data available
-					#scs = dict(( (fd, sc) for fd, sc in self.fd_destinations.iteritems() if sc.want_poll() ))
-					# Arm only the sockets for which we have data
+					# Only arm the sockets for which we have data
 					n_active = 0
 					for fd, sc in self.fd_destinations.iteritems():
 						eflags = sc.epoll_flags()
@@ -858,11 +920,13 @@ class Worker(object):
 	
 						for fd, ev in events:
 							sc = self.fd_destinations[fd]
+
 							# Check for disconnects
 							if ev & select.EPOLLHUP:
 								sc.close()
 								self.epoll.modify(fd, 0)
 								del self.fd_destinations[fd]
+								assert False
 								continue
 	
 							# Write stuff out
@@ -872,7 +936,6 @@ class Worker(object):
 							# Read back ACK messages
 							if ev & select.EPOLLIN:
 								for stage in sc.recv_ack():
-									logger.debug("Removing %s from stage_destinations[%s] (%s)" % (sc, stage, self.stage_destinations))
 									self.stage_destinations[stage].remove(sc)
 									sc.add_want_read(-1)
 									if(len(self.stage_destinations[stage]) == 0):
