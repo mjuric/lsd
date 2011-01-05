@@ -23,8 +23,9 @@ import struct
 import platform
 import gc
 import binascii
+import select
 from base64 import b64encode, b64decode
-from collections import defaultdict
+from collections import defaultdict, deque
 from heapq import heappop, heappush, heapify
 import traceback
 import weakref
@@ -139,7 +140,7 @@ if True:
 	
 				succ = False
 				while not succ:
-					for retry in xrange(10):
+					for _ in xrange(10):
 						if threading._RLock.acquire(self, blocking=False):
 							succ = True
 							break
@@ -342,13 +343,17 @@ class Pool:
 
 		print >>sys.stderr, "EXITING map_reduce_chain"
 
-def _make_buffer_mmap(size, dir=None):
+def _make_buffer_mmap(size, dir=None, return_file=False):
 	# Create the temporary memory mapped buffer. It will go away as soon as the mmap is closed, or the process exits.
 	fp = tempfile.TemporaryFile(dir=dir)
 	os.ftruncate(fp.fileno(), size)		# Resize to self.bufsize
 	mm = mmap.mmap(fp.fileno(), 0)		# create a memory map
-	fp.close()				# Close immediately to trigger the unlink()-ing of the unrelying file.
-	return mm
+
+	if not return_file:
+		fp.close()				# Close immediately to trigger the unlink()-ing of the unrelying file.
+		return mm
+	else:
+		return mm, fp
 
 class KeyChainSentinelClass(object):
 	pass
@@ -449,63 +454,68 @@ class Worker(object):
 
 		stage = None		# Destination stage for the contents of this buffer
 
-		mm = None		# Memory map buffer used for buffering
+		mm = None			# Memory map buffer used for buffering
 		lastq = None		# dequeue containing the last watermark
 
-		evt = None		# Event to set to signal when there's more data
+		evt = None			# Event to set to signal when there's more data
 		parent = None		# Parent Worker instance
-		gatherer = None		# Destination Gatherer instance, if local
 
 		# Variables for use by the Scatterer thread
-		at = None	# Read position within the buffer
-		end = None	# Read stop position within the buffer
+		at = 0		# Read position within the buffer
+		end = 0		# Read stop position within the buffer
 		hash = None	# The last hash that was read
-		length = None	# The number of bytes remaining to the end of the packet that was last read
+		length = 0	# The number of bytes remaining to the end of the packet that was last read
 
-		def __init__(self, parent, stage, evt, gatherer):
+		buffer_cache = None	# WeakValueDictionary to Buffers (to avoid locking the parent when fetching one)
+
+		def __init__(self, parent, stage, evt):
 			self.stage = stage
 
 			self.mm = _make_buffer_mmap(self.bufsize)
-		
+
 			self.evt = evt
-			self.lastq = collections.deque(maxlen=1)
+			self.lastq = deque(maxlen=1)
 
 			self.hash_key = parent._hash_key
 
-			if gatherer is None:
-				self.queue = _queue_remote
-			else:
-				self.queue = _queue_direct
+			# Support for bypassing TCP if the destination is local
+			self.buffer_cache = weakref.WeakValueDictionary()
+			self.scatterer = parent.scatterer
+			self.gatherer = parent.gatherer
 
 		def queue_eof(self):
 			# Queue the EOF marker
 			# Runs from the worker thread
-			self.hash_key = lambda x: 0xFFFFFFFF
+			logger.debug("QUEUE EOF stage=%s " % (self.stage,))
+			self.hash_key = lambda stage, key: 0xFFFFFFFF
 			self.queue((None, None))
 
-		def _queue_remote(kv):
+		def queue(self, kv):
 			# Queue the (key, value) into the buffer
 			# Runs from the worker thread
 
 			key, value = kv
-			#logger.debug("Scattering to stage=%s key=%s, val=%s" % (stage, k, v))
-			# Prepend key hash
-			self.mm.write(struct.pack('<I', self.hash_key(key)))	# 0. [uint32] Key hash
+			keyhash = self.hash_key(self.stage, key)
 
-			# store the message
-			Worker.OutputBuffer.serialize_message(self.mm, key, value)
-
-			# Notify the scatterer
-			self.lastq.append(mm.tell())
-			if not evt.is_set():
-				evt.set()
-
-		def _queue_direct(kv):
-			# Don't go through the socket for local writes
-			# Runs from the worker thread
-			key, value = kv
-			pkl_value = cPickle.dumps(value, -1)
-			self.gatherer.append(stage, key, pkl_value)
+			if (self.stage, keyhash) in self.scatterer.local_destinations:
+				# bypass TCP/IP if we're the destination
+				pkl_value = cPickle.dumps(value, -1)
+				try:
+					buffer = self.buffer_cache[self.stage]
+				except KeyError:
+					buffer = self.buffer_cache[self.stage] = self.gatherer.get_or_create_buffer(self.stage)
+				buffer.append(key, pkl_value)
+			else:
+				# Prepend key hash
+				self.mm.write(struct.pack('<I', keyhash))	# 0. [uint32] Key hash
+	
+				# store the message
+				Worker.OutputBuffer.serialize_message(self.mm, self.stage, key, value)
+	
+				# Notify the scatterer
+				self.lastq.append(self.mm.tell())
+				if not self.evt.is_set():
+					self.evt.set()
 
 		@staticmethod
 		def serialize_message(fp, stage, key, value):
@@ -515,10 +525,10 @@ class Worker(object):
 			fp.seek(8, 1)					# 1. [ int64] Payload length (placeholder, filled in 5.)
 
 			payload_beg = fp.tell()
-			fp.write(struct.pack('<I', stage))		# 2. [uint32] Stage
+			fp.write(struct.pack('<I', stage))		# 2. [uint32] Destination stage
 
-			cPickle.dump(k, fp, -1)				# 3. [pickle] Key
-			cPickle.dump(v, fp, -1)				# 4. [pickle] Value
+			cPickle.dump(key, fp, -1)				# 3. [pickle] Key
+			cPickle.dump(value, fp, -1)				# 4. [pickle] Value
 
 			end = fp.tell()
 			fp.seek(pkt_beg)
@@ -539,26 +549,30 @@ class Worker(object):
 
 			sock = None		# Connected socket
 
-			rdbuf = None		# Input buffer (for ack. messages)
+			rdbuf = None					# Input buffer (for ack. messages)
+			want_read = 0					# >0 if this socket wants to be recv-d()
 
-			def __init__(self, parent, host, port):
+			scatterer = None	# Parent Scatterer
+
+			def __init__(self, scatterer, host, port):
 				self.buf = memoryview(bytearray(self.bufsize + self.margin))
 				self.at = 0
 				self.size = 0
-				self.sock = sock
-				self.parent = parent
+				self.scatterer = scatterer
 
 				self.rdbuf = cStringIO.StringIO()
 				self.want_read = 0
 
-				sock = socket.create_socket(socket.AF_INET, socket.SOCK_STREAM)
-				sock.connect((host, port))
+				self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+				self.sock.connect((host, port))
+				self.sock.setblocking(0)
 
-				parent.epoll.register(sc.sock, 0)
+				self.scatterer.epoll.register(self.sock, 0)
 
-			def close():
-				self.parent.epoll.unregister(sc.sock)
+			def close(self):
+				self.scatterer.epoll.unregister(self.sock)
 				self.sock.close()
+				self.buf = None
 
 			def queue(self, mm, offs, maxlen, extra=0):
 				# Fill up the buffer from the given object,
@@ -573,13 +587,13 @@ class Worker(object):
 				# Queue the end-of-stage marker
 				fp = cStringIO.StringIO()
 				Worker.OutputBuffer.serialize_message(fp, stage, AckDoneSentinel, stage)
-				pkt = fp.get_value()
+				pkt = fp.getvalue()
 				self.queue(pkt, 0, len(pkt), extra=self.margin)
 
 			def send(self):
-				self.at += self.sock.send(buf[self.at:size])
+				self.at += self.sock.send(self.buf[self.at:self.size])
 
-				if self.at == bufsize:
+				if self.at == self.size:
 					self.at = self.size = 0
 
 			def recv_ack(self):
@@ -589,23 +603,27 @@ class Worker(object):
 				# Process as much as possible
 				stages = []
 				if self.rdbuf.tell() >= 4:
-					s = self.rdbuf.get_value()
-					rem = s[-(len(s)%4):]
+					s = self.rdbuf.getvalue()
+					rem = s[len(s)-(len(s)%4):]
+					logger.debug("len(sata)=%s, len(s)=%s, len(rem)=%s, tell=%s" % (len(data), len(s), len(rem), self.rdbuf.tell()))
 					self.rdbuf.truncate(0)
 					self.rdbuf.write(rem)
 
 					for at in xrange(0, len(s), 4):
 						stage, = struct.unpack('<I', s[at:at+4])
+						logger.debug("GOT EOF ACK, stage=%s" % stage)
 						stages.append(stage)
 
 				return stages
 
 			def add_want_read(self, inc):
 				self.want_read += inc
-				self.epoll_flags = select.EPOLLOUT if self.want_read == 0 else (select.EPOLLIN | select.EPOLLOUT)
 
-			def want_poll(self):
-				return self.at < self.size or self.want_read
+			def epoll_flags(self):
+				eflags = 0
+				if self.at < self.size:	eflags |= select.EPOLLOUT
+				if self.want_read:		eflags |= select.EPOLLIN
+				return eflags
 
 		### Scatterer ###################
 		parent = None		# Parent Worker instance
@@ -619,35 +637,34 @@ class Worker(object):
 
 		pending_channels = None # A list of channels that need to be added to the asyncore map
 		pending_done = None		# A list of stages that have finished (and for which we can release Channels)
-		
-		waiting_ack = None	# dict: stage->number of workers we're waiting to ack they've recvd all of our data
 
-		lock = None		# A lock protecting all member variables
+		buffers = None
+		all_buffers = None
 
 		def __init__(self, parent, curl):
 			self.parent = parent
-			self.pending_channels = []
-			self.pending_done = []
-			self.waiting_ack = {}
 			self.coordinator = xmlrpclib.ServerProxy(curl)
 
-			self.ctl = collections.deque()
-			self.ctl_evt = Event("Scatterer")
+			self.ctl = deque()					# Message passing into the thread
+			self.ctl_evt = Event("Scatterer")	# Notification mechanism for this thread
+			self.epoll = select.epoll()			# Waiting on sockets
+
 			self.buffers = defaultdict(set)		# Output buffers that the worker writes to (keyed by stage)
+			self.all_buffers = set()
 
-			epoll = select.epoll()
-
-			self.known_destinations = defaultdict(dict)			# (stage) -> {(keyhash) -> (wurl)}
-			self.stage_destinations = defaultdict(set)			# (stage) -> set(ScatterChannel) map
-			self.destinations = weakref.WeakValueDictionary()		# (host, port) -> ScatterChannel map
-			self.fd_destinations = weakref.WeakValueDictionary()		# fd -> ScatterChannel map
+			self.known_destinations = defaultdict(dict)				# (stage) -> {(keyhash) -> (wurl)}
+			self.stage_destinations = defaultdict(set)				# (stage) -> set(ScatterChannel) map
+			self.destinations = weakref.WeakValueDictionary()			# (host, port) -> ScatterChannel map
+			#self.fd_destinations = weakref.WeakValueDictionary()		# fd -> ScatterChannel map
+			self.fd_destinations = {}									# fd -> ScatterChannel map
 			self.key_destinations = weakref.WeakValueDictionary()		# (stage, keyhash) -> ScatterChannel map
+			self.local_destinations = weakref.WeakValueDictionary()		# A set of all (stage, keyhash) pairs whose destinations are local
 
 		def _close(self):
 			del self.parent
 			del self.coordinator
-			logger.info("Deleting Scatterer lock __del__")
-			del self.lock
+			self.epoll.close()
+			del self.epoll
 
 		def _html_(self):
 			with self.lock:
@@ -680,10 +697,24 @@ class Worker(object):
 
 			logger.debug("All Gatherers ack. receiving data for stage %s" % (stage,))
 
+			# House keeping
+			#logger.debug("stage_destinations[%s]=%s" % (stage, self.stage_destinations[stage]))
+			#logger.debug("buffers[%s]=%s" % (stage, self.buffers[stage]))
+			assert len(self.stage_destinations[stage]) == 0
+			assert len(self.buffers[stage]) == 0
 			del self.stage_destinations[stage]
 			del self.buffers[stage]
+			# Close all connections that are serving no-one
+			fd_dest = {}
+			for scs in self.stage_destinations.itervalues():
+				for sc in scs:
+					fd_dest[sc.sock.fileno()] = sc
+			logger.debug("Replacing fd_destinations: %s -> %s" % (self.fd_destinations, fd_dest))
+			self.fd_destinations = fd_dest
 
+			logger.debug("Calling coordinator.stage_ended")
 			self.coordinator.stage_ended(self.parent.url, stage-1)
+			logger.debug("RETURNED Calling coordinator.stage_ended")
 
 		def queue_from(self, buffer):
 			# Called from run() to transfer data to output buffers.
@@ -695,9 +726,10 @@ class Worker(object):
 			while buffer.at != buffer.end:
 				if buffer.hash is None:
 					# Get a new packet
-					buffer.hash, = struct.unpack('<I', buf.mm[self.at:self.at+4])
-					self.at += 4
-					buffer.length, = struct.unpack('<Q', buf.mm[self.at:self.at+8]) + 8 # The extra is for pkt. len
+					buffer.hash, = struct.unpack('<I', buffer.mm[buffer.at:buffer.at+4])
+					buffer.at += 4 # Move to the beginning of the packet
+					buffer.length, = struct.unpack('<Q', buffer.mm[buffer.at:buffer.at+8])
+					buffer.length += 8 # The extra is for pkt. len
 
 				# Look for the end-of-buffer marker
 				if buffer.hash == 0xFFFFFFFF:
@@ -705,43 +737,36 @@ class Worker(object):
 
 				# Find the destination channel
 				stage = buffer.stage
-				hashkey = buffer.hash
+				keyhash = buffer.hash
 				if (stage, keyhash) in self.key_destinations:
 					# Destination known
 					sc = self.key_destinations[(stage, keyhash)]
 				else:
 					# Unknown (stage, key). Find where to send them
-					#logger.debug("Getting destination from coordinator")
+					logger.debug("Getting destination from coordinator")
 					if keyhash not in self.known_destinations[stage]:
 						self.known_destinations[stage].update(self.coordinator.get_destinations(stage, keyhash))
 
 					wurl = self.known_destinations[stage][keyhash]
 					(host, port) = xmlrpclib.ServerProxy(wurl).get_gatherer_addr()
 
-					if self.parent.get_gatherer_addr() == (host, port):
-						localgs = (self.parent.gatherer, self)
-						logger.info("The destination is local.")
-					else:
-						localgs = None
-
 					if (host, port) not in self.destinations:
 						# Open a new channel
-						sc = self.ScattererChannel(parent, host, port)
+						sc = self.ScattererChannel(self, host, port)
 						self.destinations[(host, port)] = sc
 					else:
 						sc = self.destinations[(host, port)]
 
-					# Remember for later
-					self.key_destinations[(stage, keyhash)] = sc
-
-					# Store into a list of destinations for this stage
+					# Remember for later in aux. lookup tables
 					self.stage_destinations[stage].add(sc)
-					
-					# Store it into fd->destination map
+					self.key_destinations[(stage, keyhash)] = sc
 					self.fd_destinations[sc.sock.fileno()] = sc
+					if self.parent.get_gatherer_addr() == (host, port):
+						logger.info("The destination is local.")
+						self.local_destinations[(stage, keyhash)] = sc
 
 				# Queue the data to the right buffer
-				stored = sc.queue(buffer.mm, at, buffer.length)
+				stored = sc.queue(buffer.mm, buffer.at, buffer.length)
 				buffer.at += stored
 
 				if stored == buffer.length:
@@ -756,9 +781,20 @@ class Worker(object):
 			Create a new output buffer and add it to the
 			list of buffers
 			"""
-			ob = Worker.OutputBuffer(parent, stage, self.ctl_evt, None)
-			self.ctl.append(lambda: self.buffers[stage].append(ob))
+			ob = Worker.OutputBuffer(self.parent, stage, self.ctl_evt)
+			self.ctl.append(lambda ob=ob: (
+									self.buffers[stage].add(ob),
+									self.all_buffers.add(ob)
+						))
+			self.ctl_evt.set()
 			return ob
+
+		def shutdown(self):
+			# Signal the Scatterer to end the run() loop
+			def dummy():
+				raise StopIteration()
+			self.ctl.append(dummy)
+			self.ctl_evt.set()
 
 		def run(self):
 			"""
@@ -770,38 +806,47 @@ class Worker(object):
 					while len(self.ctl):
 						callback = self.ctl.popleft()
 						callback()
-
+						logger.debug("Running callback, all_buffers=%s" % (self.all_buffers,))
+	
 					# Get new data (if any) and move it to the output buffers
 					for buffer in self.all_buffers:
 						try:
 							self.queue_from(buffer)
 						except EOFError:
 							# remove this buffer from the set
+							logger.debug(" buffers[%s]=%s" % (buffer.stage, self.buffers[buffer.stage]))
 							self.buffers[buffer.stage].remove(buffer)
+							logger.debug("xbuffers[%s]=%s, %s" % (buffer.stage, self.buffers[buffer.stage], buffer))
+							#self.ctl.append(lambda buffer=buffer: self.all_buffers.remove(buffer))
+							self.ctl.append(lambda buffer=buffer: (self.all_buffers.remove(buffer), logger.debug("Removed %s" % (buffer,))))
 							if len(self.buffers[buffer.stage]) == 0:
 								# All workers for this stage have ended;
 								# Enqueue an ACK request to the Gatherers
-								for sc in self.stage_destinations[stage]:
-									sc.queue_eof(stage+1)
+								for sc in self.stage_destinations[buffer.stage]:
+									sc.queue_eof(buffer.stage)
 									sc.add_want_read(1)
-								# Handle the case where we produced no data
-								if len(self.stage.destinations[stage]) == 0:
-									self._all_acknowledged()
+								# Handle the case where a stage emitted no data
+								if len(self.stage_destinations[buffer.stage]) == 0:
+									self._all_acknowledged(buffer.stage)
 
 					# Get only the output buffers with data available
-					scs = dict(( (fd, sc) for sc in self.fd_destinations.iteritems() if sc.want_poll() ))
-
-					# If no data is available, sleep until there is some
-					if len(scs) == 0:
-						# Wait for new data
-						ctl_evt.wait()
-						ctl_evt.clear()
-						continue
-
+					#scs = dict(( (fd, sc) for fd, sc in self.fd_destinations.iteritems() if sc.want_poll() ))
 					# Arm only the sockets for which we have data
-					for fd, sc in scs.iteritems():
-						self.epoll.modify(fd, sc.epoll_flags)
-
+					n_active = 0
+					for fd, sc in self.fd_destinations.iteritems():
+						eflags = sc.epoll_flags()
+						if eflags == 0:
+							continue
+						self.epoll.modify(fd, eflags)
+						n_active += 1
+	
+					# If no data is available, sleep until there is some
+					if n_active == 0:
+						# Wait for new data
+						self.ctl_evt.wait()
+						self.ctl_evt.clear()
+						continue
+					
 					# Write while there's something to write,
 					# or until we make ~10 runs around the loop at which
 					# point recheck the buffers (this is for fairness, to prevent
@@ -810,36 +855,40 @@ class Worker(object):
 					for _ in xrange(10):
 						# Wait for readiness
 						events = self.epoll.poll(0.05)
-
+	
 						for fd, ev in events:
+							sc = self.fd_destinations[fd]
 							# Check for disconnects
 							if ev & select.EPOLLHUP:
-								scs[fd].close()
-								del scs[fd]
+								sc.close()
+								self.epoll.modify(fd, 0)
 								del self.fd_destinations[fd]
-
+								continue
+	
 							# Write stuff out
 							if ev & select.EPOLLOUT:
-								sc = scs[fd]
 								sc.send()
-								if not sc.have_data_to_send():
-									del scs[fd]
-									self.epoll.modify(fd, 0)
 
 							# Read back ACK messages
 							if ev & select.EPOLLIN:
-								sc = scs[fd]
-								stages = sc.recv_ack()
-								for stage in stages:
+								for stage in sc.recv_ack():
+									logger.debug("Removing %s from stage_destinations[%s] (%s)" % (sc, stage, self.stage_destinations))
 									self.stage_destinations[stage].remove(sc)
 									sc.add_want_read(-1)
-									if(len(self.stage.destinations[stage]) == 0):
-										self._all_acknowledged()
-
-						if not len(scs):
+									if(len(self.stage_destinations[stage]) == 0):
+										self._all_acknowledged(stage)
+	
+							# See if we emptied this buffer
+							eflags = sc.epoll_flags()
+							self.epoll.modify(fd, eflags)
+							if not eflags:
+								n_active -= 1
+	
+						if n_active == 0:
 							break
-			finally:
-				epoll.close()
+			except StopIteration:
+				logger.debug("Got the exit signal.")
+				pass
 
 	class Gatherer(AsyncoreLogErrorMixIn, asyncore.dispatcher_with_send):
 		"""
@@ -873,6 +922,7 @@ class Worker(object):
 				# Receive as much as possible into self.buf, and attempt to
 				# process it if the message is complete.
 				data = self.recv(1*1024*1024)
+#				logger.debug("Receiving data (len=%s)" % (len(data),))
 #				data = self.recv(4096)
 				if len(data):
 					self.buf.write(data)
@@ -917,6 +967,7 @@ class Worker(object):
 					if key == AckDoneSentinel:
 						# Respond by echoing back the stage, in struct-packed format
 						self.send(struct.pack('<I', stage))
+						logger.debug("ACK EOF stage=%s" % (stage,))
 					else:
 						# Commit to the apropriate stage Buffer
 						try:
@@ -924,6 +975,7 @@ class Worker(object):
 						except KeyError:
 							buffer = self.buffer_cache[stage] = self.parent.get_or_create_buffer(stage)
 						buffer.append(key, pkl_value)
+						#logger.debug("stage=%s" % stage)
 
 				# Keep only the unread bits
 				s = buf.read()
@@ -1298,7 +1350,6 @@ class Worker(object):
 	locals  = None		# Local variables to be made available to the kernels (TODO: not implemented yet)
 
 	curl	= None		# Coordinator XMLRPC server URL	
-	coordinator = None	# XMLRPC Proxy to the Coordinator
 	gatherer = None		# Gatherer instance
 	scatterer = None	# Scatterer instance
 	asyncore_thread = None	# AsyncoreThread instance running asyncore.loop with the gatherer and scatterer
@@ -1377,7 +1428,6 @@ class Worker(object):
 		# WARNING: This routine MUST NOT call back the Coordinator
 		#          or else it will deadlock
 		self.curl = curl
-		self.coordinator = xmlrpclib.ServerProxy(curl)
 
 		# Initialize Gatherer and Scatterer threads, with the asyncore
 		# loop running in a separate thread
@@ -1387,7 +1437,7 @@ class Worker(object):
 		self.asyncore_thread.start()
 
 		self.scatterer = self.Scatterer(self, curl)
-		self.scatterer_thread = Thread(target=self.scatterer.run)
+		self.scatterer_thread = Thread(name='Scatter', target=self.scatterer.run)
 		self.scatterer_thread.daemon = True
 		self.scatterer_thread.start()
 
@@ -1430,8 +1480,7 @@ class Worker(object):
 		_, v = kv
 		httpd, port = start_server(BaseHTTPServer.HTTPServer, self.ResultHTTPRequestHandler, self.port, self.hostname)
 
-		with self.lock:
-			self.coordinator.notify_client_of_result("http://%s:%s" % (self.hostname, port))
+		xmlrpclib.ServerProxy(self.curl).notify_client_of_result("http://%s:%s" % (self.hostname, port))
 
 		httpd.valiter = v	# The iterator returning the values
 		httpd.handle_request()
@@ -1495,8 +1544,8 @@ class Worker(object):
 			self.running_stage_threads[stage] -= 1
 			last_thread = self.running_stage_threads[stage] == 0
 
-			# Let the coordinator know a stage thread has ended
-			self.coordinator.stage_thread_ended(self.url, stage)
+		# Let the coordinator know a stage thread has ended
+		xmlrpclib.ServerProxy(self.curl).stage_thread_ended(self.url, stage)
 
 		if last_thread:
 			with self.lock:
@@ -1512,12 +1561,15 @@ class Worker(object):
 		# WARNING: This routine must not call back into the
 		#          Coordinator (will deadlock)
 		logger.debug("Starting stage %s on %s (maxpeers=%s)" % (stage, self.url, maxpeers))
+#		if stage != -1:
+#			return
 		with self.lock:
+			logger.debug("Entered lock")
 			assert -1 <= stage <= len(self.kernels)
 			self.running_stage_threads[stage] += 1
 			if self.running_stage_threads[stage] == 1:
 				self.maxpeers[stage+1] = maxpeers
-			ob = self.scatterer.new_output_buffer(stage)
+			ob = self.scatterer.new_output_buffer(stage+1)
 			th = Thread(name='Stage-%02d' % stage, target=self._worker, args=(stage, ob))
 			th.daemon = True
 			th.start()
@@ -1533,6 +1585,14 @@ class Worker(object):
 		with self.lock:
 			# Assert all jobs have finished
 			assert len(self.running_stage_threads) == 0, str(self.running_stage_threads)
+
+			# Shut down the scatterer thread
+			self.scatterer.shutdown()
+			self.scatterer_thread.join(10)
+			if self.scatterer_thread.is_alive():
+				logger.error("Scatterer thread still alive.")
+			else:
+				logger.info("Shut down the scatterer thread")
 
 			# Close the Gatherer and the Scatterer
 			#logger.info("Caling asyncore_thread.close_all")
@@ -1745,6 +1805,16 @@ class Peer:
 				self._progress("THREAD_ENDED_ON_WORKER", (wurl, stage, worker.running_stage_threads[stage]))
 
 		def stage_ended(self, wurl, stage):
+			# Called by a Worker when all of its threads
+			# executing the stage have finished, and when it has
+			# gotten the acknowledgments from upstream Workers that
+			# they've received all the stage+1 data it sent them.
+			
+			# We launch the real work in a separate thread, and immediately
+			# return to the worker
+			Thread(target=self._stage_ended_thread, args=(wurl, stage)).start()
+			
+		def _stage_ended_thread(self, wurl, stage):
 			# Called by a Worker when all of its threads
 			# executing the stage have finished, and when it has
 			# gotten the acknowledgments from upstream Workers that
