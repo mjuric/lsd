@@ -13,10 +13,10 @@ def mapper(v):
 	my = MyClass()
 	my.nada = 'gaga'
 
-	ntot = 128
+	ntot = 2
 	for wt in xrange(0, ntot):
 		my.ct = 1./ntot
-		yield v % 256, (my, np.arange(ntot))
+		yield v % 1024, (my, np.arange(ntot))
 
 def reducer1(kv):
 	key, v = kv
@@ -33,7 +33,7 @@ def reducer(kv):
 
 if __name__ == "__main__":
 	#v = np.arange(128*2**10)
-	v = np.arange(8*1024)
+	v = np.arange(128*1024)
 
 	# Parallel
 	if True:

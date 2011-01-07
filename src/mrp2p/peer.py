@@ -24,6 +24,8 @@ import platform
 import gc
 import binascii
 import select
+import contextlib
+import collections
 from base64 import b64encode, b64decode
 from collections import defaultdict, deque
 from heapq import heappop, heappush, heapify
@@ -231,7 +233,7 @@ class TaskSpec(object):
 	env     = None	 	# User's task environment
 
 	nitems  = None		# Number of items
-	nkernel = None		# Number of kernels
+	nkernels= None		# Number of kernels
 	nlocals = None		# Number of locals
 
 	def __init__(self, fn=None, argv=None, cwd=None, env=None, nitems=0, nkernels=0, nlocals=0):
@@ -296,6 +298,20 @@ class Pool:
 	def __init__(self, directory):
 		self.directory = directory
 
+	def print_status(self, status, nitems):
+		keys_out_prev = nitems
+		for stage, keys_in, values_out, keys_out, ended in status:
+			try:
+				pct = "%6.2f%%" % (100. * keys_in / keys_out_prev)
+			except TypeError:
+				pct = "       "
+
+			state = "COMPLETED" if ended else "IN PROGRESS"
+
+			print >>sys.stderr, "Stage %2d: %7d keys to %7d values, %s (%s)" % (stage, keys_in, values_out, pct, state)
+
+			keys_out_prev = keys_out
+
 	def map_reduce_chain(self, items, kernels, locals=[], progress_callback=None):
 		# Prepare request
 		spec = TaskSpec(fn, argv, cwd, env, len(items), len(kernels), len(locals))
@@ -326,6 +342,8 @@ class Pool:
 			try:
 				msg, args = cPickle.load(fp)
 				print >>sys.stderr, datetime.datetime.now().ctime(), "[PROGRESS]", msg, args
+				if msg == "STATUS":
+					self.print_status(args, len(items))
 			except EOFError:
 				fp.close()
 				break
@@ -440,100 +458,28 @@ class AsyncoreThread(Thread):
 		#logger.info(self.map)
 		self.schedule( lambda: asyncore.close_all(self.map, ignore_all) )
 
+def serialize_message(fp, stage, key, value):
+	# Serialize the key/value. This defines the packet format
+	# on the wire.
+	pkt_beg = fp.tell()
+	fp.seek(8, 1)					# 1. [ int64] Payload length (placeholder, filled in 5.)
+
+	payload_beg = fp.tell()
+	fp.write(struct.pack('<I', stage))		# 2. [uint32] Destination stage
+
+	cPickle.dump(key, fp, -1)				# 3. [pickle] Key
+	cPickle.dump(value, fp, -1)				# 4. [pickle] Value
+
+	end = fp.tell()
+	fp.seek(pkt_beg)
+	fp.write(struct.pack('<Q', end - payload_beg))	# 5. Fill in the length
+	fp.seek(end)
+
 class Worker(object):
 	"""
 	The class encapsulating a Worker process, and acting
 	as an XMLRPC method provider.
 	"""
-
-	class OutputBuffer(object):
-		"""
-		Output buffer for the workers, one per worker thread
-		"""
-		bufsize = BUFSIZE 	# buffer size - 1TB (ext3 max. file size is 2TB)
-
-		stage = None		# Destination stage for the contents of this buffer
-
-		mm = None			# Memory map buffer used for buffering
-		lastq = None		# dequeue containing the last watermark
-
-		evt = None			# Event to set to signal when there's more data
-		parent = None		# Parent Worker instance
-
-		# Variables for use by the Scatterer thread
-		at = 0		# Read position within the buffer
-		end = 0		# Read stop position within the buffer
-		hash = None	# The last hash that was read
-		length = 0	# The number of bytes remaining to the end of the packet that was last read
-
-		buffer_cache = None	# WeakValueDictionary to Buffers (to avoid locking the parent when fetching one)
-
-		def __init__(self, parent, stage, evt):
-			self.stage = stage
-
-			self.mm = _make_buffer_mmap(self.bufsize)
-
-			self.evt = evt
-			self.lastq = deque(maxlen=1)
-
-			self.hash_key = parent._hash_key
-
-			# Support for bypassing TCP if the destination is local
-			self.buffer_cache = weakref.WeakValueDictionary()
-			self.scatterer = parent.scatterer
-			self.gatherer = parent.gatherer
-
-		def queue_eof(self):
-			# Queue the EOF marker
-			# Runs from the worker thread
-			#logger.info("QUEUE EOF stage=%s " % (self.stage,))
-			self.hash_key = lambda stage, key: 0xFFFFFFFF
-			self.queue((None, None))
-
-		def queue(self, kv):
-			# Queue the (key, value) into the buffer
-			# Runs from the worker thread
-
-			key, value = kv
-			keyhash = self.hash_key(self.stage, key)
-
-			if (self.stage, keyhash) in self.scatterer.local_destinations:
-				# bypass TCP/IP if we're the destination
-				pkl_value = cPickle.dumps(value, -1)
-				try:
-					buffer = self.buffer_cache[self.stage]
-				except KeyError:
-					buffer = self.buffer_cache[self.stage] = self.gatherer.get_or_create_buffer(self.stage)
-				buffer.append(key, pkl_value)
-			else:
-				# Prepend key hash
-				self.mm.write(struct.pack('<I', keyhash))	# 0. [uint32] Key hash
-	
-				# store the message
-				Worker.OutputBuffer.serialize_message(self.mm, self.stage, key, value)
-	
-				# Notify the scatterer
-				self.lastq.append(self.mm.tell())
-				if not self.evt.is_set():
-					self.evt.set()
-
-		@staticmethod
-		def serialize_message(fp, stage, key, value):
-			# Serialize the key/value. This defines the packet format
-			# on the wire.
-			pkt_beg = fp.tell()
-			fp.seek(8, 1)					# 1. [ int64] Payload length (placeholder, filled in 5.)
-
-			payload_beg = fp.tell()
-			fp.write(struct.pack('<I', stage))		# 2. [uint32] Destination stage
-
-			cPickle.dump(key, fp, -1)				# 3. [pickle] Key
-			cPickle.dump(value, fp, -1)				# 4. [pickle] Value
-
-			end = fp.tell()
-			fp.seek(pkt_beg)
-			fp.write(struct.pack('<Q', end - payload_beg))	# 5. Fill in the length
-			fp.seek(end)
 
 	class Scatterer(object):
 		class ScattererChannel:
@@ -602,7 +548,6 @@ class Worker(object):
 				# Record the end-of-stage marker, taking into account
 				# that there may be a partially queued packet in the
 				# buffer.
-
 				self.pending_eofs.append(stage)
 
 				if not self._flush_eofs():
@@ -619,7 +564,7 @@ class Worker(object):
 
 				for stage in eofs:
 					fp = cStringIO.StringIO()
-					Worker.OutputBuffer.serialize_message(fp, stage, AckDoneSentinel, stage)
+					serialize_message(fp, stage, AckDoneSentinel, stage)
 					pkt = fp.getvalue()
 					queued = self.queue(pkt, 0, len(pkt), extra=self.margin)
 					assert queued == len(pkt)
@@ -689,8 +634,8 @@ class Worker(object):
 			self.ctl_evt = Event("Scatterer")	# Notification mechanism for this thread
 			self.epoll = select.epoll()			# Waiting on sockets
 
-			self.buffers = defaultdict(set)		# Output buffers that the worker writes to (keyed by stage)
-			self.all_buffers = set()
+			self.buffers = defaultdict(set)		# Output buffers that the worker writes to (keyed by destination stage)
+			self.all_buffers = set()			# Set of all output buffers
 
 			self.known_destinations = defaultdict(dict)				# (stage) -> {(keyhash) -> (wurl)}
 			self.stage_destinations = defaultdict(set)				# (stage) -> set(ScatterChannel) map
@@ -781,7 +726,7 @@ class Worker(object):
 					raise EOFError
 
 				# Find the destination channel
-				stage = buffer.stage
+				stage = buffer.stage+1
 				keyhash = buffer.hash
 				if (stage, keyhash) in self.key_destinations:
 					# Destination known
@@ -830,17 +775,19 @@ class Worker(object):
 			# if we haven't even begun.
 			return buffer.hash is None or buffer.length == buffer.full_length
 
-		def new_output_buffer(self, stage):
+		def register_data_source(self, ob):
 			"""
-			Create a new output buffer and add it to the
-			list of buffers
+			Register the output buffer as a data source for the
+			scatterer.
 			"""
-			ob = Worker.OutputBuffer(self.parent, stage, self.ctl_evt)
 			self.ctl.append(lambda ob=ob: (
-									self.buffers[stage].add(ob),
+									self.buffers[ob.stage+1].add(ob),
 									self.all_buffers.add(ob)
 						))
+
+			ob.evt = self.ctl_evt
 			self.ctl_evt.set()
+
 			return ob
 
 		def shutdown(self):
@@ -879,19 +826,20 @@ class Worker(object):
 						except EOFError:
 							# We've exhausted this buffer. Remove it
 							# from the set
-							self.buffers[buffer.stage].remove(buffer)
+							stage = buffer.stage + 1
+							self.buffers[stage].remove(buffer)
 							self.ctl.append(lambda buffer=buffer: self.all_buffers.remove(buffer))
 
 							# If all workers processing this stage have ended,
 							# enqueue the EOF signal for remote Gatherers
-							if len(self.buffers[buffer.stage]) == 0:
-								for sc in self.stage_destinations[buffer.stage]:
-									sc.queue_eof(buffer.stage)
+							if len(self.buffers[stage]) == 0:
+								for sc in self.stage_destinations[stage]:
+									sc.queue_eof(stage)
 									sc.add_want_read(1)
 
 								# Handle the case where a stage emitted no data.
-								if len(self.stage_destinations[buffer.stage]) == 0:
-									self._all_acknowledged(buffer.stage)
+								if len(self.stage_destinations[stage]) == 0:
+									self._all_acknowledged(stage)
 
 					# Only arm the sockets for which we have data
 					n_active = 0
@@ -1058,6 +1006,7 @@ class Worker(object):
 						# values are available for the given key
 			all_recvd = False	# True if the stage _before_ the one this Buffer is buffering
 						# has ended (i.e., no more key/values are to be received).
+			keys_received = 0 # The number of keys we've received
 
 			vtresh = 0; #2**20	# The size of data in bytes that we'll wait to get buffered before
 							# we trigger a new_value_evts[key] event and let the _worker know
@@ -1118,6 +1067,7 @@ class Worker(object):
 				# .. unless this is the initialization of the primary chain
 				if new_key and key is not KeyChainSentinel:
 					self._append(KeyChainSentinel, cPickle.dumps((key, self.chains[key][0]), -1))
+					self.keys_received += 1
 
 					# Notify listener (Buffer.itervalues instances) that new keys are available
 					self.new_key_evt.set()
@@ -1283,6 +1233,8 @@ class Worker(object):
 					for evt, _ in self.new_value_evts.itervalues():
 						evt.set()
 
+					return self.keys_received
+
 		## Gatherer #######################################################3
 		parent = None		# Worker instance
 		asyncore_map = None	# asyncore map that Gatherer participates in
@@ -1366,14 +1318,6 @@ class Worker(object):
 			with self.lock:
 				return self._get_or_create_buffer(stage).iteritems()
 
-		def worker_done_with_stage(self, stage):
-			# Called by the worker thread to signal it's done
-			# processing the data in this stage, and that it can
-			# be safely discarded.
-			logger.info("Discarding buffer for stage=%s" % (stage,))
-			with self.lock:
-				del self.buffers[stage]
-
 		def append(self, stage, key, pkl_value):
 			"""
 			Store a (key, pkl_value) pair into the buffer for
@@ -1396,6 +1340,14 @@ class Worker(object):
 
 			return buffer.all_received()
 
+		def worker_done_with_stage(self, stage):
+			# Called by the local worker thread to signal it's done
+			# processing the data in this stage, and that it can
+			# be safely discarded.
+			logger.info("Discarding buffer for stage=%s" % (stage,))
+			with self.lock:
+				del self.buffers[stage]
+
 		def handle_accept(self):
 			# Accept a new connection to this Gatherer (presumably
 			# by another Scatterer)
@@ -1404,6 +1356,302 @@ class Worker(object):
 				sock, _ = pair
 				self.GathererChannel(self, sock, self.asyncore_map)
 
+	class StageRunner(threading.Thread):
+		"""
+		An object representing a stage being run.
+		"""
+		class StageThread(threading.Thread):
+			"""
+			A single thread running a stage, with its output
+			buffer. Note that there may be more than one thread
+			running the same stage (if the user requests so)
+			"""
+
+			class ResultHTTPRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+				def do_GET(self):
+					# Just return the results to the user
+					self.send_response(200)
+					self.send_header("Content-type", "binary/octet-stream")
+					self.end_headers()
+		
+					for v in self.server.valiter:
+						cPickle.dump(v, self.wfile, -1)
+		
+				def log_message(self, format, *args):
+					# Need to override this, otherwise log messages will
+					# wind up on stderr
+					logger.info("ResultHTTPRequestHandler: " + format % args)
+
+			## StageThread ###############################
+			bufsize = BUFSIZE 	# buffer size - 1TB (ext3 max. file size is 2TB)
+	
+			stage = None		# The stage this thread is processing
+	
+			mm = None			# Memory map buffer used for buffering
+			lastq = None		# dequeue containing the last watermark
+	
+			evt = None			# Event to set to signal when there's more data
+			parent = None		# Parent StageRunner instance
+			thread_idx = None	# Thread index (0..nthreads for the stage)
+	
+			# Variables for use by the Scatterer thread
+			at = 0		# Read position within the buffer
+			end = 0		# Read stop position within the buffer
+			hash = None	# The last hash that was read
+			length = 0	# The number of bytes remaining to the end of the packet that was last read
+	
+			values_generated = 0 # The number of generated values
+			keys_processed = 0 # The number of processed keys
+	
+			def __init__(self, parent, thread_idx):
+				self.parent = parent
+				self.thread_idx = thread_idx
+
+				# Cache frequently used values from the parent Runner
+				self.stage = parent.stage
+				self.hash_key = parent.hash_key
+				self.coordinator = parent.parent.coordinator
+				self.kernels = parent.parent.kernels
+				self.hostname = parent.parent.hostname
+
+				# Output buffer	
+				self.mm = _make_buffer_mmap(self.bufsize)	
+				self.lastq = deque(maxlen=1)
+
+				# Support for bypassing TCP if the destination is local
+				self.scatterer = parent.parent.scatterer
+				self.gatherer = parent.parent.gatherer
+
+				# Initialize the thread
+				threading.Thread.__init__(self, name='Stage-%1d-%1d' % (self.stage, thread_idx))
+				self.daemon = True
+
+			def queue_eof(self):
+				# Queue the EOF marker
+				# Runs from the worker thread
+				#logger.info("QUEUE EOF stage=%s " % (self.stage,))
+				self.hash_key = lambda key: 0xFFFFFFFF
+				self.queue((None, None))
+	
+			def queue(self, kv):
+				# Queue the (key, value) into the buffer
+				# Runs from the worker thread
+				key, value = kv
+				keyhash = self.hash_key(key)
+
+				if (self.stage+1, keyhash) in self.scatterer.local_destinations:
+					# bypass TCP/IP if we're the destination
+					pkl_value = cPickle.dumps(value, -1)
+					try:
+						buffer = self._gatherer_buffer_cache
+					except AttributeError:
+						buffer = self._gatherer_buffer_cache = self.gatherer.get_or_create_buffer(self.stage+1)
+					buffer.append(key, pkl_value)
+				else:
+					# Prepend key hash
+					self.mm.write(struct.pack('<I', keyhash))	# 0. [uint32] Key hash
+		
+					# store the message
+					serialize_message(self.mm, self.stage+1, key, value)
+
+					# Notify the scatterer
+					self.lastq.append(self.mm.tell())
+					if not self.evt.is_set():
+						self.evt.set()
+	
+			def _serve_results(self, kv):
+				"""
+				Open a HTTP port and serve the results back to the client.
+				"""
+				if False:
+					# Force this method to be compiled as a generator
+					yield None
+		
+				_, v = kv
+				httpd, port = start_server(BaseHTTPServer.HTTPServer, self.ResultHTTPRequestHandler, 1024, self.hostname)
+
+				with self.coordinator() as coord:
+					coord.notify_client_of_result("http://%s:%s" % (self.hostname, port))
+
+				httpd.valiter = v	# The iterator returning the values
+				httpd.handle_request()
+				logger.info("Results served")
+
+			def run(self):
+				# Executes the kernel for a given stage in
+				# a separate thread (called from start())
+				stage = self.stage
+	
+				logger.info("Thread %d for stage %s active on %s" % (self.thread_idx, stage, self.parent.parent.url))
+				# stage = -1 and stage = len(kernels) are special (feeder and collector kernels)
+				# stage = 0 and stage = len(kernels)-1 have wrappers to make them look like reducers
+				if stage == -1:
+					# Feeder kernel
+					def K_start(kv):
+						_, v = kv
+						items = list(v)
+						for k, item in enumerate(items[0]):
+							yield k, item
+					K_fun, K_args = K_start, ()
+				elif stage == len(self.kernels):
+					# Server kernel (serves the results back to the user)
+					K_fun, K_args = self._serve_results, ()
+				else:
+					K_fun, K_args = unpack_callable(self.kernels[stage])
+	
+					if stage == 0:
+						# stage = 0 kernel has a thin wrapper removing
+						# the keys before passing the values to the mapper
+						def K(kv, args, K_fun, K_args):
+							_, v = kv
+							for val in v:
+								for res in K_fun(val, *K_args):
+									yield res
+						K_fun, K_args = K, (args, K_fun, K_args)
+	
+					if stage == len(self.kernels)-1:
+						# last stage has a wrapper keying the outputs
+						# to the same value (so they get redirected to
+						# the collector)
+						def K(kv, args, K_fun, K_args):
+							for res in K_fun(kv, *K_args):
+								yield (0, res)
+						K_fun, K_args = K, (args, K_fun, K_args)
+	
+				# Do the actual work
+				for key, valgen in self.gatherer.iteritems(stage):
+					for kv in K_fun((key, valgen), *K_args):
+						self.values_generated += 1
+						self.queue(kv)
+					self.keys_processed += 1
+					#logger.debug("Processed stage=%s nkeys=%s nvals=%s" % (self.stage, self.keys_processed, self.values_generated))
+
+				# Let the parent know a thread has ended.
+				self.parent.unregister_thread(self.thread_idx)
+
+				self.queue_eof()
+
+		## StageRunner ##############################################################
+		stage = None
+		parent = None		# Parent Worker instance
+		nthreads = None		# The total number of threads to be executed for this stage
+
+		threads = None		# dict:thread_idx->StageThread of threads still running
+		lock = None			# Lock protecting self.threads
+
+		keys_processed = None	# The number of keys processed by _completed_ threads
+		values_generated = None	# The number of values generated by _completed_ threads
+		
+		monitor_evt = None	# Event used to signal the monitor thread that something happened
+
+		def __init__(self, parent, stage, maxpeers, nthreads):
+			self.parent = parent
+			self.stage = stage
+			self.maxpeers = maxpeers
+			self.nthreads = nthreads
+			
+			self.threads = dict()
+			self.lock = Lock("StageRunner-%s" % stage)
+			
+			self.monitor_evt = Event("StageMonitor-%s" % stage)
+			
+			self.keys_processed = 0
+			self.values_generated = 0
+
+			# Initialize the thread object
+			threading.Thread.__init__(self, name='Monitor-%1d' % (self.stage))
+			self.daemon = True
+
+		def unregister_thread(self, thread_idx):
+			# Remove a thread from the running threads dictionary
+			logger.debug("Unregistering thread for stage=%s" % (self.stage,))
+			with self.lock:
+				th = self.threads[thread_idx]
+				del self.threads[thread_idx]
+
+				# Remember the number of keys/values processed, for later
+				self.keys_processed, self.values_generated = th.keys_processed, th.values_generated
+
+			# Let the coordinator know a thread has ended
+			with self.parent.coordinator() as coord:
+				coord.stage_thread_ended(self.parent.url, self.stage)
+
+			# Let the progress thread know something interesting
+			# happened
+			self.monitor_evt.set()
+
+		def hash_key(self, key):
+			# Return a hash for the key. The Coordinator will
+			# be queried for the destination based on this hash.
+			# The hash may be any value except 0xFFFFFFFF
+			keyhash = binascii.crc32(str(hash(key))) % self.maxpeers
+			return keyhash
+
+		def _finalize_stage_run(self):
+			# Ran from the monitor thread, once all stage threads exit.
+			# Let the parent know we're done.
+			logger.debug("Here")
+			self.parent._unregister_stage_runner(self.stage)
+
+			# Let the gatherer know we're done consuming
+			self.parent.gatherer.worker_done_with_stage(self.stage)
+
+		def run(self):
+			# Periodically report our progress to the Coordinator,
+			# as long as there's something to report.
+			while True:
+				logger.debug("Sending progress")
+				self.report_progress()
+
+				logger.debug("Entering lock")
+				with self.lock:
+					logger.debug("Testing number of threads")
+					if len(self.threads) == 0:
+						# All threads have finished
+						self._finalize_stage_run()
+						break
+
+				# TODO: The delay should be made random
+				self.monitor_evt.wait(1)
+				logger.debug("Monitor woken up")
+				self.monitor_evt.clear()
+			logger.debug("Exiting monitor")
+
+		def start(self):
+			# Starts up the threads for the stage. Called
+			# from run_stage()
+			for i in xrange(self.nthreads):
+				# Create a new thread
+				th = self.StageThread(self, i)
+
+				with self.lock:
+					self.threads[i] = th
+
+				# Register our thread's output as the data source for the scatterer
+				self.parent.scatterer.register_data_source(th)
+
+				# Run the thread
+				th.start()
+
+			# Run the monitor thread
+			threading.Thread.start(self)
+
+		def report_progress(self, force=False):
+			# Collect progress info from threads processing this
+			# stage, and report to the Coordinator
+			keys_processed = self.keys_processed
+			values_generated = self.values_generated
+
+			with self.lock:
+				for th in self.threads.itervalues():
+					keys_processed += th.keys_processed
+					values_generated += th.values_generated
+
+			# Report back to the coordinator
+			with self.parent.coordinator() as coord:
+				coord.progress_report(self.parent.url, self.stage, keys_processed, values_generated)
+
+	### Worker ################################
 	server  = None		# XMLRPC server instance
 	hostname = None		# The hostname of this machine
 	port    = None		# The port on which we're listening
@@ -1417,8 +1665,7 @@ class Worker(object):
 	scatterer = None	# Scatterer instance
 	asyncore_thread = None	# AsyncoreThread instance running asyncore.loop with the gatherer and scatterer
 
-	running_stage_threads = None	# defaultdict(int): stage -> number of worker threads processing the keys from stage
-	maxpeers = None		# dict: stage -> maximum number of peers, used to produce keyhashes
+	stage_runners = None	# dict:stage->StageRunner for active stages
 	
 	t_started = None	# Time when we launched
 
@@ -1459,6 +1706,31 @@ class Worker(object):
 
 		return info
 
+	_coordinator_pool = None
+	@contextlib.contextmanager
+	def coordinator(self):
+		"""
+		Manage a pool of xmlrpclib.ServerProxy instances
+		connecting to the coordinator.
+		
+		The point of this function is to be thread safe.
+		"""
+		try:
+			try:
+				coord = self._coordinator_pool.popleft()
+			except AttributeError:
+				# Auto-create the container
+				self._coordinator_pool = collections.deque(maxlen=5)
+				raise IndexError
+		except IndexError:
+			# Auto-create the object
+			coord = xmlrpclib.ServerProxy(self.curl)
+
+		yield coord
+
+		# Return to the pool
+		self._coordinator_pool.append(coord)
+
 	def stat(self):
 		# Return basic statistics about this server
 		with self.lock:
@@ -1475,8 +1747,7 @@ class Worker(object):
 		self.hostname, self.port = hostname, server.server_address[1]
 		self.url = 'http://%s:%s' % (self.hostname, self.port)
 
-		self.running_stage_threads = defaultdict(int)
-		self.maxpeers = dict()
+		self.stage_runners = dict()
 		self.lock      = RLock("Worker")
 
 		# Time when we launched
@@ -1517,108 +1788,6 @@ class Worker(object):
 				self.gatherer.append(-1, 0, cPickle.dumps(item, -1))
 		self.stage_ended(-2)
 
-	class ResultHTTPRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
-		def do_GET(self):
-			# Just return the results to the user
-			self.send_response(200)
-			self.send_header("Content-type", "binary/octet-stream")
-			self.end_headers()
-
-			for v in self.server.valiter:
-				cPickle.dump(v, self.wfile, -1)
-
-		def log_message(self, format, *args):
-			# Need to override this, otherwise log messages will
-			# wind up on stderr
-			logger.info("ResultHTTPRequestHandler: " + format % args)
-
-	def _serve_results(self, kv):
-		"""
-		Open a HTTP port and serve the results back to the client.
-		"""
-		if False:
-			# Force this method to be compiled as a generator
-			yield None
-
-		_, v = kv
-		httpd, port = start_server(BaseHTTPServer.HTTPServer, self.ResultHTTPRequestHandler, self.port, self.hostname)
-
-		xmlrpclib.ServerProxy(self.curl).notify_client_of_result("http://%s:%s" % (self.hostname, port))
-
-		httpd.valiter = v	# The iterator returning the values
-		httpd.handle_request()
-		logger.info("Results served")
-
-	def _hash_key(self, stage, key):
-		# Return a hash for the key. The Coordinator will
-		# be queried for the destination based on this hash.
-		keyhash = binascii.crc32(str(hash(key))) % self.maxpeers[stage]
-		return keyhash
-
-
-	def _worker(self, stage, output):
-		# Executes the kernel for a given stage in
-		# a separate thread (called from run_stage)
-		with self.lock:
-			logger.info("Worker thread for stage %s active on %s" % (stage, self.url))
-			# stage = -1 and stage = len(kernels) are special (feeder and collector kernels)
-			# stage = 0 and stage = len(kernels)-1 have wrappers to make them look like reducers
-			if stage == -1:
-				def K_start(kv):
-					_, v = kv
-					items = list(v)
-					for k, item in enumerate(items[0]):
-						yield k, item
-				K_fun, K_args = K_start, ()
-			elif stage == len(self.kernels):
-				K_fun, K_args = self._serve_results, ()
-			else:
-				K_fun, K_args = unpack_callable(self.kernels[stage])
-
-				if stage == 0:
-					# stage = 0 kernel has a thin wrapper removing
-					# the keys before passing the values to the mapper
-					def K(kv, args, K_fun, K_args):
-						_, v = kv
-						for val in v:
-							for res in K_fun(val, *K_args):
-								yield res
-					K_fun, K_args = K, (args, K_fun, K_args)
-
-				if stage == len(self.kernels)-1:
-					# last stage has a wrapper keying the outputs
-					# to the same value (so they get redirected to
-					# the collector)
-					def K(kv, args, K_fun, K_args):
-						for res in K_fun(kv, *K_args):
-							yield (0, res)
-					K_fun, K_args = K, (args, K_fun, K_args)
-
-		# Do the actual work
-		for key, valgen in self.gatherer.iteritems(stage):
-			for kv in K_fun((key, valgen), *K_args):
-				output.queue(kv)
-
-		# Let the Gatherer know it can discard data for the processed stage
-		self.gatherer.worker_done_with_stage(stage)
-
-		with self.lock:
-			# Unregister ourselves from the list of active workers
-			self.running_stage_threads[stage] -= 1
-			last_thread = self.running_stage_threads[stage] == 0
-
-		# Let the coordinator know a stage thread has ended
-		xmlrpclib.ServerProxy(self.curl).stage_thread_ended(self.url, stage)
-
-		if last_thread:
-			with self.lock:
-				# Delete the entry for this stage
-				del self.running_stage_threads[stage]
-
-			# If this is the last thread left running this stage,
-			# let the Scatterer know we're done producing for stage+1
-			output.queue_eof()
-
 	def run_stage(self, stage, maxpeers):#, nthreads=1, npeers=100):
 		# Start running a stage, in a separate thread
 		# WARNING: This routine must not call back into the
@@ -1629,25 +1798,39 @@ class Worker(object):
 		with self.lock:
 			logger.debug("Entered lock")
 			assert -1 <= stage <= len(self.kernels)
-			self.running_stage_threads[stage] += 1
-			if self.running_stage_threads[stage] == 1:
-				self.maxpeers[stage+1] = maxpeers
-			ob = self.scatterer.new_output_buffer(stage+1)
-			th = Thread(name='Stage-%02d' % stage, target=self._worker, args=(stage, ob))
-			th.daemon = True
-			th.start()
+			assert stage not in self.stage_runners
+			sr = self.stage_runners[stage] = self.StageRunner(self, stage, maxpeers, 1)
+
+		sr.start()
+
+	def _unregister_stage_runner(self, stage):
+		# Called by StageRunner._monitor when all stage threads end
+		with self.lock:
+			logger.debug("Unregistering runner for stage=%s" % stage)
+			assert stage in self.stage_runners
+			del self.stage_runners[stage]
 
 	def stage_ended(self, stage):
 		# Notification from the coordinator that a particular
-		# stage has ended
-		self.gatherer.stage_ended(stage)
+		# stage has ended. Pass it on to the Gatherer.
+		##assert stage not in self.stage_runners, stage
+		return self.gatherer.stage_ended(stage)
 
 	def shutdown(self):
 		# Command from the Coordinator to shut down
 		logger.info("Shutting down worker %s" % (self.url,))
+
+		# Wait for remaining stage runners, as they may have not
+		# exited yet
+		with self.lock:
+			stage_runners = dict(self.stage_runners)
+		for runner in stage_runners.itervalues():
+			logger.debug("Joining runner %s" % runner.name)
+			runner.join()
+
 		with self.lock:
 			# Assert all jobs have finished
-			assert len(self.running_stage_threads) == 0, str(self.running_stage_threads)
+			assert len(self.stage_runners) == 0, str(self.stage_runners)
 
 			# Shut down the scatterer thread
 			self.scatterer.shutdown()
@@ -1678,10 +1861,11 @@ class Peer:
 	class _Coordinator(object):
 		class WorkerProxy(xmlrpclib.ServerProxy):
 			url                   = None	# URL of the Worker
-			purl		      = None	# URL of the Worker's Peer
+			purl		 	     = None	# URL of the Worker's Peer
 			running_stage_threads = None	# defaultdict(int): the number of threads running each stage on the Worker
 			nkeys                 = None	# defaultdict(int): the number of keys assigned to this worker, per stage
 			process               = None	# subprocess.Popen class for local workers, None for remote workers
+			processing_status = None # dict:stage->count -- The number of keys already processed
 
 			def __eq__(self, other):
 				return self.url == other.url
@@ -1702,17 +1886,30 @@ class Peer:
 				the run in running_stage_threads
 				"""
 				self.running_stage_threads[stage] += 1
-				return self.__getattr__('run_stage')(stage, *args, **kwargs)
+				self.processing_status[stage] = np.zeros(2, dtype=int)
+				ret = self.__getattr__('run_stage')(stage, *args, **kwargs)
 
-			def __init__(self, url, purl, process=None):
+				for worker in self.parent.workers.itervalues():
+					if worker is self: continue
+					if stage in worker.running_stage_threads:
+						break
+				else:
+					self.parent._progress("STAGE_STARTED", (stage,))
+				self.parent._progress("STAGE_STARTED_ON_WORKER", (self.url, stage))
+
+				return ret
+
+			def __init__(self, parent, url, purl, process=None):
 				xmlrpclib.ServerProxy.__init__(self, url)
 
+				self.parent = parent
 				self.url = url
 				self.purl = purl
 				self.process = process
 			
 				self.running_stage_threads = defaultdict(int)
 				self.nkeys = defaultdict(int)
+				self.processing_status = {}
 
 		## _Coordinator ####################
 		id		= None	# Unique task ID
@@ -1739,6 +1936,49 @@ class Peer:
 
 		lock    = None	# Lock protecting instance variables
 		t_started = None # Time (datetime) when we were started
+		
+		ended_stages = None # dict: stages->nkeys_produced for stages that have ended
+
+		def progress_report(self, wurl, stage, keys_processed, values_generated):
+			with self.lock:
+				worker = self.workers[wurl]
+				worker.processing_status[stage][:] = (keys_processed, values_generated)
+
+				self._report_status_to_client()
+
+		def _report_status_to_client(self, force=False):
+			# Message the client about progress
+			# TODO: Split this out into a separate thread.
+			with self.lock:
+				try:
+					tprog = self.tprog
+				except AttributeError:
+					tprog = self.tprog = 0
+
+			if force:
+				tprog = 0
+
+			now = time.time()
+			if now > tprog + 5:
+				stage_status = defaultdict(lambda: np.zeros(2, dtype=int))
+				with self.lock:
+					# Sum up how we're progressing
+					for worker in self.workers.itervalues():
+						for stage, status in worker.processing_status.iteritems():
+							stage_status[stage] += status
+					# Add the information about which stages have ended
+					# and construct the report
+					report = []
+					for stage in xrange(0, self.spec.nkernels):
+						try:
+							keys_out = self.ended_stages[stage]
+							ended = True
+						except KeyError:
+							keys_out, ended = None, False
+						keys_in, values_out = stage_status[stage] if stage in stage_status else (0, 0)
+						report.append((stage, keys_in, values_out, keys_out, ended))
+				self._progress("STATUS", report)
+				self.tprog = time.time()
 
 		def _html_(self):
 			with self.lock:
@@ -1793,6 +2033,8 @@ class Peer:
 			self.worker_heap = []
 			self.destinations = defaultdict(dict)
 			self.maxpeers = dict()
+			
+			self.ended_stages = {}
 
 			# Time when we launched
 			self.t_started = datetime.datetime.now()
@@ -1831,7 +2073,7 @@ class Peer:
 			# Launch the worker
 			logger.debug("Launch worker for task %s" % (self.id,))
 			wurl = peer.start_worker(self.id, self.spec.serialize())
-			worker = self.WorkerProxy(wurl, purl)
+			worker = self.WorkerProxy(self, wurl, purl)
 
 			# Store the worker into our list of workers
 			with self.lock:
@@ -1882,9 +2124,10 @@ class Peer:
 			# executing the stage have finished, and when it has
 			# gotten the acknowledgments from upstream Workers that
 			# they've received all the stage+1 data it sent them.
+			task_ended = False
 			with self.lock:
 				worker = self.workers[wurl]
-				assert worker.running_stage_threads[stage] == 0
+				assert worker.running_stage_threads[stage] == 0, worker.running_stage_threads
 				# Decrease this worker's load and rebuild worker_heap
 				self.worker_heap = [ (load - w.nkeys[stage] if w is worker else load, w) for load, w in self.worker_heap ]
 				heapify(self.worker_heap)
@@ -1907,14 +2150,18 @@ class Peer:
 					# This stage was not found in any of the worker's
 					# running_stage_threads. Means this stage for the
 					# entire task has ended.
-					self._progress("STAGE_ENDED", (wurl, stage))
-	
+
 					# Let Workers processing stage+1 know that the
-					# previous stage has finished
+					# previous stage has finished. Also collect the stats
+					# on how many keys for that stage each worker has seen
+					nkeys = 0
 					for worker in self.workers.itervalues():
 						if stage+1 in worker.running_stage_threads:
-							worker.stage_ended(stage)
+							nkeys += worker.stage_ended(stage)
 	
+					# Note this stage has finished
+					self.ended_stages[stage] = nkeys
+
 					# Remove this stage from the destinations map
 					try:
 						del self.destinations[stage]
@@ -1923,14 +2170,20 @@ class Peer:
 						# Note: having no self.destinations[stage] is legal; means
 						# there were no results generated by the previous stage
 						pass
-	
+
+					# Notify the client
+					self._progress("STAGE_ENDED", (stage,))
+					self._report_status_to_client(force=True)
+
 					# Check if the whole task has ended
 					# Note: this is not a mistake -- there is one more stage than 
 					# the number of kernels - the last stage funneled the data back
 					# to the user.
-					if stage == self.spec.nkernels:
-						self._progress("DONE", None)
-						self.shutdown()
+					task_ended = stage == self.spec.nkernels
+
+			if task_ended:
+				self.shutdown()
+				self._progress("DONE", None)
 
 		def notify_client_of_result(self, rurl):
 			# Called by the last kernel, to notify the client
@@ -1940,12 +2193,19 @@ class Peer:
 		def shutdown(self):
 			# Called to shut down everything.
 			with self.lock:
+				workers = self.workers.values()
 				assert len(self.destinations) == 0
-				for worker in self.workers.itervalues():
-					assert len(worker.running_stage_threads) == 0
-					logger.debug("Shutting down worker %s for task %s" % (worker.url, self.url))
-					worker.shutdown()
-					logger.debug("Shutdown complete")
+
+			ths = []
+			for worker in workers:
+				assert len(worker.running_stage_threads) == 0
+				logger.debug("Shutting down worker %s for task %s" % (worker.url, self.url))
+				th = Thread(target=lambda worker=worker: worker.shutdown())
+				th.start()
+				ths.append(th)
+
+			for th in ths:
+				th.join()
 
 			logger.debug("Shutting down server")
 			self.server.shutdown()
@@ -2230,21 +2490,22 @@ class Peer:
 			wurl = worker_process.stdout.readline().strip()
 
 			# Establish connection, record the worker (keyed by task_id)
-			worker = self._Coordinator.WorkerProxy(wurl, self.url, worker_process)
+			#worker = self._Coordinator.WorkerProxy(wurl, self.url, worker_process)
+			worker = xmlrpclib.ServerProxy(wurl)
 			self.workers[task_id] = worker
 
 			# Launch a thread to monitor when the process exits
-			th = Thread(name="PMon-%s" % (worker_process.pid,), target=self._monitor_worker_process, args=(task_id, worker,))
+			th = Thread(name="PMon-%s" % (worker_process.pid,), target=self._monitor_worker_process, args=(task_id, worker_process, wurl,))
 			th.start()
 
 			return wurl
 
-	def _monitor_worker_process(self, task_id, worker):
+	def _monitor_worker_process(self, task_id, process, wurl):
 		# Called as a separate thread to monitor worker process progress
 		# and remove it from self.workers map once it terminates
-		retcode = worker.process.wait()
+		retcode = process.wait()
 		with self.lock:
-			logger.info("Worker %s (pid=%s) exited with retcode=%s" % (worker.url, worker.process.pid, retcode))
+			logger.info("Worker %s (pid=%s) exited with retcode=%s" % (wurl, process.pid, retcode))
 			del self.workers[task_id]
 
 	def shutdown(self):
