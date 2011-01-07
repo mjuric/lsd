@@ -312,6 +312,24 @@ class Pool:
 
 			keys_out_prev = keys_out
 
+	def print_status1(self, status, nitems):
+		keys_out_prev = nitems
+		for stage, keys_in, values_out, keys_out, ended in status:
+			try:
+				pct = "%6.2f%%" % (100. * keys_in / keys_out_prev)
+			except TypeError:
+				pct = "       "
+			keys_out_prev = keys_out
+
+			if ended and stage+1 != len(status):
+				continue
+
+			state = "COMPLETED" if ended else "IN PROGRESS"
+
+			sys.stderr.write("\r"+" "*75+"\r")
+			sys.stderr.write("Stage %1d/%1d: %7d keys to %7d values, %s (%s)" % (stage+1, len(status), keys_in, values_out, pct, state))
+			break
+
 	def map_reduce_chain(self, items, kernels, locals=[], progress_callback=None):
 		# Prepare request
 		spec = TaskSpec(fn, argv, cwd, env, len(items), len(kernels), len(locals))
@@ -320,11 +338,6 @@ class Pool:
 			'data': b64encode(cPickle.dumps([kernels, locals], -1) + cPickle.dumps(items, -1)),
 		      }
 		req = urllib.urlencode(req)
-		#print req;
-		#s = urlparse.parse_qs(req)['spec'][0]
-		#u = TaskSpec.unserialize(s)
-		#print u
-		#exit()
 
 		# Choose a random peer
 		peers = glob.glob(self.directory + '/*.peer')
@@ -341,14 +354,17 @@ class Pool:
 		while True:
 			try:
 				msg, args = cPickle.load(fp)
-				print >>sys.stderr, datetime.datetime.now().ctime(), "[PROGRESS]", msg, args
-				if msg == "STATUS":
-					self.print_status(args, len(items))
+				#print >>sys.stderr, datetime.datetime.now().ctime(), "[PROGRESS]", msg, args
 			except EOFError:
 				fp.close()
 				break
 
-			if msg == "RESULT":
+			if msg == "STATUS":
+				self.print_status1(args, len(items))
+				status_args = args
+			elif msg == "RESULT":
+				sys.stderr.write("\r"+" "*75+"\r")
+				#self.print_status(status_args, len(items))
 				# Results are a stream of pickled Python objects that we unpickle and
 				# pass back to the client
 				rurl = args
@@ -359,9 +375,17 @@ class Pool:
 				except EOFError:
 					rfp.close()
 
+		sys.stderr.write('\n')
 		print >>sys.stderr, "EXITING map_reduce_chain"
 
-def _make_buffer_mmap(size, dir=None, return_file=False):
+def _make_buffer_mmap(size, return_file=False):
+	# See if we have a user-specified temp directory
+	try:
+		dir = os.environ["TMP"]
+		logger.debug("Using '%s' as the temporary file directory" % dir)
+	except KeyError:
+		dir = None
+
 	# Create the temporary memory mapped buffer. It will go away as soon as the mmap is closed, or the process exits.
 	fp = tempfile.TemporaryFile(dir=dir)
 	os.ftruncate(fp.fileno(), size)		# Resize to self.bufsize
@@ -2488,6 +2512,7 @@ class Peer:
 
 			# Get the Worker's address and connect to its XMLRPC server
 			wurl = worker_process.stdout.readline().strip()
+			logger.debug("Got worker URL: %s" % (wurl,))
 
 			# Establish connection, record the worker (keyed by task_id)
 			#worker = self._Coordinator.WorkerProxy(wurl, self.url, worker_process)
@@ -2690,8 +2715,6 @@ if __name__ == '__main__':
 		# Let the parent know where we're listening
 		print worker.url
 		sys.stdout.flush()
-
-		Thread(target=np.arange, args=(2000,)).start()
 
 		if 0 and os.getenv("PROFILE", 0):
 			import cProfile
