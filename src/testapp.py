@@ -11,21 +11,29 @@ class MyClass(object):
 
 def mapper(v):
 	my = MyClass()
-	my.ct = 1
-	yield v % 512, (my, 1)
+	my.nada = 'gaga'
+
+	ntot = 128
+	for wt in xrange(0, ntot):
+		my.ct = 1./ntot
+		yield v % 256, (my, np.arange(ntot))
 
 def reducer1(kv):
+	key, v = kv
+	yield key, sum(my.ct for my, _ in v)
+
+def reducer2(kv):
 	k, v = kv
 	key = 'even' if k % 2 == 0 else 'odd'
-	yield key, sum(my.ct for my, _ in v)
+	yield key, sum(v)
 
 def reducer(kv):
 	k, v = kv
 	yield k, sum(v)
 
 if __name__ == "__main__":
-	v = np.arange(128*2**10)
-	#v = np.arange(8*1024)
+	#v = np.arange(128*2**10)
+	v = np.arange(8*1024)
 
 	# Parallel
 	if True:
@@ -33,7 +41,7 @@ if __name__ == "__main__":
 	else:
 		pool = lsd.pool2.Pool()
 	res1 = []
-	for res in pool.map_reduce_chain(v, [mapper, reducer1, reducer]):
+	for res in pool.map_reduce_chain(v, [mapper, reducer1, reducer2, reducer]):
 		print >>sys.stderr, "Result: ", res
 		res1.append(res)
 	res1 = sorted(res1)

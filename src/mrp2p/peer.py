@@ -325,7 +325,7 @@ class Pool:
 		while True:
 			try:
 				msg, args = cPickle.load(fp)
-				print >>sys.stderr, "PROGRESS:", msg, args
+				print >>sys.stderr, datetime.datetime.now().ctime(), "[PROGRESS]", msg, args
 			except EOFError:
 				fp.close()
 				break

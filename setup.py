@@ -45,7 +45,7 @@ args = {
 	'scripts'	: ['src/lsd-footprint', 'src/lsd-import-sdss', 'src/lsd-make-object-catalog',
 	 			'src/lsd-import-dvo', 'src/lsd-import-smf',
 	 			'src/lsd-query', 'src/lsd-xmatch'],
-	'packages'	: ['lsd'],
+	'packages'	: ['lsd', 'mrp2p'],
 	'package_dir'	: {'': 'src'},
 	'ext_modules'	: [Extension('lsd.native', ['src/native/main.cpp'], include_dirs=inc)],
 	'data_files'    : [('share/lsd/examples', ['src/examples/latitude_histogram.py', 'src/examples/count_rows.py'])]
