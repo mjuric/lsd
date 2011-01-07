@@ -11,13 +11,6 @@ from lsd.utils    import make_printf_string, as_tuple
 from lsd.interval import intervalset
 from lsd.tui import *
 
-np.seterr(over='raise')
-
-def usage():
-	print "Usage: %s --db=dbdir --bounds=bounds --format=[fits|text] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
-
-optlist, (dbdir,), (query,) = tui_getopt('b:f:o:q', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds='], 1, usage)
-
 def T(*args):
 	""" User friendly specification of time:
 		T([a,b], [b, c], [d, e]) --> intervalset([a,b], [b, c], [d, e])
@@ -35,79 +28,87 @@ def T(*args):
 	else:
 		return intervalset(tuple(args))
 
-bounds = []
-format = 'text'
-output = 'output.fits'
-progress_callback = None
-testbounds = True
-for o, a in optlist:
-	if o in ('-b', '--bounds'):
-		bounds.extend(eval('[' + a + ']'))
-	if o in ('--format', '-f'):
-		if a not in ['text', 'fits']: usage(); exit(-1);
-		format = a
-	if o in ('--output', '-o'):
-		output = a
-	if o in ('--quiet', '-q'):
-		progress_callback = pool2.progress_pass
-	if o in ('--testbounds'):
-		testbounds = bool(a)
+def usage():
+	print "Usage: %s --db=dbdir --bounds=bounds --format=[fits|text] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
 
-######### Actual work
+if __name__ == "__main__":
+	np.seterr(over='raise')
 
-bounds = make_canonical(bounds)
+	optlist, (dbdir,), (query,) = tui_getopt('b:f:o:q', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds='], 1, usage)
 
-db = lsd.DB(dbdir)
-q = db.query(query)
-if format == 'text':
-	# Text output
-	fmt = None
-	##rprev = None
-	for row in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds):
-		if fmt == None:
-			fmt = make_printf_string(row)
-			print '# ' + ' '.join(row.dtype.names)
-		print fmt % as_tuple(row)
-		##if rprev != None and rprev['ra'] == row['ra']:
-		##	print fmt % as_tuple(row)
-		##	print fmt % as_tuple(rprev)
-		##rprev = row.copy()
-else:
-	# FITS output
-	rows = q.fetch(bounds, progress_callback=progress_callback, testbounds=testbounds)
+	bounds = []
+	format = 'text'
+	output = 'output.fits'
+	progress_callback = None
+	testbounds = True
+	for o, a in optlist:
+		if o in ('-b', '--bounds'):
+			bounds.extend(eval('[' + a + ']'))
+		if o in ('--format', '-f'):
+			if a not in ['text', 'fits']: usage(); exit(-1);
+			format = a
+		if o in ('--output', '-o'):
+			output = a
+		if o in ('--quiet', '-q'):
+			progress_callback = pool2.progress_pass
+		if o in ('--testbounds'):
+			testbounds = bool(a)
 
-	if 'cksumok' in rows.dtype.names:
-		# Do ./lsd-query --format=fits ps1 'vecmd5(hdr) == cksum as cksumok'
-		assert rows['cksumok'].all()
-		print "CHECKSUM OK"
+	######### Actual work
 
-	# workaround for pyfits bugs -- it doesn't know what to do with bool and uint?? columns
-	#                               so for now just convert these to signed, and emit a warning
-	#			     -- it also incorrectly stores i1 columns as False
-	dtype = []
-	copy = False
-	for col in rows.dtype.names:
-		t, o = rows.dtype.fields[col]
-		conv = False
-		if   t == np.bool:	t = 'i2'; conv = True; copy = True
-		elif t == np.uint64:	t = 'i8'; conv = True
-		elif t == np.uint32:	t = 'i4'; conv = True
-		elif t == np.uint16:	t = 'i2'; conv = True
-		dtype += [(col, t)]
-		if conv:
-			print >> sys.stderr, 'WARNING: Stored "%s" as a signed integer, as pyfits can\'t handle unsigned and/or bools.' % (col)
-	rows = rows.as_ndarray()
+	bounds = make_canonical(bounds)
 
-	# pyfits bugs workarounds
-	if copy:
-		rows2 = np.empty(len(rows), dtype=dtype)
-		for col in rows.dtype.names: rows2[col] = rows[col]
-		rows = rows2
+	db = lsd.DB(dbdir)
+	q = db.query(query)
+	if format == 'text':
+		# Text output
+		fmt = None
+		##rprev = None
+		for row in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds):
+			if fmt == None:
+				fmt = make_printf_string(row)
+				print '# ' + ' '.join(row.dtype.names)
+			print fmt % as_tuple(row)
+			##if rprev != None and rprev['ra'] == row['ra']:
+			##	print fmt % as_tuple(row)
+			##	print fmt % as_tuple(rprev)
+			##rprev = row.copy()
 	else:
-		rows = rows.view(dtype=dtype)
+		# FITS output
+		rows = q.fetch(bounds, progress_callback=progress_callback, testbounds=testbounds)
 
-	if os.path.exists(output):
-		os.unlink(output)
-	pyfits.writeto(output, rows)
+		if 'cksumok' in rows.dtype.names:
+			# Do ./lsd-query --format=fits ps1 'vecmd5(hdr) == cksum as cksumok'
+			assert rows['cksumok'].all()
+			print "CHECKSUM OK"
 
-	print >> sys.stderr, 'Output in %s' % (output)
+		# workaround for pyfits bugs -- it doesn't know what to do with bool and uint?? columns
+		#                               so for now just convert these to signed, and emit a warning
+		#			     -- it also incorrectly stores i1 columns as False
+		dtype = []
+		copy = False
+		for col in rows.dtype.names:
+			t, o = rows.dtype.fields[col]
+			conv = False
+			if   t == np.bool:	t = 'i2'; conv = True; copy = True
+			elif t == np.uint64:	t = 'i8'; conv = True
+			elif t == np.uint32:	t = 'i4'; conv = True
+			elif t == np.uint16:	t = 'i2'; conv = True
+			dtype += [(col, t)]
+			if conv:
+				print >> sys.stderr, 'WARNING: Stored "%s" as a signed integer, as pyfits can\'t handle unsigned and/or bools.' % (col)
+		rows = rows.as_ndarray()
+
+		# pyfits bugs workarounds
+		if copy:
+			rows2 = np.empty(len(rows), dtype=dtype)
+			for col in rows.dtype.names: rows2[col] = rows[col]
+			rows = rows2
+		else:
+			rows = rows.view(dtype=dtype)
+
+		if os.path.exists(output):
+			os.unlink(output)
+		pyfits.writeto(output, rows)
+
+		print >> sys.stderr, 'Output in %s' % (output)

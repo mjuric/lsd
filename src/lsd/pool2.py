@@ -10,10 +10,13 @@ import tempfile
 import time
 import mmap
 import traceback
+import platform
 from utils import unpack_callable
 
 RET_KEYVAL = 1
 RET_KEYVAL_LIST = 2
+
+BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 200 * 2**30
 
 def _worker(qcmd, qin, qout):
 	""" Waits for commands on qcmd. Possible commands are:
@@ -412,7 +415,7 @@ class Pool:
 					# Create a disk backing store for intermediate results
 					fp = tempfile.NamedTemporaryFile(mode='wb', prefix='mapresults-', dir='.', suffix='.pkl', delete=True)
 					fd = fp.file.fileno()
-					os.ftruncate(fd, 1 * 2**40)  # 1TB ought to be enough for temporary storage (for now...)
+					os.ftruncate(fd, BUFSIZE)
 					mm = mmap.mmap(fd, 0)
 
 			# Call the distributed mappers

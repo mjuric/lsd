@@ -19,6 +19,7 @@ import query_parser as qp
 import bhpix
 import utils
 import pool2
+import mrp2p.peer as mrp2p
 import native
 
 from interval    import intervalset
@@ -1184,7 +1185,10 @@ class Query(object):
 			kernels.append((_into_writer, self.qwriter))
 
 		# start and run the workers
-		pool = pool2.Pool(nworkers)
+		if int(os.environ.get("MRP2P", 0)) == 0:
+			pool = pool2.Pool(nworkers)
+		else:
+			pool = mrp2p.Pool("peers")
 		yielded = False
 		for result in pool.map_reduce_chain(partspecs.items(), kernels, progress_callback=progress_callback):
 			yield result
