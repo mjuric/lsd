@@ -330,6 +330,23 @@ class Pool:
 			sys.stderr.write("Stage %1d/%1d: %7d keys to %7d values, %s (%s)" % (stage+1, len(status), keys_in, values_out, pct, state))
 			break
 
+	def _status_stream_thread(self, fp, queue):
+		try:
+			while True:
+				msg, args = cPickle.load(fp)
+				queue.put((msg, args))
+				#print >>sys.stderr, datetime.datetime.now().ctime(), "[PROGRESS]", msg, args
+		except EOFError:
+			fp.close()
+
+	def _result_stream_thread(self, rurl, queue):
+		rfp = urllib.urlopen(rurl)
+		try:
+			while True:
+				queue.put(("RITEM", cPickle.load(rfp)))
+		except EOFError:
+			rfp.close()
+
 	def map_reduce_chain(self, items, kernels, locals=[], progress_callback=None):
 		# Prepare request
 		spec = TaskSpec(fn, argv, cwd, env, len(items), len(kernels), len(locals))
@@ -349,31 +366,28 @@ class Pool:
 		# Submit the task
 		fp = urllib.urlopen(url, req)
 
+		# Launch status thread
+		queue = Queue.Queue()
+		th = threading.Thread(target=self._status_stream_thread, args=(fp, queue))
+		th.start()
+
 		# Listen for progress messages: a stream of pickled
 		# (msg, args) tuples
-		while True:
-			try:
-				msg, args = cPickle.load(fp)
-				#print >>sys.stderr, datetime.datetime.now().ctime(), "[PROGRESS]", msg, args
-			except EOFError:
-				fp.close()
-				break
-
+		for (msg, args) in iter(queue.get, ("DONE", None)):
 			if msg == "STATUS":
+				##self.print_status1(args, len(items))
+				##status_args = args
 				self.print_status1(args, len(items))
-				status_args = args
 			elif msg == "RESULT":
-				sys.stderr.write("\r"+" "*75+"\r")
+				##sys.stderr.write("\r"+" "*75+"\r")
 				#self.print_status(status_args, len(items))
-				# Results are a stream of pickled Python objects that we unpickle and
-				# pass back to the client
 				rurl = args
-				rfp = urllib.urlopen(rurl)
-				try:
-					while True:
-						yield cPickle.load(rfp)
-				except EOFError:
-					rfp.close()
+				rth = threading.Thread(target=self._result_stream_thread, args=(rurl, queue))
+				rth.start()
+			elif msg == "RITEM":
+				yield args
+#			else:
+#				print >>sys.stderr, datetime.datetime.now().ctime(), "[PROGRESS]", msg, args
 
 		sys.stderr.write('\n')
 		print >>sys.stderr, "EXITING map_reduce_chain"
@@ -1983,7 +1997,7 @@ class Peer:
 				tprog = 0
 
 			now = time.time()
-			if now > tprog + 5:
+			if now > tprog + 1:
 				stage_status = defaultdict(lambda: np.zeros(2, dtype=int))
 				with self.lock:
 					# Sum up how we're progressing
@@ -2206,8 +2220,11 @@ class Peer:
 					task_ended = stage == self.spec.nkernels
 
 			if task_ended:
+				logger.debug("Shutting down task...")
 				self.shutdown()
+				logger.debug("Shut down done...")
 				self._progress("DONE", None)
+				logger.debug("Progress message sent...")
 
 		def notify_client_of_result(self, rurl):
 			# Called by the last kernel, to notify the client
@@ -2440,6 +2457,8 @@ class Peer:
 		for msg in iter(coordinator.queue.get, ("DONE", None)):
 			logger.debug("Progress msg to client: %s" % (msg,))
 			yield msg
+
+		yield "DONE", None
 
 		# delete this Coordinator task
 		with self.lock:
