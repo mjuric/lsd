@@ -1,0 +1,104 @@
+#!/usr/bin/env python
+
+import logging
+import os, sys, getopt
+import mr.core
+from mr.core import *
+
+## Setup logging ##
+format = '%(asctime)s.%(msecs)03d %(name)s[%(process)d] %(threadName)-15s %(levelname)-8s {%(module)s:%(funcName)s}: %(message)s'
+datefmt = '%a, %d %b %Y %H:%M:%S'
+level = logging.DEBUG if (os.getenv("DEBUG", 0) == "1" or os.getenv("LOGLEVEL", "info") == "debug") else logging.INFO
+#filename = 'peer.log' if os.getenv("LOG", None) is None else os.getenv("LOG")
+#logging.basicConfig(filename=filename, format=format, datefmt=datefmt, level=level)
+logging.basicConfig(format=format, datefmt=datefmt, level=level)
+logger.info("Started %s", ' '.join(sys.argv))
+logger.debug("Debug messages turned ON")
+
+# Decide if we're launching a peer or a worker
+try:
+	optlist, args = getopt.getopt(sys.argv[1:], 'w:', ['worker='])
+except getopt.GetoptError, err:
+	print str(err)
+	exit(-1)
+
+start_worker = False
+for o, a in optlist:
+	if o in ('-w', '--worker'):
+		start_worker = True
+		hostname = a
+
+if start_worker:
+	#import pydevd; pydevd.settrace(suspend=False, trace_only_current_thread=False)
+		
+	user_fn = args[0]
+	argv = args[0:]
+
+	# Start the worker server
+	server, port = start_threaded_xmlrpc_server(HTMLAndXMLRPCRequestHandler, 1023, hostname)
+	worker = Worker(server, hostname)
+	server.register_instance(worker)
+	server.register_introspection_functions()
+
+	###################
+	# Import the user's code. Note: it's important this is done from
+	# the main module!
+
+	# Reset our argv to those of the user
+	sys.argv = argv
+
+	# Must prepend cwd to the module path, otherwise relative imports
+	# from within the app won't work
+	sys.path.insert(0, '.')
+
+	# Load the user's Python app
+	m = imp.load_source('_mr_worker', user_fn)
+
+	# Import its data to our __main__
+	kws = ['__builtins__', '__doc__', '__file__', '__name__', '__package__', '__path__', '__version__']
+	assert __name__ == '__main__'
+	mself = sys.modules['__main__']
+	for name in dir(m):
+		if name in kws:
+			continue
+		setattr(mself, name, getattr(m, name))
+	###################
+
+	# Let the parent know where we're listening
+	print worker.url
+	sys.stdout.flush()
+
+	if 0 and os.getenv("PROFILE", 0):
+		import cProfile
+		outfn = os.getenv("PROFILE_LOG", "profile.log") + '.' + str(os.getpid())
+		cProfile.runctx("server.serve_forever()", globals(), locals(), outfn)
+	else:
+		# Start the XMLRPC server
+		server.serve_forever()
+
+	logger.info("Garbage collecting __del__")
+	gc.collect()
+
+	logger.debug("Worker exiting.")
+else:
+	# Start the server
+	logger.debug("Launching peer XMLRPC server")
+	server, port = start_threaded_xmlrpc_server(PeerRequestHandler, 1023)
+	peer = Peer(server, port)
+	server.register_instance(peer)
+	server.register_introspection_functions()
+
+	try:
+		# Register the Peer in the Peer directory
+		peer._register()
+		threading.current_thread().name = "Peer XMLRPC Server"
+		server.serve_forever()
+	except KeyboardInterrupt:
+		pass;
+	finally:
+		peer._unregister()
+		peer._cleanup()
+
+	logging.debug("Remaining threads:")
+	for th in threading.enumerate():
+		logging.debug(th)

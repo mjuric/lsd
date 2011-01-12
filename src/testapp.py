@@ -2,7 +2,7 @@
 
 import numpy as np
 import sys
-import mrp2p.peer
+import mr
 import lsd.pool2
 
 class MyClass(object):
@@ -33,11 +33,11 @@ def reducer(kv):
 
 if __name__ == "__main__":
 	#v = np.arange(128*2**10)
-	v = np.arange(16*1024)
+	v = np.arange(1*1024)
 
 	# Parallel
 	if True:
-		pool = mrp2p.peer.Pool('peers')
+		pool = mr.Pool('peers')
 	else:
 		pool = lsd.pool2.Pool()
 	res1 = []
