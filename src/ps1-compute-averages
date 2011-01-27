@@ -3,6 +3,7 @@
 import os
 import lsd
 import lsd.colgroup as colgroup
+import lsd.bounds
 import numpy as np
 import scipy.stats.mstats
 from itertools import izip
@@ -10,6 +11,34 @@ from collections import defaultdict
 from lsd.join_ops import IntoWriter
 from scipy.weave import inline
 import logging
+import cPickle
+import surveys.ps1.calib as cal
+
+def get_zp(mjd):
+	self = get_zp
+	if getattr(self, 'zps', None) is None:
+		# Load the zero points
+		self.zps = cPickle.load(file('zps_array.pkl'))
+	zps = self.zps
+
+	# Find the ZP for each MJD. If it does not exist,
+	# return +inf
+	idx = np.searchsorted(zps.mjd, mjd)
+	idx[idx == len(zps)] = 0
+	found = zps.mjd[idx] == mjd
+
+	# Join the ZPs
+	zp = np.zeros(len(idx), dtype='f4')
+	zp[:] = zps.ZP[idx]
+
+	# Remove those that are flagged bad
+	bad = ~found
+	bad |= zps.time_to_bad[idx] < 30. / (24*60)
+	zp[bad] = np.nan
+
+	print "OK/Not OK:", sum(~bad), sum(bad)
+
+	return zp
 
 def calc_objmag(qresult, qwriter):
 	"""
@@ -29,6 +58,10 @@ def calc_objmag(qresult, qwriter):
 	# Sort
 	all_rows.sort(["filterid", "_ID", "mag"])
 
+	# Apply flat field corrections
+	offs = cal.flat_offs(all_rows.chip_id, all_rows.x_psf, all_rows.y_psf, all_rows.mjd_obs, all_rows.filterid)
+	all_rows.mag += offs
+
 	# Prepare the output array
 	objs = np.unique(all_rows['_ID'])
 	out = colgroup.ColGroup(
@@ -45,7 +78,10 @@ def calc_objmag(qresult, qwriter):
 
 	# Pull out the arrays we'll be using
 	(id_out, ndet, ndet_ok, nmag, nmag_ok, mean, stdev, merr, median, q25, q75) = out.as_columns()
-	id_in, mags, errs, filterid, flags = all_rows['_ID'], all_rows['mag'], all_rows['err'], all_rows['filterid'], all_rows['flags']
+	id_in, mags, errs, filterid, flags, psf_qf = all_rows['_ID'], all_rows['mag'], all_rows['err'], all_rows['filterid'], all_rows['flags'], all_rows['psf_qf']
+
+	# Join the zero-point information
+	zp = get_zp(all_rows.mjd_obs)
 
 	# Convert filterid to index
 	band = np.empty(len(all_rows), dtype='i4')
@@ -75,11 +111,14 @@ def calc_objmag(qresult, qwriter):
 		{
 			float mag = MAGS1(j);
 			float err = ERRS1(j);
+			float psf_qf = PSF_QF1(j);
+			float zp = ZP1(j);
 			uint32_t flag = FLAGS1(j);
 			//if(std::isfinite(mag) && (flag & PM_SOURCE_MODE_FITTED))
 
-			if(std::isfinite(mag) && ((flag & bad) == 0))
+			if(std::isfinite(mag) && std::isfinite(zp) && ((flag & bad) == 0) && (psf_qf > 0.85))
 			{
+				mag += zp;
 				mags1.push_back(mag);
 				wt.push_back(1. / (err*err + 0.01*0.01)); // add 0.01 in quadrature to compensate for unrealistically small quoted errors
 			}
@@ -116,7 +155,7 @@ def calc_objmag(qresult, qwriter):
 	}
 	"""
 	inline(code,
-		['id_out', 'ndet', 'ndet_ok', 'nmag', 'nmag_ok', 'mean', 'stdev', 'merr', 'median', 'q25', 'q75', 'id_in', 'mags', 'errs', 'band', 'flags'],
+		['id_out', 'ndet', 'ndet_ok', 'nmag', 'nmag_ok', 'mean', 'stdev', 'merr', 'median', 'q25', 'q75', 'id_in', 'mags', 'errs', 'band', 'flags', 'zp', 'psf_qf'],
 		headers=['"pmSourceMasks.h"', '<cmath>', '<iostream>', '<vector>', '<gsl/gsl_statistics.h>', '<cassert>', '<algorithm>'],
 		libraries=['gsl', 'gslcblas'],
 		include_dirs=['.'],
@@ -133,16 +172,18 @@ def calc_objmag(qresult, qwriter):
 
 
 db = lsd.DB("pdb")
+bounds = [ (lsd.bounds.rectangle(240, 0, 250, 10), lsd.bounds.intervalset((-np.inf, np.inf))) ]
+bounds = None
 #q = db.query("SELECT _ID, cal_psf_mag as mag, filterid FROM ps1_obj, ps1_det where (obj_id==6496442462481940483) & (filterid=='g.0000')")
 #q = db.query("SELECT _ID, cal_psf_mag as mag, filterid FROM ps1_obj, ps1_det where (obj_id==6496442462481940483) | (obj_id==6496442462481940484)")
 
 #q = db.query("SELECT _ID, cal_psf_mag as mag, cal_psf_mag_sig as err, filterid, flags FROM ps1_obj, ps1_det")
 #writer = IntoWriter(db, "cal_mags WHERE obj_id |= obj_id")
-q = db.query("SELECT _ID, psf_inst_mag as mag, psf_inst_mag_sig as err, filterid, flags FROM ps1_obj, ps1_det")
-writer = IntoWriter(db, "inst_mags WHERE obj_id |= obj_id")
+q = db.query("SELECT _ID, psf_inst_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
+writer = IntoWriter(db, "recalib_mags WHERE obj_id |= obj_id")
 
 #q = db.query("select _ID, cal_psf_mag, filterid, u, g, r, i, z from ps1_obj, ps1_det, sdss where _ROWNUM==1")
 nrows = 0
-for cell_id, rows in q.execute([(calc_objmag, writer)], group_by_static_cell=True):
+for cell_id, rows in q.execute([(calc_objmag, writer)], group_by_static_cell=True, bounds=bounds):
 	nrows += len(rows)
 print nrows

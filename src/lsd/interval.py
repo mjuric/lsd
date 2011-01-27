@@ -135,6 +135,22 @@ class intervalset:
 
 		return in_
 
+	def distance(self, x, dist_to_outside=False):
+		x = np.asarray(x)
+		
+		ivals = np.zeros(len(self.data)+2)
+		ivals[0]    = -np.inf
+		ivals[1:-1] = self.data
+		ivals[-1]   = np.inf
+
+		at = np.searchsorted(ivals, x)
+		d0 = ivals[at] - x
+		d1 = x - ivals[at-1]
+		dist = np.where(d0 < d1, d0, d1)	# Find nearest interval edge
+		dist = np.where(at % 2 == int(dist_to_outside), 0, dist)	# Inside/outside the intervals
+		
+		return dist
+
 	def __iter__(self):
 		return iter(self.astuples())
 
