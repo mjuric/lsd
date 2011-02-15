@@ -18,7 +18,8 @@ def get_zp(mjd):
 	self = get_zp
 	if getattr(self, 'zps', None) is None:
 		# Load the zero points
-		self.zps = cPickle.load(file('zps_array.pkl'))
+		fn = os.environ['ZPS_ARRAY']
+		self.zps = cPickle.load(file(fn))
 	zps = self.zps
 
 	# Find the ZP for each MJD. If it does not exist,
@@ -26,6 +27,7 @@ def get_zp(mjd):
 	idx = np.searchsorted(zps.mjd, mjd)
 	idx[idx == len(zps)] = 0
 	found = zps.mjd[idx] == mjd
+	print "Found:", sum(found)
 
 	# Join the ZPs
 	zp = np.zeros(len(idx), dtype='f4')
@@ -90,15 +92,17 @@ def calc_objmag(qresult, qwriter):
 
 	code = \
 	"""
-	#line 50 "objdata_weave.py"
+	#line 93 "objdata_weave.py"
 
 	assert(Sid_out[0] == sizeof(*id_out));	// Make sure we've got a contiguous array
 
 	uint32_t bad = PM_SOURCE_MODE_FAIL | PM_SOURCE_MODE_POOR | PM_SOURCE_MODE_SATSTAR | 
 		PM_SOURCE_MODE_BLEND | PM_SOURCE_MODE_EXTERNAL | PM_SOURCE_MODE_BADPSF |
-		PM_SOURCE_MODE_DEFECT | PM_SOURCE_MODE_SATURATED | PM_SOURCE_MODE_CR_LIMIT | 
-		PM_SOURCE_MODE_EXT_LIMIT | PM_SOURCE_MODE_MOMENTS_FAILURE | 
-		PM_SOURCE_MODE_SIZE_SKIPPED | PM_SOURCE_MODE_BIG_RADIUS;
+		PM_SOURCE_MODE_DEFECT | PM_SOURCE_MODE_SATURATED | PM_SOURCE_MODE_CR_LIMIT 
+		// | 
+		// PM_SOURCE_MODE_EXT_LIMIT | PM_SOURCE_MODE_MOMENTS_FAILURE | 
+		// PM_SOURCE_MODE_SIZE_SKIPPED | PM_SOURCE_MODE_BIG_RADIUS
+		;
 
 	// stream through the input arrays
 	int size = Nmags[0];
@@ -179,8 +183,8 @@ bounds = None
 
 #q = db.query("SELECT _ID, cal_psf_mag as mag, cal_psf_mag_sig as err, filterid, flags FROM ps1_obj, ps1_det")
 #writer = IntoWriter(db, "cal_mags WHERE obj_id |= obj_id")
-q = db.query("SELECT _ID, psf_inst_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
-writer = IntoWriter(db, "recalib_mags WHERE obj_id |= obj_id")
+q = db.query("SELECT _ID, ap_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
+writer = IntoWriter(db, "recalib_mags_ap WHERE obj_id |= obj_id")
 
 #q = db.query("select _ID, cal_psf_mag, filterid, u, g, r, i, z from ps1_obj, ps1_det, sdss where _ROWNUM==1")
 nrows = 0
