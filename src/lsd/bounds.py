@@ -3,7 +3,7 @@
 import Polygon
 import bhpix
 import numpy as np
-from slalib import sla_galeq
+from pyslalib.slalib import sla_galeq
 from numpy import sin, cos, radians, degrees, sqrt, arcsin, arctan2, pi
 from interval import intervalset
 from collections import defaultdict

@@ -1,7 +1,7 @@
 import pyfits
 import pool2
 import numpy as np
-from slalib import sla_eqgal
+from pyslalib.slalib import sla_eqgal
 from itertools import izip
 import time
 

@@ -4,7 +4,7 @@ import pyfits
 import pool2
 import time
 import numpy as np
-from slalib import sla_eqgal
+from pyslalib.slalib import sla_eqgal
 import itertools as it
 import bhpix
 from utils import gnomonic, gc_dist
