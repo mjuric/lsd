@@ -18,6 +18,9 @@ RET_KEYVAL_LIST = 2
 
 BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 200 * 2**30
 
+# OS X HFS+ filesystem does not support sparse files
+back_to_disk = platform.system() != 'Darwin'
+
 def _worker(qcmd, qin, qout):
 	""" Waits for commands on qcmd. Possible commands are:
 		MAP: On MAP, store mapper and mapper_args, and
@@ -389,8 +392,6 @@ class Pool:
 			progress_callback = progress_default
 
 		progress_callback('mapreduce', 'begin', input, None, None)
-
-		back_to_disk = True
 
 		if back_to_disk:
 			unique_objects = {}
