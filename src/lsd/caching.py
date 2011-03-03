@@ -49,17 +49,17 @@ class CallResultCache(object):
 
 		@functools.wraps(func)
 		def wrapper(*args, **kwds):
-			def stats():
-				""" Return performance counters """
-				return ((wrapper.hits, wrapper.misses),
-					(wrapper.mem_hits, wrapper.mem_misses),
-					(wrapper.disk_hits, wrapper.disk_misses))
-			wrapper.stats = stats
-
-			# Compute arg hash and cache filename
+			# Construct the hash of the arguments, using the buffer protocol where
+			# possible
+			m = hashlib.md5()
+			for k, a in zip('\0'*len(args), args) + sorted(kwds.items()):
+				m.update(k)
+				try:
+					m.update(a)
+				except TypeError:
+					m.update(cPickle.dumps(a, -1))
 			funcname = func.__module__ + "." + func.__name__
-			allargs = args + tuple(sorted(kwds.items()))
-			hash = funcname + '-' + hashlib.md5(cPickle.dumps(allargs)).hexdigest()
+			hash = funcname + '-' + m.hexdigest()
 
 			# See if it's in memory cache (LRU)
 			try:
@@ -126,6 +126,13 @@ class CallResultCache(object):
 		wrapper.hits = wrapper.misses = 0
 		wrapper.mem_misses = wrapper.mem_hits = 0
 		wrapper.disk_misses = wrapper.disk_hits = 0
+
+		def stats():
+			""" Return performance counters """
+			return ((wrapper.hits, wrapper.misses),
+				(wrapper.mem_hits, wrapper.mem_misses),
+				(wrapper.disk_hits, wrapper.disk_misses))
+		wrapper.stats = stats
 
 		return wrapper
 
