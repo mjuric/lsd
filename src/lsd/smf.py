@@ -11,6 +11,7 @@ from utils import gnomonic, gc_dist
 from colgroup import ColGroup
 import sys, os
 import logging
+import utils
 
 # Table defs for exposure table
 exp_table_def = \
@@ -29,6 +30,7 @@ exp_table_def = \
 			'columns': [
 				('exp_id',		'u8', 	'',		'LSD primary key for this exposure'   ),
 				('filterid',		'a6',	'filterid',	'Filter used (instrument name)'       ),
+				('survey',		'a4',   '',		'PS1 sub-survey (3pi, mdf, sas, ...)' ),
 				('equinox',		'f4',	'EQUINOX' ,	'Celestial coordinate system'	      ),
 				('ra',			'f8',	'RA'	  ,	'Right Ascension of boresight'	      ),
 				('dec',			'f8',	'DEC'	  ,	'Declination of boresight'	      ),
@@ -118,6 +120,7 @@ det_table_def = \
 				('det_id',		'u8', '',		'Unique LSD ID of this detection'),
 				('exp_id',		'u8', '',		'Exposure ID, joined to the image table'),
 				('chip_id',		'u1', '',		'Index of the OTA where this object was detected (integer, 0-63)'),
+				('survey',		'a4', '',		'PS1 sub-survey (3pi, mdf, sas, ...)' ),
 				('ra',			'f8', 'ra_psf',		''),
 				('dec',			'f8', 'dec_psf',	''),
 				('mjd_obs', 		'f8', '',		'Time of observation'), # Copied from image header, for convenience
@@ -268,26 +271,27 @@ def gen_tab2type(tabdef):
 		
 	return tab2type
 
-def import_from_smf(db, det_tabname, exp_tabname, smf_files, create=False):
+def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=False):
 	""" Import a PS1 table from DVO
 
 	    Note: Assumes underlying shared storage for all table
 	          cells (i.e., any worker is able to write to any cell).
 	"""
-	if create:
-		# Create the new database
-		det_table  = db.create_table(det_tabname, det_table_def)
-		exp_table  = db.create_table(exp_tabname, exp_table_def)
+	with utils.lock(db.path + "/smf-import-lock.lock"):
+		if not db.table_exists(det_tabname) and create:
+			# Create new tables
+			det_table  = db.create_table(det_tabname, det_table_def)
+			exp_table  = db.create_table(exp_tabname, exp_table_def)
 
-		# Set up a one-to-X join relationship between the two tables (join det_table:exp_id->exp_table:exp_id)
-		db.define_default_join(det_tabname, exp_tabname,
-			type = 'indirect',
-			m1   = (det_tabname, "det_id"),
-			m2   = (det_tabname, "exp_id")
-			)
-	else:
-		det_table = db.table(det_tabname)
-		exp_table = db.table(exp_tabname)
+			# Set up a one-to-X join relationship between the two tables (join det_table:exp_id->exp_table:exp_id)
+			db.define_default_join(det_tabname, exp_tabname,
+				type = 'indirect',
+				m1   = (det_tabname, "det_id"),
+				m2   = (det_tabname, "exp_id")
+				)
+		else:
+			det_table = db.table(det_tabname)
+			exp_table = db.table(exp_tabname)
 
 	det_c2f = gen_tab2fits(det_table_def)
 	exp_c2f = gen_tab2fits(exp_table_def)
@@ -295,7 +299,7 @@ def import_from_smf(db, det_tabname, exp_tabname, smf_files, create=False):
 	t0 = time.time()
 	at = 0; ntot = 0
 	pool = pool2.Pool()
-	for (file, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_table, exp_table, det_c2f, exp_c2f), progress_callback=pool2.progress_pass):
+	for (file, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_table, exp_table, det_c2f, exp_c2f, survey), progress_callback=pool2.progress_pass):
 		at = at + 1
 		ntot = ntot + nloaded
 		t1 = time.time()
@@ -391,7 +395,7 @@ def fix_ps1_coord_bugs(cols, file, hduname):
 		keep = ~np.isnan(cols['dec'])
 		for name in cols: cols[name] = cols[name][keep]
 
-def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f):
+def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f, survey):
 	det_c2t = gen_tab2type(det_table_def)
 	exp_c2t = gen_tab2type(exp_table_def)
 
@@ -426,6 +430,9 @@ def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f):
 
 	exp_cols['chip_hdr']	= np.empty(1, dtype='64O')
 	exp_cols['chip_hdr'][:] = None
+	
+	exp_cols['survey']      = np.empty(1, dtype='a4')
+	exp_cols['survey'][:]   = survey
 	nrows = 0
 	for (idx, (chip_id, chip_xy)) in enumerate(all_chips()):
 		# Workaround because .smf files have a bug, listing the EXTNAME keyword
@@ -473,10 +480,12 @@ def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f):
 		# Add computed columns
 		add_lb(det_cols)
 		det_cols['filterid']    = np.empty(len(dat), dtype='a6')
+		det_cols['survey']      = np.empty(len(dat), dtype='a4')
 		det_cols['mjd_obs']     = np.empty(len(dat), dtype='f8')
 		det_cols['exp_id']      = np.empty(len(dat), dtype='u8')
 		det_cols['chip_id']     = np.empty(len(dat), dtype='u1')
 		det_cols['filterid'][:] = filterid
+		det_cols['survey'][:]   = survey
 		det_cols['mjd_obs'][:]  = mjd_obs
 		det_cols['chip_id'][:]  = chip_id
 

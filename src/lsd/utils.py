@@ -1,5 +1,6 @@
 import subprocess, os, errno
 import numpy as np
+import contextlib
 
 def isiterable(x):
 	try:
@@ -139,6 +140,17 @@ def shell(cmd):
 		err = subprocess.CalledProcessError(p.returncode, cmd)
 		raise err
 	return out;
+
+@contextlib.contextmanager
+def lock(lockfile, retries=-1):
+	""" Acquire a lock by creating lockfile """
+
+	shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, lockfile) )
+	
+	yield
+
+	os.unlink(lockfile)
+
 
 def mkdir_p(path):
 	''' Recursively create a directory, but don't fail if it already exists. '''
