@@ -290,9 +290,13 @@ class TableEntry:
 				if x is None:
 					#(x, y) = bhpix.proj_bhealpix(lon, lat)
 					(x, y) = cached_proj_bhealpix(lon, lat)
+					#assert np.prod([np.all(a == b) for a, b in zip((x, y), bhpix.proj_bhealpix(lon, lat))])
+					#print "HERE! ", len(x), cached_proj_bhealpix.stats()
 
-				# inbounds[:, i] &= bounds_xy.isInsideV(x, y)
+				#inbounds[:, i] &= bounds_xy.isInsideV(x, y)
 				inbounds[:, i] &= cached_isInsideV(bounds_xy, x, y)
+				#assert np.all(bounds_xy.isInsideV(x, y) == cached_isInsideV(bounds_xy, x, y))
+				#print "HERE2!", len(x), cached_isInsideV.stats()
 
 		# Keep those that fell within at least one of the bounds present in the bounds set
 		# (and thus may appear in the final result, depending on time cuts later on)
