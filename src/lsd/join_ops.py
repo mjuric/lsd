@@ -26,6 +26,16 @@ from interval    import intervalset
 from colgroup    import ColGroup
 from table       import Table
 
+import caching
+
+@caching.cached
+def cached_proj_bhealpix(lon, lat):
+	return bhpix.proj_bhealpix(lon, lat)
+
+@caching.cached
+def cached_isInsideV(bounds_xy, x, y):
+	return bounds_xy.isInsideV(x, y)
+
 class TabletCache:
 	""" An cache of tablets loaded while performing a Query.
 
@@ -278,9 +288,11 @@ class TableEntry:
 		for (i, (bounds_xy, _)) in enumerate(bounds):
 			if bounds_xy is not None:
 				if x is None:
-					(x, y) = bhpix.proj_bhealpix(lon, lat)
+					#(x, y) = bhpix.proj_bhealpix(lon, lat)
+					(x, y) = cached_proj_bhealpix(lon, lat)
 
-				inbounds[:, i] &= bounds_xy.isInsideV(x, y)
+				# inbounds[:, i] &= bounds_xy.isInsideV(x, y)
+				inbounds[:, i] &= cached_isInsideV(bounds_xy, x, y)
 
 		# Keep those that fell within at least one of the bounds present in the bounds set
 		# (and thus may appear in the final result, depending on time cuts later on)
