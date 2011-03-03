@@ -348,6 +348,23 @@ class Table:
 
 	#############
 
+	def _unicode_to_str(self, arr):
+		"""
+			HACK: Recursively in-place convert unicode objects to str objects
+		"""
+		if isinstance(arr, list):
+			it = enumerate(arr)
+		elif isinstance(arr, dict):
+			it = arr.iteritems()
+		else:
+			return
+
+		for k, v in it:
+			if isinstance(v, unicode):
+				arr[k] = v.encode('utf-8')
+			else:
+				self._unicode_to_str(v)
+
 	def _load_schema(self):
 		"""
 		Load the table schema.
@@ -358,6 +375,7 @@ class Table:
 		"""
 		schemacfg = self.path + '/schema.cfg'
 		data = json.loads(file(schemacfg).read(), object_pairs_hook=OrderedDict)
+		self._unicode_to_str(data)
 
 		self.name = data["name"]
 		self._nrows = data.get("nrows", None)
