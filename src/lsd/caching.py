@@ -60,6 +60,7 @@ class CallResultCache(object):
 					m.update(cPickle.dumps(a, -1))
 			funcname = func.__module__ + "." + func.__name__
 			hash = funcname + '-' + m.hexdigest()
+			#print "HASH: ", hash
 
 			# See if it's in memory cache (LRU)
 			try:
@@ -68,6 +69,7 @@ class CallResultCache(object):
 
 				wrapper.hits += 1
 				wrapper.mem_hits += 1
+				#print "Memcache hit"
 			except KeyError:
 				wrapper.mem_misses += 1
 
@@ -81,7 +83,8 @@ class CallResultCache(object):
 				# Disk cache lookup
 				fn = self.cache_dir + '/' + hash + '.pkl'
 				try:
-					with file(fn, "a+b") as fp, self.lock(fp):
+					with open(fn, "a+b") as fp, self.lock(fp):
+						fp.seek(0, 2)
 						if fp.tell() != 0:
 							# Cache exists
 							fp.seek(0)
@@ -90,6 +93,7 @@ class CallResultCache(object):
 
 							wrapper.hits += 1
 							wrapper.disk_hits += 1
+							#print "Diskcache hit"
 						else:
 							# New cache
 							result = func(*args, **kwds)
@@ -98,7 +102,9 @@ class CallResultCache(object):
 
 							wrapper.misses += 1
 							wrapper.disk_misses += 1
+							#print "Cache miss."
 				except IOError:
+					#print "CACHE READ PROBLEM!!"
 					# Something went wrong w. opening/reading the file
 					# Evaluate but don't store the result
 					result = func(*args, **kwds)
