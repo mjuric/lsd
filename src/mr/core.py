@@ -181,7 +181,11 @@ import weakref
 class ThreadedXMLRPCServer(SocketServer.ThreadingMixIn, SimpleXMLRPCServer.SimpleXMLRPCServer):
 	def __init__(self, *args, **kwargs):
 		#print >>sys.stderr, kwargs
-		#self.daemon_threads = True
+		try:
+			self.daemon_threads = kwargs['daemon']
+			del kwargs['daemon']
+		except KeyError:
+			pass
 		SimpleXMLRPCServer.SimpleXMLRPCServer.__init__(self, *args, **kwargs)
 
 # Buffer size -- can't be too big on 32bit platforms (otherwise all mmaps
@@ -2815,5 +2819,5 @@ def start_server(ServerClass, HandlerClass, port=1023, addr='', **kwargs):
 		except socket.error:
 			port += 1
 
-def start_threaded_xmlrpc_server(HandlerClass, port=1023, addr=''):
-	return start_server(ThreadedXMLRPCServer, HandlerClass, allow_none=True, logRequests=False)
+def start_threaded_xmlrpc_server(HandlerClass, port=1023, addr='', **kwargs):
+	return start_server(ThreadedXMLRPCServer, HandlerClass, allow_none=True, logRequests=False, **kwargs)
