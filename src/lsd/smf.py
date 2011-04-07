@@ -369,12 +369,9 @@ def fix_ps1_coord_bugs(cols, file, hduname):
 	ra, dec = cols['ra'], cols['dec']
 
 	if np.any(ra < 0):
-		print "HERE!"
-		logging.warning("Encountered %d instances of ra < 0 in file %s, %s HDU. Wrapping to [0, 360)." % (sum(ra < 0), file, hduname))
 		ra[ra < 0] = np.fmod(np.fmod(ra[ra < 0], 360) + 360, 360)
 
 	if np.any(ra >= 360):
-		logging.warning("Encountered %d instances of ra >= 360 in file %s, %s HDU. Wrapping to [0, 360)." % (sum(ra >= 360), file, hduname))
 		ra[ra >= 360] = np.fmod(np.fmod(ra[ra >= 360], 360) + 360, 360)
 
 	if np.any(np.abs(dec) > 90):

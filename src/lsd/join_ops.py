@@ -21,6 +21,7 @@ import utils
 import pool2
 import mr
 import native
+import colgroup
 
 from interval    import intervalset
 from colgroup    import ColGroup
@@ -1285,33 +1286,14 @@ class Query(object):
 		various parameters.
 		"""
 
-		ret = None
-		for rows in self.iterate(
-				bounds, include_cached,
-				cells=cells, return_blocks=True, filter=filter, testbounds=testbounds,
-				_yield_empty=True,
-				nworkers=nworkers, progress_callback=progress_callback):
-			# ensure enough memory has been allocated (and do it
-			# intelligently if not)
-			if ret is None:
-				ret = rows
-				nret = len(rows)
-			else:
-				lnew = nret + len(rows)
-				lret = len(rows)
-				while lret < lnew:
-					lret = 2 * max(lret,1)
-				if lret != len(rows):
-					ret.resize(lret)
-
-				# append
-				ret[nret:nret+len(rows)] = rows
-				nret = nret + len(rows)
-
-		if ret is not None:
-			ret.resize(nret)
-
-		return ret
+		return colgroup.fromiter(
+				self.iterate(
+					bounds, include_cached, cells=cells,
+					return_blocks=True, filter=filter, _yield_empty=True,
+					nworkers=nworkers, progress_callback=progress_callback
+					),
+				blocks=True
+			)
 
 	def fetch_cell(self, cell_id, include_cached=False):
 		""" Internal: Execute the query on a given (single) cell.
@@ -1695,14 +1677,14 @@ class DB(object):
 		for tabname in tables:
 			table = self.table(tabname)
 
-			# Scan the number of rows
-			table._nrows = compute_counts(self, tabname)
-			table._store_schema()
-
 			# Compute the tablet tree cache
 			data_path = table._get_cgroup_data_path(table.primary_cgroup)
 			pattern   = table._tablet_filename(table.primary_cgroup)
 			table.tablet_tree = TabletTreeCache().create_cache(table.pix, data_path, pattern, table.path + '/tablet_tree.pkl')
+
+			# Scan the number of rows
+			table._nrows = compute_counts(self, tabname)
+			table._store_schema()
 
 ###################################################################
 ## Auxilliary functions implementing DB.build_neighbor_cache

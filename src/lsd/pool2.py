@@ -414,7 +414,7 @@ class Pool:
 					K_fun, K_args = _output_pickled_kv, (K_fun, K_args)
 
 					# Create a disk backing store for intermediate results
-					fp = tempfile.NamedTemporaryFile(mode='wb', prefix='mapresults-', dir='.', suffix='.pkl', delete=True)
+					fp = tempfile.NamedTemporaryFile(mode='wb', prefix='mapresults-', dir='/nfs_pan/mjuric', suffix='.pkl', delete=True)
 					fd = fp.file.fileno()
 					os.ftruncate(fd, BUFSIZE)
 					mm = mmap.mmap(fd, 0)
