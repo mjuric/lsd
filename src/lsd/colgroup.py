@@ -12,6 +12,7 @@ of equal length.
 
 import numpy as np
 from utils import full_dtype
+import copy
 
 def make_record(dtype):
 	# Construct a numpy record corresponding to a row of this table
@@ -180,7 +181,13 @@ class ColGroup(object):
 		# Return a ColGroup if the key was an instance of a slice or ndarray,
 		# and numpy.void structure otherwise
 		if isinstance(key, slice) or isinstance(key, np.ndarray):
-			return ColGroup(ret)
+			# This turned out to be slow (reported by eschlafly)...
+			#return ColGroup(ret)
+			# ... replaced by optimized ColGroup-to-ColGroup copying
+			cg = ColGroup(info=self.info)
+			cg.column_map = self.column_map.copy()
+			cg.column_data = [ data[key] for data in self.column_data ]
+			return cg
 		else:
 			#row = self.row.copy()
 			row = make_record(self.dtype)
@@ -262,7 +269,7 @@ class ColGroup(object):
 		"""
 		return self.column_data[idx]
 
-	def __init__(self, cols=[], dtype=None, size=0):
+	def __init__(self, cols=[], dtype=None, size=0, info=None):
 		"""
 		Construct the column group.
 
@@ -283,7 +290,10 @@ class ColGroup(object):
 		"""
 		self.column_map = dict()
 		self.column_data = []
-		self.info = InfoInstance()
+		if info is not None:
+			self.info = copy.copy(info)
+		else:
+			self.info = InfoInstance()
 
 		if dtype is not None:
 			# construct cols from structured array dtype
@@ -296,8 +306,11 @@ class ColGroup(object):
 		if getattr(cols, 'items', None) is not None:
 			cols = cols.items()
 
-		for (name, col) in cols:
-			self.add_column(name, col)
+		# Detect structured ndarrays
+		if isinstance(cols, np.ndarray) and cols.dtype.names is not None:
+			cols = [ (name, cols[name]) for name in cols.dtype.names ]
+
+		self.add_columns(cols)
 
 #		self._mk_row()
 
@@ -428,7 +441,7 @@ class ColGroup(object):
 			return self.column_data[self.column_map[key]]
 
 		# Return a subset cgroup
-		return ColGroup((   (name, self.column_data[self.column_map[name]]) for name in key ))
+		return ColGroup((   (name, self.column_data[self.column_map[name]]) for name in key ), info=self.info)
 
 	def nrows(self):
 		"""
@@ -526,7 +539,13 @@ class ColGroup(object):
 
 		res = np.ones(len(self), dtype=bool)
 		for name in self.keys():
-			res &= (self[name] == y[name])
+			# Support multi-dimensional subfields, by flattening them
+			# successively over every axis
+			tmp = self[name] == y[name]
+			for _ in xrange(len(tmp.shape)-1):
+				tmp = np.all(tmp, axis=-1)
+
+			res &= tmp
 
 		return res
 
@@ -540,8 +559,7 @@ class ColGroup(object):
 		If expr is not None, keeps only the rows for which expr
 		evaulates to True.
 		"""
-		ret = ColGroup()
-		ret.info = self.info
+		ret = ColGroup(info=self.info)
 
 		if expr is None:
 			for name in self.keys():
@@ -596,46 +614,152 @@ def fromiter(it, dtype=None, blocks=False):
 
 	return buf
 
-def test_fromiter():
-	# Test fromiter()
-	from itertools import izip
+############################################################
+# Unit tests
 
-	# No element
-	cg1 = fromiter([], blocks=True)
-	assert np.all(cg1 == ColGroup())
+class Test_ColGroup__getitem__:
+	def setUp(self):
+		# Create a numpy structured array from which ColGroup instances will be made
+		global random, sys, itertools
+		import numpy.random as random
+		import sys, itertools
 
-	# Single element
-	cg1 = ColGroup()
-	cg1.f1 = np.arange(10)
-	cg1.f2 = np.arange(10)
-	cg2 = fromiter([cg1], blocks=True)
-	assert np.all(cg1 == cg2)
+		random.seed(42)
+		dtype = [ ('int4', 'i4'), ('float8', 'f8'), ('float4', 'f4'),
+			  ('4float4', '4f4'), ('a10', 'a10'), ('cube', (np.float32, (4, 4)))
+			]
+		self.a = np.empty(10000, dtype=dtype)
+		for name, dtype in dtype:
+			self.a[name].flat = np.random.random(self.a[name].size)*self.a[name].size
 
-	# More than one block of varying sizes
-	s = [20, 2, 4, 570, 13, 44, 56, 88, 9999, 1003000, 0, 1]
-	def mkarray(begin, end):
+	def test_getitem_column_subset(self):
+		""" __getitem__: subset of columns """
+		cg = ColGroup(self.a)
+
+		random.seed(42)
+		for names in itertools.combinations(self.a.dtype.names, 3):
+			names = list(names)
+			random.shuffle(names)
+
+			#print >>sys.stderr, names
+			cg2 = cg[names]
+			for name in names:
+				assert np.all(cg2[name] == self.a[name])
+
+	def test_getitem_column_name(self):
+		""" __getitem__: by column name """
+		cg = ColGroup(self.a)
+
+		random.seed(78)
+		names = list(self.a.dtype.names)
+		random.shuffle(names)
+
+		for name in names:
+			#print >>sys.stderr, name
+			col = cg[name]
+			assert np.all(col == self.a[name])
+
+	def test_getitem_single_row(self):
+		""" __getitem__: get single row """
+		cg = ColGroup(self.a)
+
+		random.seed(79)
+		ii = np.append(random.random_integers(0, self.a.size-1, 10), [0, self.a.size-1])
+
+		for i in ii:
+			row   = cg[i]
+			rownp = self.a[i]
+
+			# Test column-by-column
+			for name in self.a.dtype.names:
+				assert np.all(row[name] == rownp[name])
+
+			# Test via __eq__ operator
+			assert np.all(row == rownp)
+
+	def _test_getitem_by(self, idx):
+		# Aux. func for test_getitem_by_index and _by_boolean
+		cg = ColGroup(self.a)
+
+		cg2 = cg[idx]
+		a2 = self.a[idx]
+
+		# Test column-by-column
+		for name in self.a.dtype.names:
+			#print >>sys.stderr, idx
+			assert np.all(cg2[name] == a2[name])
+
+		# Test via __eq__ operator
+		assert np.all(cg2 == a2)		
+
+	def test_getitem_by_index(self):
+		""" __getitem__: by integer index """
+		random.seed(55)
+		idx = random.random_integers(0, self.a.size-1, self.a.size // 2)
+
+		self._test_getitem_by(idx)
+
+	def test_getitem_by_boolean(self):
+		""" __getitem__: by boolean index """
+		random.seed(65)
+		idx = random.random_integers(0, self.a.size-1, self.a.size) > (self.a.size // 2)
+		assert idx.dtype == bool
+
+		self._test_getitem_by(idx)
+
+class Test_fromiter:
+	"""fromiter: comprehensive tests"""
+	def setUp(self):
+		global izip
+		from itertools import izip
+
+	def test_empty(self):
+		"""fromiter: empty iterator"""
+		# No element
+		cg1 = fromiter([], blocks=True)
+		assert np.all(cg1 == ColGroup())
+		assert len(cg1) == 0
+
+	def test_single(self):
+		"""fromiter: single element"""
+		cg1 = ColGroup()
+		cg1.f1 = np.arange(10)
+		cg1.f2 = np.arange(10)
+		cg2 = fromiter([cg1], blocks=True)
+		assert np.all(cg1 == cg2)
+
+	def _mkarray(self, begin, end):
 		cg = ColGroup()
 		cg.f1 = np.arange(begin, end)
 		cg.f2 = np.arange(begin, end, dtype='f4')
 		return cg
 
-	s = [20, 2, 4, 570, 13, 44, 56, 88, 9999, 1003000, 0, 1]
-	cg2 = fromiter(( mkarray(end-len, end) for (len, end) in izip(s, np.cumsum(s)) ), blocks=True)
-	cg1 = mkarray(0, sum(s))
-	assert np.all(cg1 == cg2)
-
-	# Special sizes
-	s = [0, 2, 2, 4, 8, 16, 32, 32, 32, 1]
-	cg2 = fromiter(( mkarray(end-len, end) for (len, end) in izip(s, np.cumsum(s)) ), blocks=True)
-	cg1 = mkarray(0, sum(s))
-	assert np.all(cg1 == cg2)
-
-	# Fuzzing
-	for _ in xrange(1000):
-		s = np.random.random_integers(0, 10000, 20)
-		cg2 = fromiter(( mkarray(end-len, end) for (len, end) in izip(s, np.cumsum(s)) ), blocks=True)
-		cg1 = mkarray(0, sum(s))
+	def test_general(self):
+		"""fromiter: multiple elements"""
+		# More than one block of varying sizes
+		s = [20, 2, 4, 570, 13, 44, 56, 88, 9999, 1003000, 0, 1]
+		cg2 = fromiter(( self._mkarray(end-len, end) for (len, end) in izip(s, np.cumsum(s)) ), blocks=True)
+		cg1 = self._mkarray(0, sum(s))
 		assert np.all(cg1 == cg2)
+
+	def test_special_pow2(self):
+		"""fromiter: powers of two sizes"""
+		# Special sizes
+		s = [0, 2, 2, 4, 8, 16, 32, 32, 32, 1]
+		cg2 = fromiter(( self._mkarray(end-len, end) for (len, end) in izip(s, np.cumsum(s)) ), blocks=True)
+		cg1 = self._mkarray(0, sum(s))
+		assert np.all(cg1 == cg2)
+
+	def test_fuzz(self):
+		"""fromiter: fuzzing"""
+		# Fuzzing
+		np.random.seed(99)
+		for _ in xrange(100):
+			s = np.random.random_integers(0, 10000, 20)
+			cg2 = fromiter(( self._mkarray(end-len, end) for (len, end) in izip(s, np.cumsum(s)) ), blocks=True)
+			cg1 = self._mkarray(0, sum(s))
+			assert np.all(cg1 == cg2)
+
 
 if __name__ == "__main__":
 	test_fromiter()
