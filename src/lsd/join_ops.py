@@ -663,6 +663,10 @@ class QueryInstance(object):
 			ret = np.empty(nrows, dtype=np.uint64)
 			ret[:] = self.cell_id
 			return ret
+		elif name == '_CELLPATH':
+			ret = np.empty(nrows, dtype='a128')
+			ret[:] = self.pix.path_to_cell(self.cell_id)
+			return ret
 		else:
 			raise Exception('Unknown pseudocolumn %s' % name)
 
@@ -692,7 +696,7 @@ class QueryInstance(object):
 				return self.columns[name]
 
 		# A query pseudocolumn?
-		if name in ['_ROWNUM', '_CELLID']:
+		if name in ['_ROWNUM', '_CELLID', '_CELLPATH']:
 			col = self[name] = self.load_pseudocolumn(name)
 			return col
 
