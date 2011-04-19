@@ -61,7 +61,7 @@ class Table:
 	"""
 
 	path = '.'		#: Full path to the table directory (set by controlling DB instance)
-	pix  = Pixelization(level=int(os.getenv("PIXLEVEL", 7)), t0=54335, dt=1) #: Pixelization object for the table
+	pix  = None		#: Pixelization object for the table (initialized in __init__)
 				# t0: default starting epoch (== 2pm HST, Aug 22 2007 (night of GPC1 first light))
 				# td: default temporal resolution (in days)
 	_nrows = 0		#: The number of rows in the table (use nrows() to access)
@@ -772,6 +772,7 @@ class Table:
 		Never use directly. Use DB.table() to obtain an instance of
 		this class.
 		"""
+		self.pix = Pixelization(level=int(os.getenv("PIXLEVEL", 6)), t0=54335, dt=1)
 		if mode == 'c':
 			assert name is not None
 			self._create(name, path, level, t0, dt)
