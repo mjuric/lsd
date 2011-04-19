@@ -349,9 +349,9 @@ def neighbors(x, y, level, include_self=False):
 	# into which (x,y) falls
 	result = set()
 	dx = pix_size(level)
-	(cx, cy) = xy_center(x, y, level)
-	#(cx, cy, dx) = (x, y, level)
-	for (cx, cy) in map_to_valid_pixels(cx, cy, dx):
+	(ox, oy) = xy_center(x, y, level)
+	#(ox, oy, dx) = (x, y, level)
+	for (cx, cy) in map_to_valid_pixels(ox, oy, dx):
 #		print (cx, cy)
 		for di in xrange(-1, 2):
 			for dj in xrange(-1, 2):
@@ -360,8 +360,8 @@ def neighbors(x, y, level, include_self=False):
 #				print '  n=', di, dj, pix
 				result.update(pix)
 
-	if not include_self and (cx, cy) in result:
-		result.remove((cx, cy))
+	if not include_self and (ox, oy) in result:
+		result.remove((ox, oy))
 
 	return result
 ################################################################

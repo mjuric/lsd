@@ -406,6 +406,7 @@ class Pixelization(object):
 		# TODO: Remove once we're confident it works
 		rrr = set([ self._xyt_from_cell_id(cid)[:2] for cid in nhood ])
 		assert rrr == ncells
+		assert cell_id not in rrr
 
 		return nhood
 
