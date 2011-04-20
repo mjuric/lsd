@@ -466,79 +466,93 @@ def digest(s):
 	#return hashlib.sha1(s).digest()
 	return hashlib.md5(s).digest()
 
-#	def distributed_map_reduce_chain(self, input, kernels, partitioners, progress_callback=None):
-#		""" A poor-man's map-reduce implementation.
-#		
-#		    Calls the mapper for each value in the <input> iterable. 
-#		    The mapper shall return a list of key/value pairs as a
-#		    result.  Once all mappers have run, reducers will be
-#		    called with a key, and a list of values associated with
-#		    that key, once for each key.  The reducer's return
-#		    values are yielded to the user.
-#
-#		    Input: Any iterable
-#		    Output: Iterable (generated)
-#
-#		    Notes:
-#		    	- mapper must return a dictionary of (key, value) pairs
-#		    	- reducer must expect a (key, value) pair as the first
-#		    	  argument, where the value will be an iterable
-#		"""
-#
-#		# Launch first mapping, and wait for the wave to finish
-#		mr = MapReduceSwarm(16, kernels, partitioners)
-#		mr.run()
-#
-#		for v in input:
-#			mr.push(v)
-#		for (msg, r) in mr:
-#			if msg == 'result':
-#				yield
-#			else:
-#				... progress report or something ...
-#				... we could pass this to the application layer as well ...
-#
-#
-#		class MapReduceSwarm:
-#			def __init__(self, nmembers, kernels, partitioners):
-#				self.comm = MPI.COMM_WORLD
-#				self.rank = MPI.Get_rank()
-#
-#				if self.rank == 0:
-#					# Make yourself a daemon, listening for user commands
-#					# on a given socket
-#					...
-#				else:
-#					# Listen for master's commands through MPI
-#					(cmd, args) = comm.recv(source=0)
-#					if cmd == 'run':
-#						...
-#
-#			def push(self, val):
-#				...
-#
-#		# - controller: receives messages from workers (progress or results)
-#		# - workers: just work
-#		#
-#		# - Each process should have two threads (subprocesses) -- one for
-#		#   communicating with MPI (monitor), one for the actual work.
-#		#   - e.g., the monitor could then receive and store data sent
-#		#     to it by nodes wishing to reduce
-#		#   - might be good if these were two separate MPI instances?
-#
-#		def cell_partitioner(hosts, key):
-#			# Cell partitioner with no location awareness (assumes shared storage)
-#			# Always places the same key to the same host (assuming constant len(hosts))
-#			hash = int(hashlib.md5(str(key)).hexdigest(), base=16)
-#			return hosts[hash % len(hosts)]
-#
-#		def cell_partitioner(hosts, key, args):
-#			# location-aware assignment partitioner might look something like this
-#			(cat, occ) = args
-#			
-#			# Get a list of suitable hosts (this is all propagated at initialization time)
-#			chosts = cat.get_hosts_containing_cell(key, hosts)
-#
-#			# Choose one at random
-#			return chosts[random_integer(0, len(chosts)-1)]
-#
+############ Unit tests
+
+# ====
+def _test_pool2_add(a, b):
+	yield a+b
+# ====
+def _test_pool2_add1(a, b):
+	yield a, a+b
+
+def _test_pool2_subtract(kv, b, c):
+	_, gen = kv
+	for a in gen:
+		yield a+b
+		yield a-c
+# ====
+def _test_mapred2_map(a, b, c):
+	yield a + b, 1
+	yield a + c, a
+
+def _test_mapred2_red1(kv):
+	k, v = kv
+	yield k, sum(v)
+
+def _test_mapred2_red2(kv, d):
+	k, v = kv
+	for val in v:
+		yield val + d
+# ====
+
+class Test_Pool:
+	def setUp(self):
+		global np, sys
+		import numpy as np
+		import sys
+		self.pool = Pool()
+
+	def test_imap(self):
+		""" Mapper """
+		for k in [1, 2, 3, 4, 5, 7, 8, 10, 12, 16, 20, 50, 100, 200, 600]:
+			arr = np.arange(k)
+			b = 10
+
+			it = self.pool.imap_unordered(arr, _test_pool2_add, (b,), progress_callback=progress_pass)
+			res = np.fromiter(it, dtype=arr.dtype)
+
+			res.sort()
+			arr.sort()
+			assert np.all(res == arr+b)
+
+	def test_mapred1(self):
+		""" Map-Reduce: simple """
+		for k in [1, 2, 3, 4, 5, 7, 8, 10, 12, 16, 20, 50, 100, 200, 600]:
+			arr = np.arange(k)
+			b = 10
+			c = -10
+
+			it = self.pool.map_reduce_chain(arr, [ (_test_pool2_add1, b), (_test_pool2_subtract, b, c) ], progress_callback=progress_pass)
+			res = np.fromiter(it, dtype=arr.dtype)
+			res.sort()
+
+			arr = arr + b
+			arr = np.concatenate([arr + b, arr - c])
+			arr.sort()
+
+			assert np.all(res == arr)
+
+	def test_mapred2(self):
+		""" Map-Reduce: three-stage """
+		for k in [1, 2, 3, 4, 5, 7, 8, 10, 12, 16, 20, 50, 100, 200, 600]:
+			arr = np.arange(k)
+			b = 10
+			c = -4
+			d = 3
+
+			it = self.pool.map_reduce_chain(arr, [ (_test_mapred2_map, b, c), _test_mapred2_red1, (_test_mapred2_red2, d) ], progress_callback=progress_pass)
+			res = np.fromiter(it, dtype=arr.dtype)
+			res.sort()
+
+			r1  = [ (a + b, 1) for a in arr ]
+			r1 += [ (a + c, a) for a in arr ]
+			r2 = defaultdict(np.int64)
+			for k, v in r1:
+				r2[k] += v
+			r3 = np.array(r2.values(), dtype=np.int64) + d
+			r3.sort()
+
+			print res
+			print r3
+			assert np.all(res == r3)
+
