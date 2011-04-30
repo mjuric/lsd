@@ -48,6 +48,9 @@ def _worker(ident, qcmd, qin, qout):
 						del tb    # See docs for sys.exec_info() for why this has to be here
 						qout.put((ident, 'EXCEPT', (type, value, tb_str)))
 
+				# Announce we're done with this mapper
+				qout.put((ident, 'MAPDONE', None))
+
 				# Immediately release memory
 				del result, i, item
 				del mapper, mapper_args
@@ -187,10 +190,14 @@ class Pool:
 
 		kill = []
 		for p in self.ps:
-			p.join(5)
-			if p.is_alive():
+			try:
+				p.join(5)
+				if p.is_alive():
+					kill.append(p)
+			except:
 				kill.append(p)
-		
+				pass
+
 		for p in kill:
 			p.terminate()
 
@@ -269,14 +276,19 @@ class Pool:
 
 				# yield the outputs
 				k = 0
-				while k != n:
+				wf = 0	# Number of workers that have finished
+				while wf != self.nworkers:
 					(ident, what, data) = self.qout.get()
 					if what == 'RESULT':
 						i, result = data
 						yield result
+					elif what == 'MAPDONE':
+						wf += 1
+						#print "MAPDONE----------", ident
 					elif what == 'DONE':
 						k += 1
 						progress_callback(progress_callback_stage, 'step', input, k, None)
+						#print "DONE with %s of %s" % (k, len(input)), ident
 						continue
 					elif what == 'EXCEPT':
 						# Unhandled Exception was raised in one of the workers.
@@ -285,6 +297,9 @@ class Pool:
 						type, value, tb_str = data
 						print >> sys.stderr, 'Remote Traceback (most recent call last):\n', ''.join(tb_str)
 						raise value
+
+				assert wf == self.nworkers	# All workers must have finished
+				assert k == n			# All items must have been processed
 			except:
 				# Terminate the workers if an exception ocurred
 				self.terminate()
@@ -496,7 +511,8 @@ def _test_mapred2_red2(kv, d):
 # ====
 
 class Test_Pool:
-	def setUp(self):
+	@classmethod
+	def setUpClass(self):
 		global np, sys
 		import numpy as np
 		import sys
