@@ -21,7 +21,7 @@ BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 200 * 2**30
 # OS X HFS+ filesystem does not support sparse files
 back_to_disk = platform.system() != 'Darwin'
 
-def _worker(qcmd, qin, qout):
+def _worker(ident, qcmd, qin, qout):
 	""" Waits for commands on qcmd. Possible commands are:
 		MAP: On MAP, store mapper and mapper_args, and
 		     begin listening on qin for a stream of
@@ -38,15 +38,15 @@ def _worker(qcmd, qin, qout):
 				for (i, item) in iter(qin.get, 'DONE'):
 					try:
 						for result in mapper(item, *mapper_args):
-							qout.put((i, result))
-						qout.put(('DONE', None))
+							qout.put((ident, 'RESULT', (i, result)))
+						qout.put((ident, 'DONE', i))
 					except KeyboardInterrupt:
 						return
 					except:
 						type, value, tb = sys.exc_info()
 						tb_str = traceback.format_tb(tb)
 						del tb    # See docs for sys.exec_info() for why this has to be here
-						qout.put(('EXCEPT', (type, value, tb_str)))
+						qout.put((ident, 'EXCEPT', (type, value, tb_str)))
 
 				# Immediately release memory
 				del result, i, item
@@ -216,7 +216,7 @@ class Pool:
 		self.qin = Queue()
 		self.qout = Queue(self.nworkers*2)
 		self.qcmd = [ Queue() for _ in xrange(self.nworkers) ]
-		self.ps = [ Process(target=_worker, args=(self.qcmd[i], self.qin, self.qout)) for i in xrange(self.nworkers) ]
+		self.ps = [ Process(target=_worker, args=(i, self.qcmd[i], self.qin, self.qout)) for i in xrange(self.nworkers) ]
 
 		for p in self.ps:
 			p.daemon = True
@@ -270,21 +270,21 @@ class Pool:
 				# yield the outputs
 				k = 0
 				while k != n:
-					(i, result) = self.qout.get()
-					if isinstance(i, str):
-						if i == 'DONE':
-							k += 1
-							progress_callback(progress_callback_stage, 'step', input, k, None)
-							continue
-						if i == 'EXCEPT':
-							# Unhandled Exception was raised in one of the workers.
-							# Terminate the workers and re-raise it.
-							self.terminate()
-							type, value, tb_str = result
-							print >> sys.stderr, 'Remote Traceback (most recent call last):\n', ''.join(tb_str)
-							raise value
-
-					yield result
+					(ident, what, data) = self.qout.get()
+					if what == 'RESULT':
+						i, result = data
+						yield result
+					elif what == 'DONE':
+						k += 1
+						progress_callback(progress_callback_stage, 'step', input, k, None)
+						continue
+					elif what == 'EXCEPT':
+						# Unhandled Exception was raised in one of the workers.
+						# Terminate the workers and re-raise it.
+						self.terminate()
+						type, value, tb_str = data
+						print >> sys.stderr, 'Remote Traceback (most recent call last):\n', ''.join(tb_str)
+						raise value
 			except:
 				# Terminate the workers if an exception ocurred
 				self.terminate()
