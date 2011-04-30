@@ -1,0 +1,57 @@
+#!/usr/bin/env python
+
+import multiprocessing
+import logging
+import threading
+from lsd.pyrpc import PyRPCServer
+
+logger = logging.getLogger('lsd-manager')
+
+########### Simple check-in server
+
+class RunningPools:
+	_lock = None
+	_pools = None
+	
+	def __init__(self):
+		self._lock = threading.Lock()
+		self._pools = dict()
+	
+	def __connect__(self, client_address):
+		with self._lock:
+			assert client_address not in self._pools
+			self._pools[client_address] = 1
+			logger.info("%s:%s connected (%d active connections)" % (client_address[0], client_address[1], len(self._pools)))
+
+	def __disconnect__(self, client_address):
+		with self._lock:
+			del self._pools[client_address]
+			logger.info("%s:%s disconnected (%d active connections)" % (client_address[0], client_address[1], len(self._pools)))
+
+	def nworkers(self):
+		""" Return the number of workers the client should have active """
+		ncores = multiprocessing.cpu_count()
+
+		with self._lock:
+			nworkers = int(float(ncores) / len(self._pools))
+		
+		if nworkers == 0:
+			nworkers = 1
+
+		return nworkers
+
+def run_server():
+	# Instantiate a server
+	server = PyRPCServer("localhost", 5432)
+	server.register_instance(RunningPools())
+	server.serve_forever()
+
+if __name__ == "__main__":
+	import os
+	format = '%(asctime)s.%(msecs)03d %(name)s[%(process)d] %(levelname)-8s {%(module)s:%(funcName)s}: %(message)s'
+	datefmt = '%a, %d %b %Y %H:%M:%S'
+	level = logging.DEBUG if (os.getenv("DEBUG", 0) or os.getenv("LOGLEVEL", "info") == "debug") else logging.INFO
+	logging.basicConfig(format=format, datefmt=datefmt, level=level)
+
+	run_server()
+

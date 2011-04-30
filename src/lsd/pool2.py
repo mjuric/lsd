@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 
 from multiprocessing import Process, Queue, cpu_count
-from lsd.pyrpc import PyRPCProxy
+from lsd.pyrpc import PyRPCProxy, RPCError
 from Queue import Empty
 from collections import defaultdict
+import socket
 import cPickle as pickle
 import cPickle
 import os
@@ -32,19 +33,17 @@ def _worker(ident, qcmd, qbroadcast, qin, qout):
 		     results yielded by mapper via qout.
 	"""
 
-
 	def check_bqueue():
 		# Check if there's a command in the broadcast queue
 		try:
 			(cmd, args) = qbroadcast.get_nowait()
 			if cmd == "STOP":
-				print "Received STOP", ident
 				qout.put((ident, 'STOPPED', None))
 				cmd, args = qcmd.get()	# Expect 'CONT' to unfreeze the job
-				assert cmd == 'CONT'
-				print "Received CONT", ident
+				assert cmd == 'CONT', cmd
 		except Empty:
 			pass
+
 
 	try:
 		for cmd, args in iter(qcmd.get, 'EXIT'):
@@ -55,7 +54,6 @@ def _worker(ident, qcmd, qbroadcast, qin, qout):
 
 				i, item, result = None, None, None
 				for (i, item) in iter(qin.get, 'DONE'):
-					#print "ITEM: ", i, ident
 					# Process an item
 					try:
 						for result in mapper(item, *mapper_args):
@@ -71,14 +69,14 @@ def _worker(ident, qcmd, qbroadcast, qin, qout):
 
 					check_bqueue()
 
-				# Announce we're done with this mapper
-				qout.put((ident, 'MAPDONE', None))
-				print "MAPDONE", ident
-
 				# Immediately release memory
 				del result, i, item
 				del mapper, mapper_args
 				del args
+
+				# Announce we're done with this mapper
+				qout.put((ident, 'MAPDONE', None))
+
 	except KeyboardInterrupt:
 		pass;
 
@@ -267,25 +265,18 @@ class Pool:
 		if nworkers != None:
 			self.nworkers = nworkers
 
-	@property
-	def mgr(self):
+		self._mgr = PyRPCProxy("localhost", 5432)
 
-		try:
-			return self._mgr
-		except AttributeError:
-			try:
-				self._mgr = PyRPCProxy("localhost", 5432)
-				return self._mgr
-			except RPCError:
-				pass
-
-		return None
-
+	_mgr = None		# RPC proxy to LSD Client Manager
 	_ntarget_time = 0
 	_ntarget = None
 	def get_active_workers_target(self):
-		if time.time() - self._ntarget_time > 1:
-			self._ntarget = min(self.mgr.nworkers(), self.nworkers)
+		""" Return the target number of active workers """
+		if time.time() - self._ntarget_time > 10:
+			try:
+				self._ntarget = min(self._mgr.nworkers(), self.nworkers)
+			except AttributeError:
+				self._ntarget = self.nworkers
 			self._ntarget_time = time.time()
 
 		return self._ntarget
@@ -339,7 +330,7 @@ class Pool:
 				# yield the outputs
 				k = 0	# Number of items that have been processed
 				wf = 0	# Number of workers that have finished
-				while wf != self.nworkers or k != n:
+				while wf != self.nworkers or k != n or nstopping != 0:
 					(ident, what, data) = self.qout.get()
 					if what == 'RESULT':
 						i, result = data
@@ -351,7 +342,6 @@ class Pool:
 						progress_callback(progress_callback_stage, 'step', input, k, None)
 						continue
 					elif what == 'STOPPED':
-						print "Acked STOPPED", ident
 						assert ident not in stopped
 						stopped.add(ident)
 						nstopping -= 1
@@ -370,10 +360,15 @@ class Pool:
 					if k != n:
 						ntarget = self.get_active_workers_target()
 					else:
-						print "k == n"
 						# If all items have been exhausted, unstop all workers so they can
 						# finish cleanly
 						ntarget = self.nworkers
+						
+						# Rescind outstanding STOP orders, if any
+						if wf == self.nworkers:
+							for _ in xrange(nstopping):
+								self.qbroadcast.get()
+								nstopping -= 1
 					
 					# Need to stop more workers?
 					for _ in xrange(nrunning - nstopping - ntarget):
@@ -390,13 +385,8 @@ class Pool:
 
 				assert wf == self.nworkers	# All workers must have finished
 				assert k == n			# All items must have been processed
-				
-				# Clear any outstanting STOP commands that haven't reached the workers in time
-				try:
-					while True:
-						self.qbroadcast.get_nowait()
-				except Empty:
-					pass
+				assert nstopping == 0		# No outstanding STOP orders
+
 			except:
 				# Terminate the workers if an exception ocurred
 				self.terminate()
@@ -620,8 +610,8 @@ class Test_Pool:
 		self.pool = Pool()
 
 	def test_imap_long(self):
-		return
-		for k in [200]:
+		""" Mapper, long duration """
+		for k in [100]:
 			arr = np.arange(k)
 			b = 10
 
