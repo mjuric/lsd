@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
 from multiprocessing import Process, Queue, cpu_count
+from lsd.pyrpc import PyRPCProxy
+from Queue import Empty
 from collections import defaultdict
 import cPickle as pickle
 import cPickle
@@ -21,7 +23,7 @@ BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 200 * 2**30
 # OS X HFS+ filesystem does not support sparse files
 back_to_disk = platform.system() != 'Darwin'
 
-def _worker(ident, qcmd, qin, qout):
+def _worker(ident, qcmd, qbroadcast, qin, qout):
 	""" Waits for commands on qcmd. Possible commands are:
 		MAP: On MAP, store mapper and mapper_args, and
 		     begin listening on qin for a stream of
@@ -29,13 +31,32 @@ def _worker(ident, qcmd, qin, qout):
 		     message 'DONE' is encountered. Return the
 		     results yielded by mapper via qout.
 	"""
+
+
+	def check_bqueue():
+		# Check if there's a command in the broadcast queue
+		try:
+			(cmd, args) = qbroadcast.get_nowait()
+			if cmd == "STOP":
+				print "Received STOP", ident
+				qout.put((ident, 'STOPPED', None))
+				cmd, args = qcmd.get()	# Expect 'CONT' to unfreeze the job
+				assert cmd == 'CONT'
+				print "Received CONT", ident
+		except Empty:
+			pass
+
 	try:
 		for cmd, args in iter(qcmd.get, 'EXIT'):
 			if cmd == 'MAP':
 				mapper, mapper_args = args
 
+				check_bqueue()
+
 				i, item, result = None, None, None
 				for (i, item) in iter(qin.get, 'DONE'):
+					#print "ITEM: ", i, ident
+					# Process an item
 					try:
 						for result in mapper(item, *mapper_args):
 							qout.put((ident, 'RESULT', (i, result)))
@@ -48,8 +69,11 @@ def _worker(ident, qcmd, qin, qout):
 						del tb    # See docs for sys.exec_info() for why this has to be here
 						qout.put((ident, 'EXCEPT', (type, value, tb_str)))
 
+					check_bqueue()
+
 				# Announce we're done with this mapper
 				qout.put((ident, 'MAPDONE', None))
+				print "MAPDONE", ident
 
 				# Immediately release memory
 				del result, i, item
@@ -172,6 +196,7 @@ def where(cond, a, b):
 class Pool:
 	qcmd = None
 	qin = None
+	qbroadcast = None
 	qout = None
 	ps = []
 	min_tasks_for_parallel = 3
@@ -201,14 +226,19 @@ class Pool:
 		for p in kill:
 			p.terminate()
 
-		self.qcmd = self.qin = self.qout = None
+		self.qcmd = self.qin = self.qbroadcast = self.qout = None
 		del self.ps[:]
+
+		try:
+			del self._mgr
+		except AttributeError:
+			pass
 
 	def terminate(self):
 		for p in self.ps:
 			p.terminate()
 
-		self.qcmd = self.qin = self.qout = None
+		self.qcmd = self.qin = self.qbroadcast = self.qout = None
 		if len(self.ps):
 			del self.ps[:]
 
@@ -221,9 +251,10 @@ class Pool:
 			return
 
 		self.qin = Queue()
+		self.qbroadcast = Queue()
 		self.qout = Queue(self.nworkers*2)
 		self.qcmd = [ Queue() for _ in xrange(self.nworkers) ]
-		self.ps = [ Process(target=_worker, args=(i, self.qcmd[i], self.qin, self.qout)) for i in xrange(self.nworkers) ]
+		self.ps = [ Process(target=_worker, args=(i, self.qcmd[i], self.qbroadcast, self.qin, self.qout)) for i in xrange(self.nworkers) ]
 
 		for p in self.ps:
 			p.daemon = True
@@ -235,6 +266,29 @@ class Pool:
 
 		if nworkers != None:
 			self.nworkers = nworkers
+
+	@property
+	def mgr(self):
+
+		try:
+			return self._mgr
+		except AttributeError:
+			try:
+				self._mgr = PyRPCProxy("localhost", 5432)
+				return self._mgr
+			except RPCError:
+				pass
+
+		return None
+
+	_ntarget_time = 0
+	_ntarget = None
+	def get_active_workers_target(self):
+		if time.time() - self._ntarget_time > 1:
+			self._ntarget = min(self.mgr.nworkers(), self.nworkers)
+			self._ntarget_time = time.time()
+
+		return self._ntarget
 
 	def imap_unordered(self, input, mapper, mapper_args=(), progress_callback=None, progress_callback_stage='map'):
 		""" Execute in parallel a callable <mapper> on all values of
@@ -256,9 +310,17 @@ class Pool:
 
 		# Dispatch/execute
 		if parallel:
-			# Create workers (if not created already)
 			try:
+				# Create workers (if not created already)
 				self._create_workers()
+
+				# Connect to worker manager and stop workers over the limit
+				stopped   = set()				# Idents of stopped workers
+				nrunning  = self.nworkers			# Number of running workers
+				ntarget   = self.get_active_workers_target()	# Desired number of running workers
+				nstopping = self.nworkers - ntarget		# Number of workers to which the stop command has been sent
+				for _ in xrange(nstopping):
+					self.qbroadcast.put( ('STOP', None) )
 
 				# Initialize this map
 				for q in self.qcmd:
@@ -275,21 +337,25 @@ class Pool:
 					self.qin.put('DONE')
 
 				# yield the outputs
-				k = 0
+				k = 0	# Number of items that have been processed
 				wf = 0	# Number of workers that have finished
-				while wf != self.nworkers:
+				while wf != self.nworkers or k != n:
 					(ident, what, data) = self.qout.get()
 					if what == 'RESULT':
 						i, result = data
 						yield result
 					elif what == 'MAPDONE':
 						wf += 1
-						#print "MAPDONE----------", ident
 					elif what == 'DONE':
 						k += 1
 						progress_callback(progress_callback_stage, 'step', input, k, None)
-						#print "DONE with %s of %s" % (k, len(input)), ident
 						continue
+					elif what == 'STOPPED':
+						print "Acked STOPPED", ident
+						assert ident not in stopped
+						stopped.add(ident)
+						nstopping -= 1
+						nrunning -= 1
 					elif what == 'EXCEPT':
 						# Unhandled Exception was raised in one of the workers.
 						# Terminate the workers and re-raise it.
@@ -298,8 +364,39 @@ class Pool:
 						print >> sys.stderr, 'Remote Traceback (most recent call last):\n', ''.join(tb_str)
 						raise value
 
+					#
+					# Adjust the number of active workers
+					#
+					if k != n:
+						ntarget = self.get_active_workers_target()
+					else:
+						print "k == n"
+						# If all items have been exhausted, unstop all workers so they can
+						# finish cleanly
+						ntarget = self.nworkers
+					
+					# Need to stop more workers?
+					for _ in xrange(nrunning - nstopping - ntarget):
+						self.qbroadcast.put( ('STOP', None) )
+						nstopping += 1
+
+					# Need to unstop some workers?
+					for _ in xrange(ntarget - (nrunning - nstopping)):
+						if len(stopped) == 0:
+							break
+						ident = stopped.pop()
+						self.qcmd[ident].put(("CONT", None))
+						nrunning += 1
+
 				assert wf == self.nworkers	# All workers must have finished
 				assert k == n			# All items must have been processed
+				
+				# Clear any outstanting STOP commands that haven't reached the workers in time
+				try:
+					while True:
+						self.qbroadcast.get_nowait()
+				except Empty:
+					pass
 			except:
 				# Terminate the workers if an exception ocurred
 				self.terminate()
@@ -487,6 +584,10 @@ def digest(s):
 def _test_pool2_add(a, b):
 	yield a+b
 # ====
+def _test_pool2_add_slow(a, b):
+	time.sleep(.2)
+	yield a+b
+# ====
 def _test_pool2_add1(a, b):
 	yield a, a+b
 
@@ -517,6 +618,19 @@ class Test_Pool:
 		import numpy as np
 		import sys
 		self.pool = Pool()
+
+	def test_imap_long(self):
+		return
+		for k in [200]:
+			arr = np.arange(k)
+			b = 10
+
+			it = self.pool.imap_unordered(arr, _test_pool2_add_slow, (b,), progress_callback=progress_pass)
+			res = np.fromiter(it, dtype=arr.dtype)
+
+			res.sort()
+			arr.sort()
+			assert np.all(res == arr+b)
 
 	def test_imap(self):
 		""" Mapper """
