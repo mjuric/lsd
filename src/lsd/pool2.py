@@ -496,7 +496,6 @@ class Pool:
 		progress_callback('mapreduce', 'begin', input, None, None)
 
 		if back_to_disk:
-			unique_objects = {}
 			fp, prev_fp = None, None
 
 		for i, K in enumerate(kernels):
@@ -505,11 +504,13 @@ class Pool:
 			stage = where(i == 0, 'map', 'reduce')
 
 			if back_to_disk:
+				# Reinitialize the unique_hash->file_offset map
+				unique_objects = {}
+
 				# Insert picklers/unpicklers
 				if i != 0:
 					# Insert unpickler
 					K_fun, K_args = _reduce_from_pickle_jar, (prev_fp.name, K_fun, K_args)
-#					if i == 2: exit()
 
 				if not last_step:
 					# Insert pickler
