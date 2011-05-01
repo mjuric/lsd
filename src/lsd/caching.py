@@ -28,7 +28,11 @@ class CallResultCache(object):
 
 	def __init__(self, cache_dir = None, max_memcache = 0.5 * 2**30):
 		if cache_dir is None:
-			cache_dir = tempfile.gettempdir() + '/_lsd_caching-' + getpass.getuser()
+			try:
+				cache_base = os.environ["LSD_CACHEDIR"]
+			except KeyError:
+				cache_base = tempfile.gettempdir()
+			cache_dir = cache_base + '/_lsd_caching-' + getpass.getuser()
 
 		self.cache_dir = cache_dir
 		self.max_memcache = max_memcache
