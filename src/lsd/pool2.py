@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from multiprocessing import Process, Queue, cpu_count
+from multiprocessing import Process, Queue, cpu_count, current_process
 from lsd.pyrpc import PyRPCProxy, RPCError
 from Queue import Empty
 from collections import defaultdict
@@ -16,6 +16,8 @@ import traceback
 import platform
 import logging
 from utils import unpack_callable
+
+logger = logging.getLogger('lsd.pool2')
 
 RET_KEYVAL = 1
 RET_KEYVAL_LIST = 2
@@ -250,7 +252,7 @@ class Pool:
 		self.qbroadcast = Queue()
 		self.qout = Queue(self.nworkers*2)
 		self.qcmd = [ Queue() for _ in xrange(self.nworkers) ]
-		self.ps = [ Process(target=_worker, args=(i, self.qcmd[i], self.qbroadcast, self.qin, self.qout)) for i in xrange(self.nworkers) ]
+		self.ps = [ Process(target=_worker, name="%s{%02d}" % (current_process().name, i), args=(i, self.qcmd[i], self.qbroadcast, self.qin, self.qout)) for i in xrange(self.nworkers) ]
 
 		for p in self.ps:
 			p.daemon = True
@@ -271,11 +273,12 @@ class Pool:
 	_ntarget = None		# Target number of active workers
 	def get_active_workers_target(self):
 		""" Return the target number of active workers """
-		if time.time() - self._ntarget_time > 10:
+		if time.time() - self._ntarget_time > 30:
 			try:
 				self._ntarget = min(self._mgr.nworkers(), self.nworkers)
 			except RPCError:
 				self._mgr.close()
+				logger.warning("Error contacting lsd-manager. Cannot coordinate resource usage with others, using %d cores." % self._ntarget)
 				pass
 			self._ntarget_time = time.time()
 

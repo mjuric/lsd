@@ -19,7 +19,7 @@ class ActiveWorkerManager:
 		self._lock = threading.Lock()
 		self._pools = dict()
 		self._maxcores = maxcores
-		logger.info("LSD manager starter, maxcores=%d" % (self._maxcores,))
+		logger.info("LSD manager started, maxcores=%d" % (self._maxcores,))
 
 	def __connect__(self, client_address):
 		with self._lock:

@@ -62,6 +62,8 @@ from interval import intervalset
 from collections import defaultdict
 from itertools import izip
 
+logger = logging.getLogger('lsd.fcache')
+
 END_MARKER=0x7FFFFFFF
 
 def _get_cells_kernel(ij, lev, cc, bounds_xy, bounds_t):
@@ -314,8 +316,8 @@ class TabletTreeCache:
 		self._compute_mipmaps()
 
 		#nstatic = np.sum(self._bmap != 0)
-		#logging.debug("%s cells in %s static cells" % (len(self._leaves)-2, nstatic))
-		#logging.debug("%s cells with data, the rest contain caches only." % (sum(npl['next'] > 0)-2))
+		#logger.debug("%s cells in %s static cells" % (len(self._leaves)-2, nstatic))
+		#logger.debug("%s cells with data, the rest contain caches only." % (sum(npl['next'] > 0)-2))
 		#print self._bmaps[0]
 		#print self._bmaps[1]
 		#print self._bmaps[2]

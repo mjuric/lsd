@@ -7,6 +7,8 @@ __all__ = ['TUIException', 'tui_getopt']
 
 import sys, exceptions, getopt, os, logging
 
+logger = logging.getLogger('lsd.tui')
+
 class TUIException(Exception):
 	pass;
 
@@ -80,27 +82,82 @@ def tui_getstdopts(optlist):
 
 	return (dbdir,)
 
+_default_logging_config = """
+version: 1
+
+formatters:
+  simple:
+    format: '%(levelname)s: %(message)s'
+  detailed:
+    format: '%(asctime)s.%(msecs)03d %(processName)s[%(process)d] %(levelname)-8s {%(module)s:%(funcName)s:%(lineno)d}: %(message)s'
+    datefmt: '%a, %d %b %Y %H:%M:%S'
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: WARNING
+    formatter: simple
+    stream: ext://sys.stderr
+  file:
+    class: logging.FileHandler
+    level: INFO
+    formatter: detailed
+    filename: /dev/null
+
+loggers:
+  lsd:
+    level: DEBUG
+    handlers: [console]
+    propagate: 0
+
+root:
+  level: DEBUG
+  handlers: [console]
+"""
+
 def startup():
 	## Setup various useful text UI handlers ##################
 	suppress_keyboard_interrupt_message()
 
 	## Setup logging ##
-	name = sys.argv[0].split('/')[-1]
-	format = '%(asctime)s.%(msecs)03d %(name)s[%(process)d] %(levelname)-8s {%(module)s:%(funcName)s}: %(message)s'
-	datefmt = '%a, %d %b %Y %H:%M:%S'
-	level = logging.DEBUG if (os.getenv("DEBUG", 0) or os.getenv("LOGLEVEL", "info") == "debug") else logging.INFO
-	filename = ('%s.log' % name) if os.getenv("LOG", None) is None else os.getenv("LOG")
-	logging.basicConfig(filename=filename, format=format, datefmt=datefmt, level=level)
+	import logging.config, yaml
 
-	logger = logging.getLogger()
-	logger.name = name
-	logging.info("Started %s", ' '.join(sys.argv))
-	logging.debug("Debug messages turned ON")
+	lsdlogrc = "%s/.lsdlogrc" % os.environ["HOME"]
+	defaultcfg = False
+	if os.getenv("LOG_CONFIG") is not None:
+	        # External YAML file with log configuration, explicitly set
+		cfg = yaml.load(open(os.getenv("LOG_CONFIG")))
+	elif os.path.exists(lsdlogrc):
+	        # External YAML file with log configuration
+		cfg = yaml.load(open(lsdlogrc))
+	else:
+	        # Default configuration, possibly partially overridden
+		cfg = yaml.load(_default_logging_config)
+		defaultcfg = True
 
-	# Log WARNING and above to console
-	ch = logging.StreamHandler()
-	ch.setLevel(logging.WARNING)
-	ch.setFormatter(logging.Formatter('%(levelname)s: %(name)s[%(process)d]: %(message)s'))
-	logger.addHandler(ch)
+        ## Increase the logging level everywhere if debugging is turned on
+        if int(os.getenv("DEBUG", 0)):
+                for h in cfg['handlers'].itervalues():
+        		h['level'] = 'DEBUG'
+
+        ## Redirect output of all loggers to a log file, if requested
+        if "LOG" in os.environ:
+		cfg['handlers']['file']['filename'] = os.environ["LOG"]
+		cfg['root']['handlers'] += ['file']
+		for lcfg in cfg['loggers'].itervalues():
+			lcfg['handlers'] += ['file']
+        elif defaultcfg:
+                ## Remove the unused file handler
+		del cfg['handlers']['file']
+
+	## Set the name of the current process to the filename of the executable
+	from multiprocessing import current_process
+	current_process().name = sys.argv[0].split('/')[-1]
+
+        logging.config.dictConfig(cfg)
+        logging.getLogger().name = current_process().name
+
+	logger.info("Started %s", ' '.join(sys.argv))
+	logger.debug("Debug messages turned ON")
 
 startup()

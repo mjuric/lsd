@@ -6,10 +6,13 @@ import numpy as np
 import pyfits
 import lsd as lsd
 import lsd.pool2 as pool2
+import logging
 from lsd.bounds   import rectangle, beam, make_canonical
 from lsd.utils    import make_printf_string, as_tuple
 from lsd.interval import intervalset
 from lsd.tui import *
+
+logger = logging.getLogger()
 
 def T(*args):
 	""" User friendly specification of time:
@@ -96,7 +99,7 @@ if __name__ == "__main__":
 			elif t == np.uint16:	t = 'i2'; conv = True
 			dtype += [(col, t)]
 			if conv:
-				print >> sys.stderr, 'WARNING: Stored "%s" as a signed integer, as pyfits can\'t handle unsigned and/or bools.' % (col)
+				logger.warning('Stored "%s" as a signed integer, as pyfits can\'t handle unsigned and/or bools.' % (col))
 		rows = rows.as_ndarray()
 
 		# pyfits bugs workarounds

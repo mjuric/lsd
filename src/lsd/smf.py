@@ -13,6 +13,8 @@ import sys, os
 import logging
 import utils
 
+logger = logging.getLogger("lsd.smf")
+
 # Table defs for exposure table
 exp_table_def = \
 {
@@ -375,7 +377,7 @@ def fix_ps1_coord_bugs(cols, file, hduname):
 		ra[ra >= 360] = np.fmod(np.fmod(ra[ra >= 360], 360) + 360, 360)
 
 	if np.any(np.abs(dec) > 90):
-		logging.warning("Encountered %d instances of dec > +/- 90 in file %s, %s HDU. Truncating to +/-90." % (sum(np.abs(dec) > 90), file, hduname))
+		logger.warning("Encountered %d instances of dec > +/- 90 in file %s, %s HDU. Truncating to +/-90." % (sum(np.abs(dec) > 90), file, hduname))
 		dec[dec > 90] = 90
 		dec[dec < -90] = -90
 
@@ -383,12 +385,12 @@ def fix_ps1_coord_bugs(cols, file, hduname):
 
 	# Remove any NaN rows
 	if np.isnan(cols['ra'].sum()):
-		logging.warning("Encountered %d instances of ra == NaN in file %s, %s HDU. Removing those rows." % (sum(np.isnan(ra)), file, hduname))
+		logger.warning("Encountered %d instances of ra == NaN in file %s, %s HDU. Removing those rows." % (sum(np.isnan(ra)), file, hduname))
 		keep = ~np.isnan(cols['ra'])
 		for name in cols: cols[name] = cols[name][keep]
 
 	if np.isnan(cols['dec'].sum()):
-		logging.warning("Encountered %d instances of dec == NaN in file %s, %s HDU. Removing those rows." % (sum(np.isnan(dec)), file, hduname))
+		logger.warning("Encountered %d instances of dec == NaN in file %s, %s HDU. Removing those rows." % (sum(np.isnan(dec)), file, hduname))
 		keep = ~np.isnan(cols['dec'])
 		for name in cols: cols[name] = cols[name][keep]
 

@@ -20,6 +20,8 @@ from collections  import OrderedDict
 from contextlib   import contextmanager
 from colgroup     import ColGroup
 
+logger = logging.getLogger("lsd.table")
+
 class BLOBAtom(tables.ObjectAtom):
 	"""
 	A PyTables atom representing BLOBs
@@ -595,7 +597,7 @@ class Table:
 			utils.mkdir_p(path)
 
 		utils.shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, fn) )
-		logging.debug("Acquired lockfile %s" % (fn))
+		logger.debug("Acquired lockfile %s" % (fn))
 		return fn
 
 	def _unlock_cell(self, lock):
@@ -603,7 +605,7 @@ class Table:
 		Unlock a cell.
 		"""
 		os.unlink(lock)
-		logging.debug("Released lockfile %s" % (lock))
+		logger.debug("Released lockfile %s" % (lock))
 
 	#### Low level tablet creation/access routines. These employ no locking
 	def _get_row_group(self, fp, group, cgroup):
@@ -694,7 +696,7 @@ class Table:
 			utils.mkdir_p(path)
 
 		# Create the tablet
-		logging.debug("Creating tablet %s" % (fn))
+		logger.debug("Creating tablet %s" % (fn))
 		fp  = tables.openFile(fn, mode='w')
 
 		# Force creation of the main subgroup
@@ -713,7 +715,7 @@ class Table:
 		"""
 		fn = self._tablet_file(cell_id, cgroup)
 
-       		logging.debug("Opening tablet %s (mode='%s')" % (fn, mode))
+       		logger.debug("Opening tablet %s (mode='%s')" % (fn, mode))
 		if mode == 'r':
 			fp = tables.openFile(fn)
 		elif mode == 'w':
@@ -1060,7 +1062,7 @@ class Table:
 
 					# Close and reopen (otherwise truncate appears to have no effect)
 					# -- bug in PyTables ??
-					logging.debug("Closing tablet (%s)" % (fp.filename))
+					logger.debug("Closing tablet (%s)" % (fp.filename))
 					fp.close()
 					fp = self._open_tablet(cur_cell_id, mode='w', cgroup=cgroup)
 					g  = self._get_row_group(fp, group, cgroup)
@@ -1126,7 +1128,7 @@ class Table:
 #					print 'LEN:', colname, bsize, len(barray), ito
 
 				t.append(rows)
-				logging.debug("Closing tablet (%s)" % (fp.filename))
+				logger.debug("Closing tablet (%s)" % (fp.filename))
 				fp.close()
 #				exit()
 
@@ -1443,7 +1445,7 @@ class Table:
 
 			yield fp
 
-			logging.debug("Closing tablet (%s)" % (fp.filename))
+			logger.debug("Closing tablet (%s)" % (fp.filename))
 			fp.close()
 
 	@contextmanager
