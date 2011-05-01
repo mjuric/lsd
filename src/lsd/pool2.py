@@ -227,10 +227,7 @@ class Pool:
 		self.qcmd = self.qin = self.qbroadcast = self.qout = None
 		del self.ps[:]
 
-		try:
-			del self._mgr
-		except AttributeError:
-			pass
+		self._mgr.close()
 
 	def terminate(self):
 		for p in self.ps:
@@ -266,17 +263,19 @@ class Pool:
 			self.nworkers = nworkers
 
 		self._mgr = PyRPCProxy("localhost", 5432)
+		self._ntarget = self.nworkers
 
 	_mgr = None		# RPC proxy to LSD Client Manager
-	_ntarget_time = 0
-	_ntarget = None
+	_ntarget_time = 0	# Last time _ntarget was refreshed
+	_ntarget = None		# Target number of active workers
 	def get_active_workers_target(self):
 		""" Return the target number of active workers """
 		if time.time() - self._ntarget_time > 10:
 			try:
 				self._ntarget = min(self._mgr.nworkers(), self.nworkers)
-			except AttributeError:
-				self._ntarget = self.nworkers
+			except RPCError:
+				self._mgr.close()
+				pass
 			self._ntarget_time = time.time()
 
 		return self._ntarget
@@ -327,6 +326,7 @@ class Pool:
 				for _ in xrange(self.nworkers):
 					self.qin.put('DONE')
 
+
 				# yield the outputs
 				k = 0	# Number of items that have been processed
 				wf = 0	# Number of workers that have finished
@@ -340,7 +340,6 @@ class Pool:
 					elif what == 'DONE':
 						k += 1
 						progress_callback(progress_callback_stage, 'step', input, k, None)
-						continue
 					elif what == 'STOPPED':
 						assert ident not in stopped
 						stopped.add(ident)

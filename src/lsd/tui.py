@@ -23,7 +23,7 @@ def suppress_keyboard_interrupt_message():
 
 	sys.excepthook = new_hook
 
-def tui_getopt(short, long, argn, usage, argn_max=None):
+def tui_getopt(short, long, argn, usage, argn_max=None, stdopts=True):
 	""" A streamlined getopt adapted to LSD tool needs.
 	    Also adds standard option existing on all LSD
 	    commands (e.g., --db)
@@ -36,8 +36,9 @@ def tui_getopt(short, long, argn, usage, argn_max=None):
 	                None, will be equal to argn. If
 	                -1, equals infinity
 	"""
-	short += 'd:'
-	long.append('db=')
+	if stdopts:
+        	short += 'd:'
+        	long.append('db=')
 
 	try:
 		optlist, args = getopt.getopt(sys.argv[1:], short, long)
@@ -55,9 +56,12 @@ def tui_getopt(short, long, argn, usage, argn_max=None):
 		usage()
 		exit(-1)
 
-	stdopts = tui_getstdopts(optlist)
+        if stdopts:
+        	stdopts = tui_getstdopts(optlist)
 
-	return optlist, stdopts, args
+        	return optlist, stdopts, args
+        else:
+                return optlist, args
 
 def tui_getstdopts(optlist):
 	""" Parses standard options out of command
@@ -81,14 +85,15 @@ def startup():
 	suppress_keyboard_interrupt_message()
 
 	## Setup logging ##
+	name = sys.argv[0].split('/')[-1]
 	format = '%(asctime)s.%(msecs)03d %(name)s[%(process)d] %(levelname)-8s {%(module)s:%(funcName)s}: %(message)s'
 	datefmt = '%a, %d %b %Y %H:%M:%S'
 	level = logging.DEBUG if (os.getenv("DEBUG", 0) or os.getenv("LOGLEVEL", "info") == "debug") else logging.INFO
-	filename = 'lsd.log' if os.getenv("LOG", None) is None else os.getenv("LOG")
+	filename = ('%s.log' % name) if os.getenv("LOG", None) is None else os.getenv("LOG")
 	logging.basicConfig(filename=filename, format=format, datefmt=datefmt, level=level)
 
 	logger = logging.getLogger()
-	logger.name = sys.argv[0].split('/')[-1]
+	logger.name = name
 	logging.info("Started %s", ' '.join(sys.argv))
 	logging.debug("Debug messages turned ON")
 

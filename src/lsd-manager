@@ -3,20 +3,24 @@
 import multiprocessing
 import logging
 import threading
+import sys, os
 from lsd.pyrpc import PyRPCServer
-
-logger = logging.getLogger('lsd-manager')
+from lsd.tui import *
 
 ########### Simple check-in server
 
-class RunningPools:
+logger = logging.getLogger()
+
+class ActiveWorkerManager:
 	_lock = None
 	_pools = None
 	
-	def __init__(self):
+	def __init__(self, maxcores):
 		self._lock = threading.Lock()
 		self._pools = dict()
-	
+		self._maxcores = maxcores
+		logger.info("LSD manager starter, maxcores=%d" % (self._maxcores,))
+
 	def __connect__(self, client_address):
 		with self._lock:
 			assert client_address not in self._pools
@@ -30,7 +34,8 @@ class RunningPools:
 
 	def nworkers(self):
 		""" Return the number of workers the client should have active """
-		ncores = multiprocessing.cpu_count()
+		#ncores = multiprocessing.cpu_count()
+		ncores = self._maxcores
 
 		with self._lock:
 			nworkers = int(float(ncores) / len(self._pools))
@@ -40,18 +45,13 @@ class RunningPools:
 
 		return nworkers
 
-def run_server():
-	# Instantiate a server
-	server = PyRPCServer("localhost", 5432)
-	server.register_instance(RunningPools())
-	server.serve_forever()
+def usage():
+	print "Usage: %s --quiet <max_cores>" % sys.argv[0]
 
 if __name__ == "__main__":
-	import os
-	format = '%(asctime)s.%(msecs)03d %(name)s[%(process)d] %(levelname)-8s {%(module)s:%(funcName)s}: %(message)s'
-	datefmt = '%a, %d %b %Y %H:%M:%S'
-	level = logging.DEBUG if (os.getenv("DEBUG", 0) or os.getenv("LOGLEVEL", "info") == "debug") else logging.INFO
-	logging.basicConfig(format=format, datefmt=datefmt, level=level)
+	optlist, (max_cores,) = tui_getopt('q', ['quiet'], 1, usage, stdopts=False)
 
-	run_server()
-
+	# Instantiate a server
+	server = PyRPCServer("localhost", 5432)
+	server.register_instance(ActiveWorkerManager(int(max_cores)))
+	server.serve_forever()

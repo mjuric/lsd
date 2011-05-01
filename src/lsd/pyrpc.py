@@ -229,7 +229,7 @@ class PyRPCProxy(object):
 		#self._connect()
 
 	def _connect(self):
-		if self._sock is None:
+		if self._wfile is None:
 			self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 			self._sock.connect(self._addr)
 
