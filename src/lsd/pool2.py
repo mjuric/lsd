@@ -230,8 +230,6 @@ class Pool:
 		self.qcmd = self.qin = self.qbroadcast = self.qout = None
 		del self.ps[:]
 
-		self._mgr.close()
-
 	def terminate(self):
 		for p in self.ps:
 			p.terminate()
@@ -265,19 +263,17 @@ class Pool:
 		if nworkers != None:
 			self.nworkers = nworkers
 
-		self._mgr = PyRPCProxy("localhost", 5432)
 		self._ntarget = self.nworkers
 
-	_mgr = None		# RPC proxy to LSD Client Manager
 	_ntarget_time = 0	# Last time _ntarget was refreshed
 	_ntarget = None		# Target number of active workers
-	def get_active_workers_target(self):
+	def get_active_workers_target(self, _mgr):
 		""" Return the target number of active workers """
 		if time.time() - self._ntarget_time > 30:
 			try:
-				self._ntarget = min(self._mgr.nworkers(), self.nworkers)
+				self._ntarget = min(_mgr.nworkers(), self.nworkers)
 			except RPCError:
-				self._mgr.close()
+				_mgr.close()
 				logger.warning("Error contacting lsd-manager. Cannot coordinate resource usage with others, using %d cores." % self._ntarget)
 				pass
 			self._ntarget_time = time.time()
@@ -307,11 +303,12 @@ class Pool:
 			try:
 				# Create workers (if not created already)
 				self._create_workers()
+				_mgr = PyRPCProxy("localhost", 5432)
 
 				# Connect to worker manager and stop workers over the limit
 				stopped   = set()				# Idents of stopped workers
 				nrunning  = self.nworkers			# Number of running workers
-				ntarget   = self.get_active_workers_target()	# Desired number of running workers
+				ntarget   = self.get_active_workers_target(_mgr)# Desired number of running workers
 				nstopping = self.nworkers - ntarget		# Number of workers to which the stop command has been sent
 				for _ in xrange(nstopping):
 					self.qbroadcast.put( ('STOP', None) )
@@ -361,7 +358,7 @@ class Pool:
 					# Adjust the number of active workers
 					#
 					if k != n:
-						ntarget = self.get_active_workers_target()
+						ntarget = self.get_active_workers_target(_mgr)
 					else:
 						# If all items have been exhausted, unstop all workers so they can
 						# finish cleanly
@@ -394,6 +391,10 @@ class Pool:
 				# Terminate the workers if an exception ocurred
 				self.terminate()
 				raise
+			finally:
+				# Make sure the connection to manager is closed (e.g., if an
+				# exception is thrown)
+				_mgr.close()
 		else:
 			# Execute in-thread, without external workers
 			for (i, item) in enumerate(input):
