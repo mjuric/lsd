@@ -59,6 +59,9 @@ class TabletCache:
 		# NOTE: Unless resolve_blobs=True, this method DOES NOT resolve blobrefs to BLOBs
 		include_cached = self.include_cached if table.name == self.root_name else True
 
+		# Resolve a column name alias
+		name = table.resolve_alias(name)
+
 		# Figure out which table contains this column
 		cgroup = table.columns[name].cgroup
 
@@ -341,9 +344,9 @@ class JoinRelation:
 	tableR = None	# Right-hand side table of the relation
 	tableS = None	# Left-hand side table of the relation
 	
-	def __init__(self, db, tableR, tableS, kind, **joindef):
+	def __init__(self, db, tableR, tableS, **joindef):
 		self.db     = db
-		self.kind   = kind
+		self.kind   = 'inner' if 'outer' not in joindef else 'outer'
 		self.tableR = tableR
 		self.tableS = tableS
 
@@ -379,6 +382,23 @@ class IndirectJoin(JoinRelation):
 		m2 = tcache.load_column(cell_id_to  , column_to  , table2)
 		assert len(m1) == len(m2)
 
+		# Cut on number of neighbors and distance, if given
+#		try:
+#			nr = tcache.load_column(cell_id_from, '_NR', table1)
+#			assert len(nr) == len(m1)
+#			m1 = m1[nr < self.n]
+#			m2 = m2[nr < self.n]
+#		except KeyError:
+#			if self.n != 1:
+#				raise	# Propagate the exception if n != 1 and we have no _NR column
+#			pass
+
+		if self.d is not None:
+			dist = tcache.load_column(cell_id_from, '_DIST', table1)
+			assert len(dist) == len(m1)
+			m1 = m1[nr < self.n]
+			m2 = m2[nr < self.n]
+
 		return m1, m2
 
 	def join(self, cell_id, id1, id2, idx1, idx2, tcache):
@@ -389,11 +409,15 @@ class IndirectJoin(JoinRelation):
 		(m1, m2) = self.fetch_join_map(cell_id, self.m1_colspec, self.m2_colspec, tcache)
 		return native.table_join(id1, id2, m1, m2, self.kind)
 
-	def __init__(self, db, tableR, tableS, kind, **joindef):
-		JoinRelation.__init__(self, db, tableR, tableS, kind, **joindef)
+	def __init__(self, db, tableR, tableS, **joindef):
+		JoinRelation.__init__(self, db, tableR, tableS, **joindef)
 
 		m1_tabname, m1_colname = joindef['m1']
 		m2_tabname, m2_colname = joindef['m2']
+
+		# Number of neighbors, max distance (these are usually given as FROM clause args)
+		self.n = joindef.get('n', 1)
+		self.d = joindef.get('d', None)
 
 		self.m1_colspec = (db.table(m1_tabname), m1_colname)
 		self.m2_colspec = (db.table(m2_tabname), m2_colname)
@@ -414,12 +438,22 @@ class IndirectJoin(JoinRelation):
 #		self.m1_colspec = tableR, joindef['id1']
 #		self.m2_colspec = tableS, joindef['id2']
 
-def create_join(db, fn, jkind, tableR, tableS):
+def create_join(db, fn, jargs, tableR, tableS):
+	if 'j' in jargs:					# Allow the join file to be overridden
+		j = jargs['j']
+		if j.find('/') == '-1':
+			fn = '%s/%s.join' % (db.path, j)	# j=myjoin
+		else:
+			fn = j					# j=bla/myjoin.join
+
 	data = json.loads(file(fn).read())
 	assert 'type' in data
 
+	# override the joindef with args from the FROM clause
+	data.update(jargs)
+
 	jclass = data['type'].capitalize() + 'Join'
-	return globals()[jclass](db, tableR, tableS, jkind, **data)
+	return globals()[jclass](db, tableR, tableS, **data)
 
 class iarray(np.ndarray):
 	"""
@@ -1583,8 +1617,8 @@ class DB(object):
 		tablist = []
 
 		# Instantiate the tables
-		for tabname, tabpath, jointype in from_clause:
-			tablist.append( ( tabname, (TableEntry(self.table(tabpath), tabname), jointype) ) )
+		for tabname, tabpath, join_args in from_clause:
+			tablist.append( ( tabname, (TableEntry(self.table(tabpath), tabname), join_args) ) )
 		tables = dict(tablist)
 
 		# Discover and set up JOIN links based on defined JOIN relations
@@ -1598,19 +1632,19 @@ class DB(object):
 				if jtabname not in tables:
 					continue
 
-				je, jkind = tables[jtabname]
+				je, jargs = tables[jtabname]
 				if je.relation is not None:	# Already joined
 					continue
 
-				je.relation = create_join(self, fn, jkind, e.table, je.table)
+				je.relation = create_join(self, fn, jargs, e.table, je.table)
 				e.joins.append(je)
 	
 		# Discover the root (the one and only one table that has no links pointing to it)
 		root = None
-		for _, (e, jkind) in tables.iteritems():
+		for _, (e, jargs) in tables.iteritems():
 			if e.relation is None:
-				assert root is None	# Can't have more than one roots
-				assert jkind == 'inner'	# Can't have something like 'ps1_obj(outer)' on root table
+				assert root is None		# Can't have more than one roots
+				assert 'outer' not in jargs	# Can't have something like 'ps1_obj(outer)' on root table
 				root = e
 		assert root is not None			# Can't have zero roots
 	

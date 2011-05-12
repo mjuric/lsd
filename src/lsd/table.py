@@ -717,6 +717,11 @@ class Table:
 
        		logger.debug("Opening tablet %s (mode='%s')" % (fn, mode))
 		if mode == 'r':
+		        # --- hack: preload the entire file to have it appear in filesystem cache
+		        #     this will speed up subsequent random reads within the file
+			with open(fn) as f:
+        			f.read()
+			# ---
 			fp = tables.openFile(fn)
 		elif mode == 'w':
 			if not os.path.isfile(fn):
@@ -883,6 +888,8 @@ class Table:
 		cols = ColGroup()
 		if getattr(cols_, 'items', None):			# Permit cols_ to be a dict()-like object
 			cols_ = cols_.items()
+		if getattr(cols_, 'dtype', None):			# Allow cols_ to be a ndarray or ColGroup
+			cols_ = [ (name, cols_[name]) for name in cols_.dtype.names ]
 		for name, col in cols_:
 			cols.add_column(self.resolve_alias(name), col)
 		assert cols.ncols()
@@ -1030,9 +1037,9 @@ class Table:
 							idx = slice(None)
 						else:
 							# Find rows which will be added, and those which will be updated
-							in_      = idx < len(id1)                    # Rows with IDs less than the maximum existing one
+							in_      = idx < len(id1)		    # Rows with IDs less than the maximum existing one
 							app      = np.ones(len(id2), dtype=np.bool)
-							app[in_] = id1[idx[in_]] != id2[in_]         # These rows will be appended
+							app[in_] = id1[idx[in_]] != id2[in_]	 # These rows will be appended
 							nnew     = app.sum()
 
 							# Reindex new rows past the end

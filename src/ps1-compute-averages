@@ -13,6 +13,7 @@ from scipy.weave import inline
 import logging
 import cPickle
 import surveys.ps1.calib as cal
+import lsd.tui
 
 def get_zp(mjd):
 	self = get_zp
@@ -27,7 +28,7 @@ def get_zp(mjd):
 	idx = np.searchsorted(zps.mjd, mjd)
 	idx[idx == len(zps)] = 0
 	found = zps.mjd[idx] == mjd
-	print "Found:", sum(found)
+#	print "Found:", sum(found)
 
 	# Join the ZPs
 	zp = np.zeros(len(idx), dtype='f4')
@@ -38,7 +39,7 @@ def get_zp(mjd):
 	bad |= zps.time_to_bad[idx] < 30. / (24*60)
 	zp[bad] = np.nan
 
-	print "OK/Not OK:", sum(~bad), sum(bad)
+#	print "OK/Not OK:", sum(~bad), sum(bad)
 
 	return zp
 
@@ -176,15 +177,17 @@ def calc_objmag(qresult, qwriter):
 
 
 db = lsd.DB("pdb")
-bounds = [ (lsd.bounds.rectangle(240, 0, 250, 10), lsd.bounds.intervalset((-np.inf, np.inf))) ]
+#bounds = [ (lsd.bounds.rectangle(240, 0, 250, 10), lsd.bounds.intervalset((-np.inf, np.inf))) ]
 bounds = None
 #q = db.query("SELECT _ID, cal_psf_mag as mag, filterid FROM ps1_obj, ps1_det where (obj_id==6496442462481940483) & (filterid=='g.0000')")
 #q = db.query("SELECT _ID, cal_psf_mag as mag, filterid FROM ps1_obj, ps1_det where (obj_id==6496442462481940483) | (obj_id==6496442462481940484)")
 
 #q = db.query("SELECT _ID, cal_psf_mag as mag, cal_psf_mag_sig as err, filterid, flags FROM ps1_obj, ps1_det")
 #writer = IntoWriter(db, "cal_mags WHERE obj_id |= obj_id")
-q = db.query("SELECT _ID, ap_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
-writer = IntoWriter(db, "recalib_mags_ap WHERE obj_id |= obj_id")
+#q = db.query("SELECT _ID, psf_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
+#writer = IntoWriter(db, "recalib_mags_ap WHERE obj_id |= obj_id")
+q = db.query("SELECT _ID, psf_inst_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
+writer = IntoWriter(db, "recalib_mags WHERE obj_id |= obj_id")
 
 #q = db.query("select _ID, cal_psf_mag, filterid, u, g, r, i, z from ps1_obj, ps1_det, sdss where _ROWNUM==1")
 nrows = 0

@@ -73,13 +73,25 @@ def parse(query):
 						# ... (inner/outer)
 						# ... AS asname
 						# ... (inner/outer) AS asname
-						join_type = 'inner'					# default JOIN type
+						join_args = dict()
 						astable = table
 						for _ in xrange(2):
 							(_, token, _, _, _) = next(g)
 							if token == '(':
-								(_, join_type, _, _, _) = next(g)	# inner/outer
-								(_, token, _, _, _) = next(g)		# )
+								#(_, join_args, _, _, _) = next(g)	# inner/outer
+								#(_, token, _, _, _) = next(g)		# )
+								while token != ')':
+									key = next(g)[1].lower()	# key=value or key or )
+									token = next(g)[1].lower()
+									if token == '=':
+										val = next(g)[1]
+										token = next(g)[1]
+									else:
+										val = None
+										assert token in [',', ')']
+									join_args[key] = val
+								if 'inner' in join_args and 'outer' in join_args:
+									raise Exception('Cannot simultaneously have both "inner" and "outer" as join type')
 							elif token.lower() == 'as':			# table rename
 								(_, astable, _, _, _) = next(g)
 								(_, token, _, _, _) = next(g)		# next token
@@ -87,7 +99,7 @@ def parse(query):
 							elif token.lower() in ['', ',', 'where', 'into']:
 								break
 
-						from_clause += [ (astable, table, join_type) ]
+						from_clause += [ (astable, table, join_args) ]
 
 					# WHERE clause (optional)
 					if token.lower() == 'where':

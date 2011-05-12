@@ -183,6 +183,7 @@ xm_table_def = \
 				('m1',			'u8', '', 'ID in table one'),
 				('m2',			'u8', '', 'ID in table two'),
 				('dist',		'f4', '', 'Distance (in degrees)'),
+				('nr',			'u1', '', 'Neighbor rank (0 == first neighbor, 1 == second neighbor, ...)'),
 				# Not strictly necessary, but useful for creation of neighbor cache (needed for joins agains M2 table)
 				# TODO: split this off into a separate column group
 				('ra',			'f8', '', 'Position from table two'),
@@ -195,7 +196,8 @@ xm_table_def = \
 	'aliases': {
 		'_M1': 'm1',
 		'_M2': 'm2',
-		'_DIST': 'dist'
+		'_DIST': 'dist',
+		'_NR': 'nr'
 	}
 }
 

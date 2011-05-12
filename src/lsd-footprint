@@ -5,7 +5,7 @@ import os.path
 import numpy as np
 import getopt
 import lsd
-from lsd.bounds import rectangle
+from lsd.bounds import rectangle, make_canonical
 from lsd.utils import make_printf_string, as_tuple
 import pyfits
 from lsd.tui import *
@@ -16,16 +16,18 @@ def usage():
 if __name__ == "__main__":
 	optlist, (dbdir,), (table, output) = tui_getopt('b:r:q:', ['bounds=', 'resolution=', 'query='], 2, usage)
 
-	bounds = None
+	bounds = []
 	query = '_LON, _LAT FROM "%s"' % table
 	dx = 2.
 	for o, a in optlist:
 		if o in ('-b', '--bounds'):
-			foot = eval(a)
+			bounds.extend(eval('[' + a + ']'))
 		if o in ('-r', '--resolution'):
 			dx = float(a)
 		if o in ('-q', '--query'):
 			query = a
+
+	bounds = make_canonical(bounds)
 
 	#
 	# Compute and store the sky coverage at a given resolution (see lsd/tasks.py on how this is implemented)
