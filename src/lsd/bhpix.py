@@ -271,27 +271,7 @@ def map_to_valid_pixels(x, y, dx, assume_adjacent=True):
 	# Map into a pixel within range
 	ax = fabs(x)
 	ay = fabs(y)
-	if ax > 1 or ay > 1:
-		# Fallen off the rectangle
-		if y > 1.:
-			if x > 1:
-				pix = (-(x-dx), -(y-dx))
-			elif x < -1:
-				pix = (-(x+dx), -(y-dx))
-			else:
-				pix = (-x, y-dx)
-		elif y < -1.:
-			if x > 1:
-				pix = (-(x-dx), -(y+dx))
-			elif x < -1:
-				pix = (-(x+dx), -(y+dx))
-			else:
-				pix = (-x, y+dx)
-		elif x > 1:
-			pix = (x-dx, -y)
-		else:
-			pix = (x+dx, -y)
-	elif fabs(ax - ay) > 0.5:
+	if fabs(ax - ay) > 0.5:
 		if ax - 0.5 > ay:
 			# left and right triangles
 			if   x > 0 and y > 0:
@@ -312,6 +292,26 @@ def map_to_valid_pixels(x, y, dx, assume_adjacent=True):
 				pix = (0.5 + y, -0.5 - x)
 			elif y < 0 and x < 0:
 				pix = (-0.5 - y, -0.5 + x)
+	elif ax > 1 or ay > 1:
+		# Fallen off the rectangle
+		if y > 1.:
+			if x > 1:
+				pix = (-(x-dx), -(y-dx))
+			elif x < -1:
+				pix = (-(x+dx), -(y-dx))
+			else:
+				pix = (-x, y-dx)
+		elif y < -1.:
+			if x > 1:
+				pix = (-(x-dx), -(y+dx))
+			elif x < -1:
+				pix = (-(x+dx), -(y+dx))
+			else:
+				pix = (-x, y+dx)
+		elif x > 1:
+			pix = (x-dx, -y)
+		else:
+			pix = (x+dx, -y)
 	else:
 		# OK.
 		pix = (x, y)
@@ -330,7 +330,7 @@ def map_to_valid_pixels(x, y, dx, assume_adjacent=True):
 
 	for (cx, cy) in ret:
 		if fabs(fabs(cx) - fabs(cy)) > 0.5 or fabs(cx) >= 1 or fabs(cy) >= 1:
-			raise Exception("map_to_valid_pixels: ", x, y, " mapped to illegal value: ", cx, cy)
+			raise Exception("map_to_valid_pixels: ", x, y, " mapped to illegal value: ", cx, cy, "dx=", dx, "(x,y)/dx=", x/dx, y/dx)
 
 	return ret
 
