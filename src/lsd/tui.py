@@ -95,7 +95,7 @@ formatters:
 handlers:
   console:
     class: logging.StreamHandler
-    level: WARNING
+    level: ERROR
     formatter: simple
     stream: ext://sys.stderr
   file:
@@ -106,6 +106,10 @@ handlers:
 
 loggers:
   lsd:
+    level: DEBUG
+    handlers: [console]
+    propagate: 0
+  surveys:
     level: DEBUG
     handlers: [console]
     propagate: 0
