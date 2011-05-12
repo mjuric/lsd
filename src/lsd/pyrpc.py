@@ -244,9 +244,20 @@ class PyRPCProxy(object):
 		self._stop_heartbeat()
 
 		with self._lock:
-			if self._rfile is not None: self._rfile.close()
-			if self._wfile is not None: self._wfile.close()
-			if self._sock  is not None: self._sock.close()
+			try:
+				if self._rfile is not None: self._rfile.close()
+			except:
+				pass
+
+			try:
+				if self._wfile is not None: self._wfile.close()
+			except:
+				pass
+
+			try:
+				if self._sock  is not None: self._sock.close()
+			except:
+				pass
 
 			self._rfile = self._wfile = self._sock = None
 
@@ -265,7 +276,8 @@ class PyRPCProxy(object):
 					self._hbeat = threading.Timer(i, self._heartbeat)
 					self._hbeat.daemon = True
 					self._hbeat.start()
-		except:
+		except Exception as e:
+			print e
 			pass
 
 	def _stop_heartbeat(self):
