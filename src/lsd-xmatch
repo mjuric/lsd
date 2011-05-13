@@ -10,21 +10,24 @@ from   lsd.utils import *
 from   lsd.tui   import *
 
 def usage():
-	print "Usage: %s --db=dbdir --radius=[1arcsec] <from_table> <to_table>" % sys.argv[0]
+	print "Usage: %s --db=dbdir --radius=[1arcsec] --neighbors=[1] <from_table> <to_table>" % sys.argv[0]
 
-optlist, (dbdir,), (from_tabname, to_tabname) = tui_getopt('hr:', ['help', 'radius='], 2, usage)
+optlist, (dbdir,), (from_tabname, to_tabname) = tui_getopt('hr:n:', ['help', 'radius=', 'neighbors='], 2, usage)
 
 radius = 1.
+neighbors = 1
 for (o, a) in optlist:
 	if o == '-h' or o == '--help':
 		usage()
 		exit()
 	if o == '-r' or o == '--radius':
 		radius = float(a)
+	if o == '-n' or o == '--neighbors':
+		neighbors = int(a)
 
 #
 # Actual work
 #
 
 db = lsd.DB(dbdir)
-lsd.xmatch(db, from_tabname, to_tabname, radius/3600.)
+lsd.xmatch(db, from_tabname, to_tabname, radius/3600., neighbors)

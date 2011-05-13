@@ -378,28 +378,26 @@ class IndirectJoin(JoinRelation):
 		   or not table2.tablet_exists(cell_id_to):
 			return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64)
 
-		m1 = tcache.load_column(cell_id_from, column_from, table1)
-		m2 = tcache.load_column(cell_id_to  , column_to  , table2)
-		assert len(m1) == len(m2)
+		cg = ColGroup()
+		cg.m1 = tcache.load_column(cell_id_from, column_from, table1)
+		cg.m2 = tcache.load_column(cell_id_to  , column_to  , table2)
+		assert len(cg.m1) == len(cg.m2)
 
-		# Cut on number of neighbors and distance, if given
-#		try:
-#			nr = tcache.load_column(cell_id_from, '_NR', table1)
-#			assert len(nr) == len(m1)
-#			m1 = m1[nr < self.n]
-#			m2 = m2[nr < self.n]
-#		except KeyError:
-#			if self.n != 1:
-#				raise	# Propagate the exception if n != 1 and we have no _NR column
-#			pass
+		# Fetch columns on which we might filter
+		try:
+			cg.nr = tcache.load_column(cell_id_from, '_NR', table1)
+		except KeyError:
+			if self.n != 1:
+				raise	# Propagate the exception if n != 1 and we have no _NR column
+			pass
+		if self.d > 0:
+			cg.dist = tcache.load_column(cell_id_from, '_DIST', table1)
 
-		if self.d is not None:
-			dist = tcache.load_column(cell_id_from, '_DIST', table1)
-			assert len(dist) == len(m1)
-			m1 = m1[nr < self.n]
-			m2 = m2[nr < self.n]
+		# Apply cuts
+		if getattr(cg, 'nr', None) is not None:    cg.cut(cg.nr < self.n)
+		if getattr(cg, 'dist', None) is not None:  cg.cut(cg.dist < self.d)
 
-		return m1, m2
+		return cg.m1, cg.m2
 
 	def join(self, cell_id, id1, id2, idx1, idx2, tcache):
 		"""
@@ -416,8 +414,8 @@ class IndirectJoin(JoinRelation):
 		m2_tabname, m2_colname = joindef['m2']
 
 		# Number of neighbors, max distance (these are usually given as FROM clause args)
-		self.n = joindef.get('n', 1)
-		self.d = joindef.get('d', None)
+		self.n = int(joindef.get('nmax', 1))
+		self.d = float(joindef.get('dmax', 0)) / 3600. # fetch and convert to degrees
 
 		self.m1_colspec = (db.table(m1_tabname), m1_colname)
 		self.m2_colspec = (db.table(m2_tabname), m2_colname)

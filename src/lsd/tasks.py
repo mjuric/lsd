@@ -100,7 +100,7 @@ def compute_counts(db, table, include_cached=False):
 ###################################################################
 ## Cross-match two tables
 
-def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm):
+def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm, n_neighbors):
 	"""
 	    Mapper:
 	    	- given all objects in a cell, make an ANN tree
@@ -116,7 +116,7 @@ def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm):
 	for rows in qresult:
 		cell_id  = rows.info.cell_id
 
-		join = ColGroup()
+		join = ColGroup(dtype=[('_M1', 'u8'), ('_M2', 'u8'), ('_DIST', 'f4'), ('_NR', 'u1'), ('_LON', 'f8'), ('_LAT', 'f8')])
 
 		(id1, ra1, dec1) = rows.as_columns()
 		(id2, ra2, dec2) = db.query('_ID, _LON, _LAT FROM %s' % tabname_to).fetch_cell(cell_id, include_cached=True).as_columns()
@@ -133,16 +133,19 @@ def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm):
 			# Construct kD-tree to find an object in table_to that is nearest
 			# to an object in table_from, for every object in table_from
 			tree = kdtree(xy2)
-			match_idx, match_d2 = tree.knn(xy1, 1)
+			match_idxs, match_d2 = tree.knn(xy1, min(n_neighbors, len(xy2)))
 			del tree
-			match_idx = match_idx[:,0]		# Consider first neighbor only
 
 			# Create the index table array
-			join['_M1']   = id1
-			join['_M2']   = id2[match_idx]
-			join['_DIST'] = gc_dist(ra1, dec1, ra2[match_idx], dec2[match_idx])
-			join['_LON']  = ra2[match_idx]
-			join['_LAT']  = dec2[match_idx]
+			join.resize(match_idxs.size)
+			for k in xrange(match_idxs.shape[1]):
+				match_idx = match_idxs[:,k]
+				join['_M1'][k::match_idxs.shape[1]]   = id1
+				join['_M2'][k::match_idxs.shape[1]]   = id2[match_idx]
+				join['_DIST'][k::match_idxs.shape[1]] = gc_dist(ra1, dec1, ra2[match_idx], dec2[match_idx])
+				join['_LON'][k::match_idxs.shape[1]]  = ra2[match_idx]
+				join['_LAT'][k::match_idxs.shape[1]]  = dec2[match_idx]
+				join['_NR'][k::match_idxs.shape[1]]   = k
 
 			# Remove matches beyond the xmatch radius
 			join = join[join['_DIST'] < radius]
@@ -201,7 +204,7 @@ xm_table_def = \
 	}
 }
 
-def xmatch(db, tabname_from, tabname_to, radius=1./3600.):
+def xmatch(db, tabname_from, tabname_to, radius, neighbors):
 	""" Cross-match objects from tabname_to with tabname_from table and
 	    store the result into a cross-match table in tabname_from.
 
@@ -209,6 +212,7 @@ def xmatch(db, tabname_from, tabname_to, radius=1./3600.):
 	    	xmatch(db, ps1_obj, sdss_obj)
 
 	   Note:
+	   	- The maximum radius is in _degrees_ (!!)
 	        - No attempt is being made to force the xmatch result to be a
 	          one-to-one map. In particular, more than one object from tabname_from
 	          may be mapped to a same object in tabname_to
@@ -243,7 +247,7 @@ def xmatch(db, tabname_from, tabname_to, radius=1./3600.):
 
 	ntot = 0
 	for (nfrom, nto, nmatch) in db.query("_ID, _LON, _LAT from '%s'" % tabname_from).execute(
-					[ (_xmatch_mapper, tabname_to, radius, tabname_xm) ],
+					[ (_xmatch_mapper, tabname_to, radius, tabname_xm, neighbors) ],
 					progress_callback=pool2.progress_pass):
 		ntot += nmatch
 		if nfrom != 0 and nto != 0:
