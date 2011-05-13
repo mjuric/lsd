@@ -3,6 +3,10 @@
 import StringIO
 import tokenize
 
+def check_key_validity(key):
+	if key not in ['nmax', 'dmax', 'inner', 'outer']:
+		raise Exception("Unknown keyword '%s' in FROM clause" % key)
+
 def parse(query):
 	""" 
 	    Parse query of the form:
@@ -82,6 +86,9 @@ def parse(query):
 								#(_, token, _, _, _) = next(g)		# )
 								while token != ')':
 									key = next(g)[1].lower()	# key=value or key or )
+									if key == ')':
+										break
+									check_key_validity(key)
 									token = next(g)[1].lower()
 									if token == '=':
 										val = next(g)[1]

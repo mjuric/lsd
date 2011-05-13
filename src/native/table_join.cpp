@@ -8,30 +8,32 @@
 
 struct Output
 {
-	int64_t *idx1, *idx2;
+	int64_t *idx1, *idx2, *idxLink;
 	bool *isnull;
 	int64_t size, reserved;
-	
-	Output() : size(0), reserved(0), idx1(NULL), idx2(NULL), isnull(NULL) {}
-	
-	void push_back(int64_t i1, int64_t i2, int64_t in)
+
+	Output() : size(0), reserved(0), idx1(NULL), idx2(NULL), idxLink(NULL), isnull(NULL) {}
+
+	void push_back(int64_t i1, int64_t i2, int64_t in, int64_t iLink)
 	{
 		if(size+1 >= reserved)
 		{
 			reserved = 2*std::max(size, int64_t(1));
 			idx1   = (int64_t *)realloc(idx1,   sizeof(*idx1)*reserved);
 			idx2   = (int64_t *)realloc(idx2,   sizeof(*idx2)*reserved);
+			idxLink= (int64_t *)realloc(idxLink,sizeof(*idxLink)*reserved);
 			isnull =    (bool *)realloc(isnull, sizeof(*isnull)*reserved);
 		}
 		idx1[size] = i1;
 		idx2[size] = i2;
+		idxLink[size] = iLink;
 		isnull[size] = in;
 		size++;
 	}
 
 	~Output()
 	{
-		free(idx1); free(idx2); free(isnull);
+		free(idx1); free(idx2); free(idxLink); free(isnull);
 	}
 };
 

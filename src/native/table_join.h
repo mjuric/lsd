@@ -4,9 +4,12 @@
 #include <iostream>
 #include <string>
 #include <tr1/unordered_map>
+#include <tr1/tuple>
 
 #define MULTIMAP std::tr1::unordered_multimap
 //#define MULTIMAP std::map
+
+using std::tr1::get;
 
 struct tcomp
 {
@@ -356,11 +359,11 @@ template<typename Output>
 		bool sorted;
 
 		// sort (m1, m2)
-		std::vector<std::pair<uint64_t, uint64_t> > m(nm);
+		std::vector<std::tr1::tuple<uint64_t, uint64_t, uint64_t> > m(nm);
 		sorted = true;
 		for(size_t i = 0; i != nm; i++)
 		{
-			m[i] = std::make_pair(m1[i], m2[i]);
+			m[i] = std::tr1::make_tuple(m1[i], m2[i], i);
 			if(i) { sorted &= m1[i] >= m1[i-1]; }
 		}
 		if(!sorted)
@@ -396,17 +399,17 @@ template<typename Output>
 			size_t idx = i1[i].second;
 
 			// find the corresponding m1 block
-			std::pair<uint64_t, uint64_t> mm;
-			while(at < m.size() && (mm = m[at]).first < id) at++;
+			std::tr1::tuple<uint64_t, uint64_t, uint64_t> mm;
+			while(at < m.size() && get<0>(mm = m[at]) < id) at++;
 
 			// resolve all id->* links
 			at0 = o.size;
-			if(mm.first != id)
+			if(get<0>(mm) != id)
 			{
 				if(join == OUTER)
 				{
 					// register a NULL if this is an outer JOIN
-					o.push_back(idx, 0, true);
+					o.push_back(idx, 0, true, 0);
 				}
 			}
 			else
@@ -415,14 +418,14 @@ template<typename Output>
 				do
 				{
 					// find the block into which we map
-					std::pair<typeof(i2.begin()), typeof(i2.begin())> r = std::equal_range(i2.begin(), i2.end(), mm.second, tcomp());
+					std::pair<typeof(i2.begin()), typeof(i2.begin())> r = std::equal_range(i2.begin(), i2.end(), get<1>(mm), tcomp());
 					if(r.first == r.second)
 					{
 						if(join == OUTER)
 						{
-							// Aangling link (where m2 is not found in id2)
+							// Dangling link (where m2 is not found in id2)
 							// register a NULL if this is an outer JOIN
-							o.push_back(idx, 0, true);
+							o.push_back(idx, 0, true, 0);
 						}
 					}
 					else
@@ -430,12 +433,12 @@ template<typename Output>
 						for(typeof(i2.begin()) ii = r.first; ii != r.second; ii++)
 						{
 							// store the result
-							o.push_back(idx, ii->second, false);
+							o.push_back(idx, ii->second, false, get<2>(mm));
 						}
 					}
 
 					mm = m[++at];
-				} while(mm.first == id);
+				} while(get<0>(mm) == id);
 			}
 			at1 = o.size;
 
@@ -446,7 +449,7 @@ template<typename Output>
 				// duplicate the block
 				for(size_t j = at0; j != at1; j++)
 				{
-					o.push_back(idx, o.idx2[j], o.isnull[j]);
+					o.push_back(idx, o.idx2[j], o.isnull[j], o.idxLink[j]);
 				}
 			}
 		}

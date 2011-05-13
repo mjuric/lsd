@@ -26,18 +26,19 @@ struct E
 struct PyOutput
 {
 	/* Aux class for table_join that stores the output directly into NumPy arrays */
-	npy_int64 *idx1, *idx2;
+	npy_int64 *idx1, *idx2, *idxLink;
 	npy_bool *isnull;
 	int64_t size, reserved;
 
-	PyArrayObject *o_idx1, *o_idx2, *o_isnull;
+	PyArrayObject *o_idx1, *o_idx2, *o_idxLink, *o_isnull;
 
-	PyOutput() : size(0), reserved(0), o_idx1(NULL), o_idx2(NULL), o_isnull(NULL)
+	PyOutput() : size(0), reserved(0), o_idx1(NULL), o_idx2(NULL), o_idxLink(NULL), o_isnull(NULL)
 	{
 		npy_intp dims = reserved;
 
 		o_idx1   = (PyArrayObject *)PyArray_SimpleNew(1, &dims, PyArray_INT64);
 		o_idx2   = (PyArrayObject *)PyArray_SimpleNew(1, &dims, PyArray_INT64);
+		o_idxLink= (PyArrayObject *)PyArray_SimpleNew(1, &dims, PyArray_INT64);
 		o_isnull = (PyArrayObject *)PyArray_SimpleNew(1, &dims, PyArray_BOOL);
 	}
 
@@ -49,16 +50,18 @@ struct PyOutput
 
 		if(PyArray_Resize(o_idx1,   &shape, false, NPY_CORDER) == NULL) throw E();
 		if(PyArray_Resize(o_idx2,   &shape, false, NPY_CORDER) == NULL) throw E();
+		if(PyArray_Resize(o_idxLink,&shape, false, NPY_CORDER) == NULL) throw E();
 		if(PyArray_Resize(o_isnull, &shape, false, NPY_CORDER) == NULL) throw E();
 
 		idx1   = (npy_int64 *)o_idx1->data;
 		idx2   = (npy_int64 *)o_idx2->data;
+		idxLink= (npy_int64 *)o_idxLink->data;
 		isnull = (npy_bool  *)o_isnull->data;
 		
 		reserved = dims;
 	}
 
-	void push_back(int64_t i1, int64_t i2, bool in)
+	void push_back(int64_t i1, int64_t i2, bool in, int64_t iLink)
 	{
 		if(size >= reserved)
 		{
@@ -66,6 +69,7 @@ struct PyOutput
 		}
 		idx1[size] = i1;
 		idx2[size] = i2;
+		idxLink[size] = iLink;
 		isnull[size] = in;
 		size++;
 	}
@@ -74,13 +78,14 @@ struct PyOutput
 	{
 		Py_XDECREF(o_idx1);
 		Py_XDECREF(o_idx2);
+		Py_XDECREF(o_idxLink);
 		Py_XDECREF(o_isnull);
 	}
 };
 
-// Python interface: (idx1, idx2, isnull) = table_join(idx1, idx2, m1, m2, join_type)
+// Python interface: (idx1, idx2, idxLink, isnull) = table_join(idx1, idx2, m1, m2, join_type)
 #define DOCSTR_TABLE_JOIN \
-"idx1, idx2, isnull = table_join(id1, id2, m1, m2)\n\
+"idx1, idx2, idxLink, isnull = table_join(id1, id2, m1, m2)\n\
 \n\
 Join columns id1 and id2, using linkage information\n\
 in (m1, m2).\n\
@@ -92,12 +97,18 @@ in (m1, m2).\n\
 	- m2  : Second table link key\n\
 \n\
 The output will be arrays of indices\n\
-idx1, idx2, and isnull such that:\n\
+idx1, idx2, idxLink, and isnull such that:\n\
 \n\
 	id1[idx1], id2[idx2]\n\
 \n\
 (where indexing is performed in NumPy-like vector sense)\n\
-will form the resulting JOIN-ed table.\n\
+will form the resulting JOIN-ed table, and.\n\
+\n\
+	m1[idxLink], m2[idxLink]\n\
+\n\
+will give the rows in m1,m2 that produced the rows in the\n\
+joined table, with entries corresponding to each row in the\n\
+joined table.\n\
 \n\
 If join_type=='inner', the result is roughly equivalent\n\
 to the result of the following SQL fragment:\n\
@@ -141,14 +152,16 @@ static PyObject *Py_table_join(PyObject *self, PyObject *args)
 		#undef DATAPTR
 		o.resize(o.size);
 
-		ret = PyTuple_New(3);
+		ret = PyTuple_New(4);
 		// because PyTuple will take ownership (and PyOutput will do a DECREF on destruction).
 		Py_INCREF(o.o_idx1);
 		Py_INCREF(o.o_idx2);
+		Py_INCREF(o.o_idxLink);
 		Py_INCREF(o.o_isnull);
 		PyTuple_SetItem(ret, 0, (PyObject *)o.o_idx1);
 		PyTuple_SetItem(ret, 1, (PyObject *)o.o_idx2);
-		PyTuple_SetItem(ret, 2, (PyObject *)o.o_isnull);
+		PyTuple_SetItem(ret, 2, (PyObject *)o.o_idxLink);
+		PyTuple_SetItem(ret, 3, (PyObject *)o.o_isnull);
 	}
 	catch(const E& e)
 	{
