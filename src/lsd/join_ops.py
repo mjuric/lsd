@@ -392,11 +392,14 @@ class IndirectJoin(JoinRelation):
 		cell_id_from = table1.static_if_no_temporal(cell_id)
 		cell_id_to   = table2.static_if_no_temporal(cell_id)
 
+		cg = ColGroup()
+
 		if    not table1.tablet_exists(cell_id_from) \
 		   or not table2.tablet_exists(cell_id_to):
-			return np.empty(0, dtype=np.uint64), np.empty(0, dtype=np.uint64)
+		   	cg.m1 = np.empty(0, dtype=np.uint64)
+		   	cg.m2 = np.empty(0, dtype=np.uint64)
+		   	return cg
 
-		cg = ColGroup()
 		cg.m1 = tcache.load_column(cell_id_from, column_from, table1)
 		cg.m2 = tcache.load_column(cell_id_to  , column_to  , table2)
 		assert len(cg.m1) == len(cg.m2)
