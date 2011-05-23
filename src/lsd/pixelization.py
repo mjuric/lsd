@@ -8,6 +8,12 @@ import bounds as bn
 import glob, os
 from collections import defaultdict
 
+u1 = np.uint64(1)
+u2 = np.uint64(2)
+u32 = np.uint64(32)
+u0xFFFFFFFF00000000 = np.uint64(0xFFFFFFFF00000000)
+u0xFFFFFFFF = np.uint64(0x00000000FFFFFFFF)
+
 class Pixelization(object):
 	""" Pixelization class - manages the generation and interpretation
 	    of object and cell IDs, as well as the directory structure
@@ -23,8 +29,16 @@ class Pixelization(object):
 
 	# Number of bits reserved for position and time coordinate
 	# in a 32-bit cell identifier
-	xybits = 10
-	tbits  = 32 - 2*xybits
+	xybits = np.uint64(10)
+	tbits  = u32 - u2*xybits
+
+	# Backwards compatibility for instances pickled before we switched the member
+	# variables to uint64 (most notably in TableTreeCache instances).
+	# To be removed once those have disappeared.
+	def __setstate__(self, state):
+	        self.__dict__ = state
+	        for key in ['id2cell_mask', 'mask_x32', 'mask_t32', 'mask_y32', 't2static_mask', 'tmask']:
+	                self.__dict__[key] = np.uint64(self.__dict__[key])
 
 	### Low-level functions that care about the bits in IDs
 
@@ -34,11 +48,11 @@ class Pixelization(object):
 		self.dt = dt
 
 		# Compute object_id -> cell_id mask (used by cell_for_id())
-		xymask = 2**(self.xybits - self.level)-1	# 0b111
+		xymask = (u1<<(self.xybits - np.uint64(self.level)))-u1	# 0b111
 		mask = (~(
 					xymask << (self.xybits+self.tbits) | 
 					xymask << (self.tbits)
-				) << 32) | 0xFFFFFFFF
+				) << u32) | u0xFFFFFFFF
 		self.id2cell_mask = mask
 #		print bin(xymask)
 #		print mask
@@ -47,13 +61,13 @@ class Pixelization(object):
 #		exit()
 
 		# Temporal cell -> static cell_id mask (used by static_cell_for_cell())
-		mask = (2**self.tbits-1)<< 32
+		mask = ((u1<<self.tbits)-u1)<< u32
 		self.tmask = mask
 		self.t2static_mask = ~mask			# Zeros out the temporal bits when &-ed
 
-		self.mask_x32 = (2**self.xybits-1) << (self.xybits + self.tbits)
-		self.mask_y32 = (2**self.xybits-1) << (self.tbits)
-		self.mask_t32 = (2**self.tbits-1)
+		self.mask_x32 = ((u1<<self.xybits)-u1) << (self.xybits + self.tbits)
+		self.mask_y32 = ((u1<<self.xybits)-u1) << (self.tbits)
+		self.mask_t32 = ((u1<<self.tbits)-u1)
 
 #		cell_id = self._cell_id_for_xyt(-0.328125, +0.234375, 55249)
 #		(x, y, t) = self._xyt_from_cell_id(cell_id)
@@ -83,11 +97,11 @@ class Pixelization(object):
 		iy   = iy.astype(np.uint64)
 		id   = ix << (self.tbits + self.xybits)
 		id  |= iy << (self.tbits)
-		id  |= ct & (2**self.tbits - 1)
-		id <<= 32
-		id  |= i & 0xFFFFFFFF
+		id  |= ct & ((u1<<self.tbits) - u1)
+		id <<= u32
+		id  |= np.uint64(i) & u0xFFFFFFFF
 
-		if np.any(i == 0xFFFFFFFF):
+		if np.any(i == u0xFFFFFFFF):
 			# If we're computing cell IDs, make sure to wipe out the
 			# sub-pixel bits for the given level (otherwise we'd get
 			# multiple cell_ids for the same cell, depending on where
@@ -96,9 +110,9 @@ class Pixelization(object):
 
 		# TODO: Transformation verification, remove when debugged
 		if False:
-			if np.any(i == 0xFFFFFFFF):
+			if np.any(i == u0xFFFFFFFF):
 				ux, uy, ut = self._xyt_from_cell_id(id)
-				ui = 0xFFFFFFFF
+				ui = u0xFFFFFFFF
 				(cx, cy) = bhpix.xy_center(x, y, self.level)
 			else:
 				ux, uy, ut, ui = self._xyti_from_id(id)
@@ -117,9 +131,9 @@ class Pixelization(object):
 		# x, y to our pixelization level.
 
 		id = np.array(id, np.uint64)
-		ci = id & 0xFFFFFFFF
+		ci = id & u0xFFFFFFFF
 
-		id >>= 32
+		id >>= u32
 		ix = (id & self.mask_x32) >> (self.xybits + self.tbits)
 		iy = (id & self.mask_y32) >> (self.tbits)
 		it = (id & self.mask_t32)
@@ -129,7 +143,7 @@ class Pixelization(object):
 		ct = np.array(it, float) * self.dt + self.t0
 
 		# Special handling for cell IDs
-		cellids = ci == 0xFFFFFFFF
+		cellids = ci == u0xFFFFFFFF
 		if np.any(cellids):
 			assert np.all(cellids)
 			(cx, cy) = bhpix.xy_center(cx, cy, self.level)
@@ -141,11 +155,11 @@ class Pixelization(object):
 		return self._xyti_from_id(cell_id)[:3]
 
 	def _cell_id_for_xyt(self, x, y, t=None):
-		return self._id_from_xyti(x, y, t, 0xFFFFFFFF)
+		return self._id_from_xyti(x, y, t, u0xFFFFFFFF)
 
 	def cell_for_id(self, id):
 		""" Return a cell id corresponding to a given object ID """
-		cell_id    = (id & np.uint64(self.id2cell_mask)) | 0xFFFFFFFF
+		cell_id    = (id & self.id2cell_mask) | u0xFFFFFFFF
 		assert np.all(self.is_cell_id(cell_id))
 
 		# TODO: Debugging (remove when happy)
@@ -159,12 +173,12 @@ class Pixelization(object):
 		# Returns an ID given a valid cell_id and the 32-bit
 		# object ID part
 		assert np.all(self.is_cell_id(cell_id))		# Must be cell_id
-		assert not np.any(i & 0xFFFFFFFF00000000)	# Must be 32bit
-		return (cell_id & 0xFFFFFFFF00000000) | i
+		assert not np.any(i & u0xFFFFFFFF00000000)	# Must be 32bit
+		return (cell_id & u0xFFFFFFFF00000000) | i
 
 	def is_cell_id(self, id):
 		# Return True if id is a cell_id
-		return id | 0x00000000FFFFFFFF == id
+		return id | u0xFFFFFFFF == id
 
 	def static_cell_for_cell(self, cell_id):
 		""" Return a static-sky cell corresponding to a given cell_id """
@@ -229,7 +243,7 @@ class Pixelization(object):
 			for a given cell.
 		"""
 		x, y, t, _ = self._xyti_from_id(cell_id)
-		assert _ == 0xFFFFFFFF
+		assert _ == u0xFFFFFFFF
 
 		bounds = self._cell_bounds_xy(x, y)
 		return (bounds, intervalset((t, t+self.dt)))
