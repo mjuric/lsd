@@ -187,7 +187,7 @@ class TableEntry:
 		else:
 			return cells, self.relation.join_op()
 
-	def evaluate_join(self, cell_id, bounds, tcache, r = None, key = None, idxkey = None):
+	def evaluate_join(self, cell_id, bounds, tcache, r = None, idxkey = None, rtable = None):
 		""" Constructs a JOIN index array.
 
 			* If the result of the join is no rows, return None
@@ -221,9 +221,8 @@ class TableEntry:
 		# Load ourselves
 		id = tcache.load_column(cell_id, self.table.get_primary_key(), self.table)
 		s = ColGroup()
-		mykey = '%s._ID' % self.name
 
-		s.add_column(mykey, id)				# The key on which we'll do the joins
+		s.add_column('%s._ID' % self.name, id)		# The primary key of the left table
 		s.add_column(self.name, np.arange(len(id)))	# The index into rows of this tablet, as loaded from disk
 
 		if self.relation is None:
@@ -239,7 +238,7 @@ class TableEntry:
 				r = self.filter_space(r, lon, lat, bounds)	# Note: this will add the _INBOUNDS column to r
 		else:
 			# We're a child. Join with the parent table
-			idx1, idx2, m = self.relation.join(cell_id, r[key], s[mykey], r[idxkey], s[self.name], tcache)
+			idx1, idx2, m = self.relation.join(cell_id, r[idxkey], s[self.name], tcache)
 
 			# Handle the special case of OUTER JOINed empty 's'
 			if len(s) == 0 and len(idx2) != 0:
@@ -269,7 +268,7 @@ class TableEntry:
 
 		# Let children JOIN themselves onto us
 		for ce in self.joins:
-			r = ce.evaluate_join(cell_id, bounds, tcache, r, mykey, self.name)
+			r = ce.evaluate_join(cell_id, bounds, tcache, r, self.name, self.table)
 
 		if self.relation is None:
 			# Return None if the query yielded no rows
@@ -371,7 +370,7 @@ class JoinRelation:
 	def join_op(self):	# Returns 'and' if the relation has an inner join-like effect, and 'or' otherwise
 		return 'and' if self.kind == 'inner' else 'or'
 
-	def join(self, cell_id, id1, id2, idx1, idx2, tcache):	# Returns idx1, idx2, isnull
+	def join(self, cell_id, table1, table2, idx1, idx2, tcache):	# Returns idx1, idx2, isnull
 		raise NotImplementedError('You must override this method from a derived class')
 
 class IndirectJoin(JoinRelation):
@@ -426,12 +425,16 @@ class IndirectJoin(JoinRelation):
 
 		return cg
 
-	def join(self, cell_id, id1, id2, idx1, idx2, tcache):
+	def join(self, cell_id, idx1, idx2, tcache):
 		"""
 		    Perform a JOIN on id1, id2, that were obtained by
 		    indexing their origin tables with idx1, idx2.
 		"""
 		cg = self.fetch_join_map(cell_id, self.m1_colspec, self.m2_colspec, tcache)
+
+		id1 = tcache.load_column(cell_id, self.tableR.get_primary_key(), self.tableR)[idx1]
+		id2 = tcache.load_column(cell_id, self.tableS.get_primary_key(), self.tableS)[idx2]
+		
 		(idx1, idx2, idxLink, isnull) = native.table_join(id1, id2, cg.m1, cg.m2, self.kind)
 		assert np.all(idxLink < len(cg))
 
@@ -467,6 +470,84 @@ class IndirectJoin(JoinRelation):
 			self.m2_colspec[0], self.m2_colspec[1].name,
 		)
 
+class CrossmatchJoin(JoinRelation):
+	def __init__(self, db, tableR, tableS, **joindef):
+		JoinRelation.__init__(self, db, tableR, tableS, **joindef)
+
+		# Number of neighbors, max distance (these are usually given as FROM clause args)
+		self.n = int(joindef.get('nmax', 1))
+		self.d = float(joindef.get('dmax', 1.)) / 3600. # fetch and convert to degrees
+
+	def join(self, cell_id, idx1, idx2, tcache):
+		"""
+		    Perform a JOIN on id1, id2, that were obtained by
+		    indexing their origin tables with idx1, idx2.
+		"""
+		# Cross-match, R x S
+		# Return objects (== rows) from S that are nearest neighbors of
+		# objects (== rows) in R
+		from scikits.ann import kdtree
+		from utils import gnomonic, gc_dist
+
+		join = ColGroup(dtype=[('m1', 'u8'), ('m2', 'u8'), ('_DIST', 'f4'), ('_NR', 'u1')])
+
+		# Load spatial keys from S table
+		rakey, deckey = self.tableS.get_spatial_keys()
+		ra2, dec2 = tcache.load_column(cell_id, rakey, self.tableS), tcache.load_column(cell_id, deckey, self.tableS)
+
+		if len(ra2) != 0:
+			# Get all objects in R for which neighbors in S will be
+			# looked up
+			rakey, deckey = self.tableR.get_spatial_keys()
+			uidx1 = np.unique(idx1)
+			ra1, dec1 = \
+				tcache.load_column(cell_id, rakey, self.tableR)[uidx1], \
+				tcache.load_column(cell_id, deckey, self.tableR)[uidx1]
+
+			# Project to tangent plane around the center of the cell. We
+			# assume the cell is small enough for the distortions not to
+			# matter and Euclidian distances apply
+			bounds, _    = self.tableR.pix.cell_bounds(cell_id)
+			(clon, clat) = bhpix.deproj_bhealpix(*bounds.center())
+			xy1 = np.column_stack(gnomonic(ra1, dec1, clon, clat))
+			xy2 = np.column_stack(gnomonic(ra2, dec2, clon, clat))
+
+			# Construct kD-tree to find nearest neighbors from tableS
+			# for every object in tableR
+			tree = kdtree(xy2)
+			match_idxs, match_d2 = tree.knn(xy1, min(self.n, len(xy2)))
+			del tree
+
+			# Expand the matches into a table, with one row per neighbor
+			join.resize(match_idxs.size)
+			for k in xrange(match_idxs.shape[1]):
+				match_idx = match_idxs[:,k]
+				join['m1'][k::match_idxs.shape[1]]   = uidx1
+				join['m2'][k::match_idxs.shape[1]]   = match_idx
+				join['_DIST'][k::match_idxs.shape[1]] = gc_dist(ra1, dec1, ra2[match_idx], dec2[match_idx])
+				join['_NR'][k::match_idxs.shape[1]]   = k
+
+			# Remove matches beyond the xmatch radius
+			join = join[join['_DIST'] < self.d]
+
+		# Perform the join
+		assert idx1.dtype == idx2.dtype == np.int64
+		id1, id2 = idx1.view(np.uint64), idx2.view(np.uint64) # Because native.table_join expects uint64 data
+		(idx1, idx2, idxLink, isnull) = native.table_join(id1, id2, join.m1, join.m2, self.kind)
+		assert np.all(idxLink < len(join)), (len(join), np.max(idxLink), idxLink, idx1, idx2, id1, id2)
+
+		join = join[idxLink]
+		join._ISNULL = isnull
+		del join.m1, join.m2
+
+		# Null-out the columns that are NULL
+		for colname in join.keys():
+			if colname == '_ISNULL':
+				continue
+			set_NULL(join[colname], join._ISNULL)
+
+		return (idx1, idx2, join)
+
 #class EquijoinJoin(IndirectJoin):
 #	def __init__(self, db, tableR, tableS, kind, **joindef):
 #		JoinRelation.__init__(self, db, tableR, tableS, kind, **joindef)
@@ -476,22 +557,27 @@ class IndirectJoin(JoinRelation):
 #		self.m1_colspec = tableR, joindef['id1']
 #		self.m2_colspec = tableS, joindef['id2']
 
-def create_join(db, fn, jargs, tableR, tableS):
-	if 'j' in jargs:					# Allow the join file to be overridden
-		j = jargs['j']
-		if j.find('/') == '-1':
-			fn = '%s/%s.join' % (db.path, j)	# j=myjoin
-		else:
-			fn = j					# j=bla/myjoin.join
+def create_join(db, fn, jargs, tableR, tableS, jclass=None):
+	if fn is not None:
+		if 'j' in jargs:					# Allow the join file to be overridden
+			j = jargs['j']
+			if j.find('/') == '-1':
+				fn = '%s/%s.join' % (db.path, j)	# j=myjoin
+			else:
+				fn = j					# j=bla/myjoin.join
 
-	data = json.loads(file(fn).read())
-	assert 'type' in data
+		data = json.loads(file(fn).read())
+	else:
+		data = dict()
 
 	# override the joindef with args from the FROM clause
 	data.update(jargs)
 
-	jclass = data['type'].capitalize() + 'Join'
-	return globals()[jclass](db, tableR, tableS, **data)
+	if jclass is None:
+		assert 'type' in data
+		jclass = globals()[data['type'].capitalize() + 'Join']
+
+	return jclass(db, tableR, tableS, **data)
 
 class iarray(np.ndarray):
 	"""
@@ -1655,33 +1741,45 @@ class DB(object):
 	def construct_join_tree(self, from_clause):
 		"""
 		Internal: Figure out how to join tables in a query
-		
+
 		This is an internal function; do not use it.
 		"""
 		tablist = []
 
-		# Instantiate the tables
+		# Find the tables involved in the query and instantiate them
 		for tabname, tabpath, join_args in from_clause:
-			tablist.append( ( tabname, (TableEntry(self.table(tabpath), tabname), join_args) ) )
+			tablist.append( ( tabname, (TableEntry(self.table(tabpath), tabname), join_args[0]) ) )
 		tables = dict(tablist)
 
 		# Discover and set up JOIN links based on defined JOIN relations
 		# TODO: Expand this to allow the 'joined to via' and related syntax, once it becomes available in the parser
-		for tabname, (e, _) in tablist:
-			# Check for tables that can be joined onto this one (where this one is on the right hand side of the relation)
-			# Look for default .join files named ".<tabname>:*.join"
-			pattern = "%s/.%s:*.join" % (self.path, tabname)
-			for fn in glob.iglob(pattern):
-				jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
-				if jtabname not in tables:
-					continue
+		for tabname, (e, jargs) in tablist:
+			# Check for 'matchedto' keys in join_args
+			if 'matchedto' in jargs:
+				# Test query:
+				# NWORKERS=1 ./lsd-query "select ra, dec, galex_gr5.ra, galex_gr5.dec, sdss._NR, sdss._DIST*3600 from galex_gr5, sdss(matchedto=galex_gr5,nmax=5,dmax=15)" | head -n 20
+				assert e.relation is None
+				entry, _ = tables[jargs['matchedto']]
+				e.relation = create_join(self, None, jargs, entry.table, e.table, jclass=CrossmatchJoin)
+				##e.relation = create_join(self, "/n/pan/mjuric/db/.galex_gr5:sdss.join", jargs, entry.table, e.table)
+				entry.joins.append(e)
+			else:
+				# Check for tables that can be joined onto this one (where this one is on the right hand side of the relation)
+				# Look for default .join files named ".<tabname>:*.join"
+				pattern = "%s/.%s:*.join" % (self.path, tabname)
+				for fn in glob.iglob(pattern):
+					jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
+					if jtabname not in tables:
+						continue
 
-				je, jargs = tables[jtabname]
-				if je.relation is not None:	# Already joined
-					continue
+					je, jargs = tables[jtabname]
+					if 'matchedto' in jargs:	# Explicitly joined
+						continue
+					if je.relation is not None:	# Already joined
+						continue
 
-				je.relation = create_join(self, fn, jargs, e.table, je.table)
-				e.joins.append(je)
+					je.relation = create_join(self, fn, jargs, e.table, je.table)
+					e.joins.append(je)
 	
 		# Discover the root (the one and only one table that has no links pointing to it)
 		root = None

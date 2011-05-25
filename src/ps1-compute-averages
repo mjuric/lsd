@@ -15,6 +15,8 @@ import cPickle
 import surveys.ps1.calib as cal
 import lsd.tui
 
+nominal_exptimes = { 'g.0000': 43, 'r.0000': 40, 'i.0000': 45, 'z.0000': 30, 'y.0000': 30 }
+
 def get_zp(mjd):
 	self = get_zp
 	if getattr(self, 'zps', None) is None:
@@ -34,9 +36,18 @@ def get_zp(mjd):
 	zp = np.zeros(len(idx), dtype='f4')
 	zp[:] = zps.ZP[idx]
 
+	# Correct the ZP from nominal exposures to true exposures
+	filterid = zps.filterid[idx]
+	exptime = zps.exptime[idx]
+	delta_mag = np.empty(len(exptime))
+	for fid, et in nominal_exptimes.iteritems():
+		ii = filterid == fid
+		delta_mag[ii] = -2.5 * np.log10( exptime[ii] / et )
+	zp -= delta_mag
+
 	# Remove those that are flagged bad
 	bad = ~found
-	bad |= zps.time_to_bad[idx] < 30. / (24*60)
+	bad |= (zps.time_to_bad[idx] < 10. / (24*60)) & ~zps.overlaps_sdss[idx]
 	zp[bad] = np.nan
 
 #	print "OK/Not OK:", sum(~bad), sum(bad)
@@ -177,8 +188,8 @@ def calc_objmag(qresult, qwriter):
 
 
 db = lsd.DB("pdb")
-#bounds = [ (lsd.bounds.rectangle(240, 0, 250, 10), lsd.bounds.intervalset((-np.inf, np.inf))) ]
 bounds = None
+#bounds = [ (lsd.bounds.rectangle(40, 40, 250, 80), lsd.bounds.intervalset((-np.inf, np.inf))) ]
 #q = db.query("SELECT _ID, cal_psf_mag as mag, filterid FROM ps1_obj, ps1_det where (obj_id==6496442462481940483) & (filterid=='g.0000')")
 #q = db.query("SELECT _ID, cal_psf_mag as mag, filterid FROM ps1_obj, ps1_det where (obj_id==6496442462481940483) | (obj_id==6496442462481940484)")
 
@@ -187,7 +198,7 @@ bounds = None
 #q = db.query("SELECT _ID, psf_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
 #writer = IntoWriter(db, "recalib_mags_ap WHERE obj_id |= obj_id")
 q = db.query("SELECT _ID, psf_inst_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
-writer = IntoWriter(db, "recalib_mags WHERE obj_id |= obj_id")
+writer = IntoWriter(db, "recalib_mags6 WHERE obj_id |= obj_id")
 
 #q = db.query("select _ID, cal_psf_mag, filterid, u, g, r, i, z from ps1_obj, ps1_det, sdss where _ROWNUM==1")
 nrows = 0
