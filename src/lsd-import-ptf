@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 #
-# Initial run: nice -n 10 ./lsd-import-ptf -c ptf2_det ptf2_exp >output 2>errors
-# Subsequent runs: time nice -n 10 ./lsd-import-ptf ptf2_det ptf2_exp >output 2>errors
+# Initial run: nice -n 10 ./lsd-import-ptf -c ptf_det ptf_exp >output 2>errors
+# Subsequent runs: time nice -n 10 ./lsd-import-ptf ptf_det ptf_exp >output 2>errors
 # For testing: ./lsd-import-ptf -c -f file_list.0 ptf_det ptf_exp >output1 2>errors1
 # For testing: ./lsd-import-ptf -f file_list.1 ptf_det ptf_exp >output2 2>errors2
 #
