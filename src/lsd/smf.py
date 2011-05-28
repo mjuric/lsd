@@ -671,8 +671,21 @@ def make_object_catalog(db, obj_tabname, det_tabname, radius=1./3600., create=Tr
 
 	# Fetch all non-empty cells with detections. Group them by the same spatial
 	# cell ID. This will be the list over which the first kernel will map.
-	det_cells = det_table.get_cells()
-	det_cells_grouped = det_table.pix.group_cells_by_spatial(det_cells).items()
+	if os.access(os.environ.get("LSD_DB")+'/.'+obj_tabname+'_import_MJD', os.F_OK):
+		f = open(os.environ.get("LSD_DB")+'/.'+obj_tabname+'_import_MJD', 'r')
+		MJD_of_last_import = int(f.readline().strip())
+		f.close()
+	else:
+		MJD_of_last_import = 0
+	if create:
+		det_cells = det_table.get_cells()
+#		det_cells = det_table.get_cells(bounds=[(bounds.ALLSKY, intervalset((-np.inf, 55562)))])
+	else:
+#		det_cells = det_table.get_cells(bounds=[(bounds.ALLSKY, intervalset((55563, np.inf)))])
+		det_cells = []
+		for row in db.query("_CELLID FROM '%s' WHERE mjd_import > %d" % (det_tabname, MJD_of_last_import)).iterate():
+			det_cells.append(row[0])
+		det_cells = list(set(det_cells))
 
 	t0 = time.time()
 	pool = pool2.Pool()
