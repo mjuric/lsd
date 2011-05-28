@@ -1,0 +1,89 @@
+#!/usr/bin/env python
+#
+# Initial run: nice -n 10 ./lsd-import-ptf -c ptf2_det ptf2_exp >output 2>errors
+# Subsequent runs: time nice -n 10 ./lsd-import-ptf ptf2_det ptf2_exp >output 2>errors
+# For testing: ./lsd-import-ptf -c -f file_list.0 ptf_det ptf_exp >output1 2>errors1
+# For testing: ./lsd-import-ptf -f file_list.1 ptf_det ptf_exp >output2 2>errors2
+#
+
+import sys, os
+import getopt
+import lsd
+import lsd.ptf as ptf
+from lsd.utils import *
+from lsd.tui import *
+import numpy as np
+
+def usage():
+    print "Usage: %s [-c|--create] [-f|--file] <det_table> <exp_table>" % sys.argv[0]
+
+optlist, (dbdir,), (det_tabname, exp_tabname) = tui_getopt('cf:', ['create', 'file=', ], 2, usage, argn_max=2)
+
+create = False
+filelist = 'None'
+for (o, a) in optlist:
+	if o == '-c' or o == '--create':
+		create = True
+	if o == '-f' or o == '--file':
+		filelist = str(a)
+
+#
+# Actual work
+#
+db = lsd.DB(dbdir)
+
+if filelist != 'None':
+	files = np.genfromtxt(filelist, dtype='a')
+else:
+	print "Fetching filenames..."
+	import psycopg2
+	conn = psycopg2.connect("dbname='ptf7' user='ptfbs' host='ptfsdm2'");
+	cur = conn.cursor()
+	# define SQL query
+	if create:
+		SQL = "select a.filename from ancilfiles a, procimages p, exposures e where a.pid=p.pid and p.expid=e.expid and a.anciltype=\'sexcat\' and p.ppid=5 and p.vbest > 0 and p.status > 0 and p.svid>41 and a.archivestatus = 1 order by e.expid"
+		cur.execute(SQL)
+		dat = cur.fetchall()
+		files = []
+		for row in dat:
+			files.append(row[0])
+	else:
+		SQL = "select p.pid, a.filename from ancilfiles a, procimages p, exposures e where a.pid=p.pid and p.expid=e.expid and a.anciltype=\'sexcat\' and p.ppid=5 and p.vbest > 0 and p.status > 0 and p.svid>41 and a.archivestatus = 1 order by p.pid"
+		cur.execute(SQL)
+		# find all PIDs in the IPAC database
+		dat = cur.fetchall()
+		pids_all = []
+		files_all = []
+		for row in dat:
+			pids_all.append(row[0])
+			files_all.append(row[1])
+		# PIDs currently in the LSD database
+		q = db.query('pid FROM "%s"' % (exp_tabname))
+		pids_current = []
+		for row in q.iterate():
+			pids_current.append(row[0])
+		# sort PIDs
+		pids_current = np.sort(pids_current)
+		# find indexes of new PIDs
+		dat = pids_current.searchsorted(np.asarray(pids_all), 'right') - pids_current.searchsorted(np.asarray(pids_all), 'left')
+		new_pids = np.where(dat == 0)[0]
+		# find new filenames
+		files = np.asarray(files_all)[new_pids]
+		# split the list
+		files0 = files[0:np.floor(files.size/2.)]
+		files1 = files[np.floor(files.size/2.):]
+		f = open('files.0', 'w')
+		for row in files0:
+			f.write('%s\n' % row)
+
+		f.close()
+		f = open('files.1', 'w')
+		for row in files1:
+			f.write('%s\n' % row)
+
+		f.close()
+
+
+print "Importing SExtractor catalog files:"
+ptf.import_from_catalogs(db, det_tabname, exp_tabname, files, create, all)
+print " done."

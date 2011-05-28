@@ -1,0 +1,53 @@
+#!/usr/bin/env python
+#
+# Example: time nice -n 10 ./lsd-make-ptf-object-catalog -c ptf_obj ptf_det >output_object 2>errors_object
+# Example: time nice -n 10 ./lsd-make-ptf-object-catalog ptf_obj ptf_det >output_object 2>errors_object
+#
+
+import sys
+import getopt
+import lsd
+import lsd.smf as smf
+from lsd.utils import *
+from lsd.tui import *
+import shutil
+import datetime
+from pyslalib.slalib import sla_caldj
+
+def usage():
+	print "Usage: %s [-c|--create] <obj_table> <det_table>" % sys.argv[0]
+
+optlist, (dbdir,), (obj_tabname, det_tabname) = tui_getopt('c', ['create'], 2, usage)
+
+create = False
+for (o, a) in optlist:
+	if o == '-c' or o == '--create':
+		create = True
+
+if create:
+	if os.access(dbdir+'/.'+det_tabname+':_'+obj_tabname+'_to_'+det_tabname+'.join', os.F_OK):
+		os.remove(dbdir+'/.'+det_tabname+':_'+obj_tabname+'_to_'+det_tabname+'.join')
+	if os.access(dbdir+'/.'+obj_tabname+':_'+obj_tabname+'_to_'+det_tabname+'.join', os.F_OK):
+		os.remove(dbdir+'/.'+obj_tabname+':_'+obj_tabname+'_to_'+det_tabname+'.join')
+	if os.access(dbdir+'/.'+obj_tabname+':'+det_tabname+'.join', os.F_OK):
+		os.remove(dbdir+'/.'+obj_tabname+':'+det_tabname+'.join')
+	if os.access(dbdir+'/'+obj_tabname, os.F_OK):
+		shutil.rmtree(dbdir+'/'+obj_tabname)
+	if os.access(dbdir+'/_'+obj_tabname+'_to_'+det_tabname, os.F_OK):
+		shutil.rmtree(dbdir+'/_'+obj_tabname+'_to_'+det_tabname)
+
+
+#
+# Actual work
+#
+
+db = lsd.DB(dbdir)
+smf.make_object_catalog(db, obj_tabname, det_tabname, create=create, radius=1.5/3600)
+
+# MJD of last build
+now = datetime.datetime.now()
+(djm, j) = sla_caldj(now.year, now.month, now.day)
+djm -= 55682
+f = open(dbdir+'/.'+obj_tabname+'_import_MJD','w')
+f.write('%d\n' % (djm))
+f.close()

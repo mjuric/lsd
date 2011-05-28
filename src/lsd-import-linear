@@ -1,0 +1,43 @@
+#!/usr/bin/env python
+#
+# Example: lsd-import-linear linear final_params_All.fits.gz
+#
+
+import sys
+import getopt
+import lsd
+import lsd.linear as linear
+from lsd.utils import *
+from lsd.tui import *
+import numpy as np
+import shutil
+
+def usage():
+	print "Usage: %s <table> <filename>" % sys.argv[0]
+
+optlist, (dbdir,), (tabname, file) = tui_getopt('c', ['create'], 2, usage)
+create = True
+
+if create:
+    if os.access(dbdir+'/'+tabname, os.F_OK):
+        shutil.rmtree(dbdir+'/'+tabname)
+
+file = [file]
+
+#
+# Actual work
+#
+db = lsd.DB(dbdir)
+
+print "Importing from catalog:"
+linear.import_from_catalogs(db, tabname, file, create)
+print " done."
+
+print "Building neighbor cache ",
+db.build_neighbor_cache(tabname)
+print " done."
+
+print "Computing summary statistics ",
+db.compute_summary_stats(tabname)
+print " done."
+print "Total number of objects in catalog: ", db.table(tabname).nrows()

@@ -1,0 +1,210 @@
+#!/usr/bin/env python
+
+import os
+import lsd
+import lsd.colgroup as colgroup
+import lsd.bounds
+import numpy as np
+import scipy.stats.mstats
+from itertools import izip
+from collections import defaultdict
+from lsd.join_ops import IntoWriter
+from scipy.weave import inline
+import logging
+import cPickle
+import shutil
+
+def calc_stats(qresult, qwriter):
+	"""
+	Compute statistics from merged detections.
+
+	Compute median, average, SIQR, chi2dof per object.
+	"""
+	all_rows = colgroup.fromiter(qresult, blocks=True)
+	if not len(all_rows):
+		return
+
+	# Sort
+	all_rows.sort(["_ID", "filterid", "mag"])
+
+	# Prepare the output array
+	objs = np.unique(all_rows['_ID'])
+	out = colgroup.ColGroup(
+		dtype=[
+			('obj_id', 'u8'),
+			('nmag', '2i2'), ('nmag_ok', '2i2'),
+			('ra_med', 'f8'), ('dec_med', 'f8'),
+			('ra_rms', 'f4'), ('dec_rms', 'f4'),
+			('ra_mean', 'f8'), ('dec_mean', 'f8'),
+			('ra_stdev', 'f4'), ('dec_stdev', 'f4'),
+			('mag_mean', '2f4'), ('mag_stdev', '2f4'), ('merr', '2f4'),
+			('mag_med', '2f4'), ('mag_rms', '2f4'),
+			('chi2dof', '2f4')
+		      ],
+		      size=len(objs)
+	      )
+	out['obj_id'][:] = objs
+
+	# Pull out the arrays we'll be using
+	(id_out, nmag, nmag_ok, ra_med, dec_med, ra_rms, dec_rms, ra_mean, dec_mean, ra_stdev, dec_stdev, mag_mean, mag_stdev, merr, mag_med, mag_rms, chi2dof) = out.as_columns()
+	id_in, ras, decs, mags, errs, filterid, flags, sys_errs = all_rows['_ID'], all_rows['ra'], all_rows['dec'], all_rows['mag'], all_rows['err'], all_rows['filterid'], all_rows['imflags'], all_rows['sys_err']
+
+	# Convert filterid to index
+	band = np.empty(len(all_rows), dtype='i4')
+	for f, i in { 1: 0, 2: 1 }.iteritems():
+		band[filterid == f] = i
+
+	code = \
+	"""
+	#line 52 "objdata_weave.py"
+
+	assert(Sid_out[0] == sizeof(*id_out));	// Make sure we've got a contiguous array
+
+	uint32_t bad_astro = SATELLITE ;
+	uint32_t bad_photo = SATELLITE | HIGH_DARK | HOT_PIXEL | SATURATED_PIXEL | DEAD_PIXEL | NAN_PIXEL ;
+
+	// stream through the input arrays
+	int size = Nmags[0];
+	std::vector<double> magsg, wtg, magsR, wtR, ras1, decs1;
+	for(int i = 0, j = 0; i != size; i = j)
+	{
+		j = i;
+		int nobsg = 0, nobsR = 0;
+		ras1.clear(); decs1.clear(); magsg.clear(); wtg.clear(); magsR.clear(); wtR.clear();
+		while(j != size && id_in[i] == id_in[j])
+		{
+			double ra = RAS1(j);
+			double dec = DECS1(j);
+			float mag = MAGS1(j);
+			float err = ERRS1(j);
+			float syserr = SYS_ERRS1(j);
+			uint32_t flag = FLAGS1(j);
+
+			if(std::isfinite(ra) && std::isfinite(dec) && ((flag & bad_astro) == 0))
+			{
+				ras1.push_back(ra);
+				decs1.push_back(dec);
+			}
+
+			if(std::isfinite(mag) && ((flag & bad_photo) == 0))
+			{
+				if(band[j] == 0)
+				{
+					magsg.push_back(mag);
+					wtg.push_back(1. / (err*err + syserr*syserr)); // add systematic error in quadrature
+				} else {
+					magsR.push_back(mag);
+					wtR.push_back(1. / (err*err + syserr*syserr)); // add systematic error in quadrature
+				}
+			} else {
+				if(band[j] == 0)
+				{
+					nobsg++;
+				} else {
+					nobsR++;
+				}
+
+			}
+
+			j++;
+
+			// find where to store
+			int row = std::lower_bound(id_out, id_out + Nid_out[0], id_in[i]) - id_out;
+			assert(id_out[row] == id_in[i]);
+			assert(0 <= row && row < Nid_out[0]);
+
+			// store number of elements (all and good)
+			NMAG2(row, 0) = nobsg;
+			NMAG2(row, 1) = nobsR;
+			NMAG_OK2(row, 0) = magsg.size();
+			NMAG_OK2(row, 1) = magsR.size();
+
+			if (!ras1.empty())
+			{
+				// sort RA and Dec
+				gsl_sort(&ras1[0], 1, ras1.size());
+				gsl_sort(&decs1[0], 1, decs1.size());
+
+				RA_MED1(row) = gsl_stats_quantile_from_sorted_data(&ras1[0], 1, ras1.size(), 0.50);
+				RA_RMS1(row) = 0.741*3600.*(gsl_stats_quantile_from_sorted_data(&ras1[0], 1, ras1.size(), 0.75) - gsl_stats_quantile_from_sorted_data(&ras1[0], 1, ras1.size(), 0.25));
+
+				DEC_MED1(row) = gsl_stats_quantile_from_sorted_data(&decs1[0], 1, decs1.size(), 0.50);
+				DEC_RMS1(row) = 0.741*3600.*(gsl_stats_quantile_from_sorted_data(&decs1[0], 1, decs1.size(), 0.75) - gsl_stats_quantile_from_sorted_data(&decs1[0], 1, decs1.size(), 0.25));
+
+				// mean statistics
+				RA_MEAN1(row)   = gsl_stats_mean(&ras1[0], 1, ras1.size());
+				RA_STDEV1(row)  = 3600.*fabs(gsl_stats_sd(&ras1[0], 1, ras1.size())); // I wrap it in fabs because for N=0 it returns a -0 (??)
+
+				DEC_MEAN1(row)  = gsl_stats_mean(&decs1[0], 1, decs1.size());
+				DEC_STDEV1(row) = 3600.*fabs(gsl_stats_sd(&decs1[0], 1, decs1.size()));
+			}
+
+			if(!magsg.empty())
+			{
+				// median statistics
+				MAG_MED2(row, 0) = gsl_stats_quantile_from_sorted_data(&magsg[0], 1, magsg.size(), 0.50);
+				MAG_RMS2(row, 0) = 0.741*(gsl_stats_quantile_from_sorted_data(&magsg[0], 1, magsg.size(), 0.75) - gsl_stats_quantile_from_sorted_data(&magsg[0], 1, magsg.size(), 0.25));
+
+				// mean statistics
+				MAG_MEAN2(row, 0)  = gsl_stats_wmean(&wtg[0], 1, &magsg[0], 1, magsg.size());
+				MAG_STDEV2(row, 0) = fabs(gsl_stats_wsd(&wtg[0], 1, &magsg[0], 1, magsg.size()));
+
+				// mean error computed as 1./sum(wts)
+				double w = 0.;
+				double chi = 0.;
+				for(int i = 0; i != wtg.size(); i++)
+				{
+					w += wtg[i];
+					chi += ( (magsg[i]-MAG_MEAN2(row, 0))*(magsg[i]-MAG_MEAN2(row, 0))   )*wtg[i];
+				}
+				MERR2(row, 0) = 1. / sqrt(w);
+				CHI2DOF2(row, 0) = chi/(wtg.size()-1);
+			}
+
+			if(!magsR.empty())
+			{
+				// median statistics
+				MAG_MED2(row, 1) = gsl_stats_quantile_from_sorted_data(&magsR[0], 1, magsR.size(), 0.50);
+				MAG_RMS2(row, 1) = 0.741*(gsl_stats_quantile_from_sorted_data(&magsR[0], 1, magsR.size(), 0.75) - gsl_stats_quantile_from_sorted_data(&magsR[0], 1, magsR.size(), 0.25));
+
+				// mean statistics
+				MAG_MEAN2(row, 1)  = gsl_stats_wmean(&wtR[0], 1, &magsR[0], 1, magsR.size());
+				MAG_STDEV2(row, 1) = fabs(gsl_stats_wsd(&wtR[0], 1, &magsR[0], 1, magsR.size()));
+
+				// mean error computed as 1./sum(wts)
+				double w = 0.;
+				double chi = 0.;
+				for(int i = 0; i != wtR.size(); i++)
+				{
+					w += wtR[i];
+					chi += ( (magsR[i]-MAG_MEAN2(row, 1))*(magsR[i]-MAG_MEAN2(row, 1))   )*wtR[i];
+				}
+				MERR2(row, 1) = 1. / sqrt(w);
+				CHI2DOF2(row, 1) = chi/(wtR.size()-1);
+			}
+		}
+	}
+	"""
+	inline(code,
+		['id_out', 'nmag', 'nmag_ok', 'ra_med', 'dec_med', 'ra_rms', 'dec_rms', 'ra_mean', 'dec_mean', 'ra_stdev', 'dec_stdev', 'mag_mean', 'mag_stdev', 'merr', 'mag_med', 'mag_rms', 'chi2dof', 'id_in', 'ras', 'decs', 'mags', 'errs', 'band', 'flags', 'sys_errs'],
+		headers=['"imflags.h"', '<cmath>', '<iostream>', '<vector>', '<gsl/gsl_statistics.h>', '<gsl/gsl_sort.h>', '<cassert>', '<algorithm>'],
+		libraries=['gsl', 'gslcblas'],
+		include_dirs=['.'],
+		undef_macros=['NDEBUG'])
+
+	# Write out the result
+	result = qwriter.write(qresult.static_cell, out)
+	yield result
+
+if os.access('/home/bsesar/projects/DB/ptf_stat', os.F_OK):
+	shutil.rmtree('/home/bsesar/projects/DB/ptf_stat')
+
+db = lsd.DB('/home/bsesar/projects/DB')
+bounds = None
+q = db.query("SELECT _ID, ptf_det.ra as ra, ptf_det.dec as dec, mag_abs/1000. as mag, magerr_abs/1000. as err, fid as filterid, imaflags_iso as imflags, apbsrms as sys_err FROM ptf_det, ptf_exp, ptf_obj WHERE (flags < 8)")
+writer = IntoWriter(db, "ptf_stat WHERE obj_id |= obj_id")
+
+nrows = 0
+for cell_id, rows in q.execute([(calc_stats, writer)], group_by_static_cell=True, bounds=bounds):
+	nrows += len(rows)
+print nrows

@@ -1,0 +1,12 @@
+#define SATELLITE 1
+#define HIGH_DARK 4
+#define NON_LINEAR 8
+#define HOT_PIXEL 16
+#define GHOST_PIXEL 32
+#define CCD_BLEED 64
+#define RAD_HIT 128
+#define SATURATED_PIXEL 256
+#define DEAD_PIXEL 512
+#define NAN_PIXEL 1024
+#define DIRT 2048
+#define HALO 4096
