@@ -1,8 +1,5 @@
-import pyfits
 import pool2
 import numpy as np
-from pyslalib.slalib import sla_eqgal
-from itertools import izip
 import time
 
 conversion_to_int = 0
@@ -18,7 +15,6 @@ small_table_def = \
 				('ra',			'f8',	'f8',	1.,		'ra',		'Right ascension'),
 				('dec',			'f8',	'f8',	1.,		'dec',		'Declination'),
 				('objid',		'u4',	'u4',	1.,		'objid',	'object id'),
-				('name',		'a12',	'a12',	1.,		'name',		'object name'),
 			],
 			'primary_key' : 'small_id',
 			'spatial_keys': ('ra', 'dec'),
@@ -53,16 +49,12 @@ def import_from_catalogs(db, small_tabname, catalog_files, create=False):
 
 def import_from_catalogs_aux(file, db, tabname):
 	# import an table
-	dat   = np.genfromtxt(file, names='objid, ra, dec, name', dtype='u4, f8, f8, a12')
+	dat   = np.genfromtxt(file, names='ra, dec, objid', dtype='f8, f8, u4')
 	table = db.table(tabname)
 
 	# Load the data, cutting on flags
 	coldefs = small_table_def['schema']['main']['columns']
-	if (conversion_to_int == 1):
-		cols = dict(( (name, np.around(np.abs(dat[fitsname]*factor)).astype(coltype[-3:])) for (name, _, coltype, factor, fitsname, _) in coldefs if fitsname != '' and factor > 1))
-		cols.update(dict(( (name, (dat[fitsname]*factor).astype(coltype[-3:])) for (name, _, coltype, factor, fitsname, _) in coldefs if fitsname != '' and factor == 1)))
-	else:
-		cols = dict(( (name, dat[fitsname].astype(coltype[-3:])) for (name, coltype, _, _, fitsname, _) in coldefs if fitsname != ''))
+	cols = dict(( (name, dat[fitsname].astype(coltype[-3:])) for (name, coltype, _, _, fitsname, _) in coldefs if fitsname != ''))
 
 	ids = table.append(cols)
 
