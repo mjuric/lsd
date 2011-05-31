@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Initial run: time nice -n 10 ./lsd-build-cache ptf_det ptf_exp >output_cache 2>errors_cache
+# Initial run: time nice -n 10 ./lsd-build-cache ptf_det ptf_exp >output 2>errors
 
 import sys, os
 import getopt
@@ -20,13 +20,17 @@ optlist, (dbdir,), (det_tabname, exp_tabname) = tui_getopt('cf:', ['create', 'fi
 #
 db = lsd.DB(dbdir)
 
-## Build neighbor caches for detections
-print >> sys.stderr, "Building neighbor cache (detections): ",
-db.build_neighbor_cache(det_tabname)
+# Old tablet_tree.pkl need to be removed manually from shell before rebuilding!!
+if os.access(dbdir+'/'+det_tabname+'/tablet_tree.pkl', os.F_OK) or os.access(dbdir+'/'+exp_tabname+'/tablet_tree.pkl', os.F_OK):
+	sys.exit("First remove "+dbdir+'/'+det_tabname+'/tablet_tree.pkl and '+dbdir+'/'+exp_tabname+'/tablet_tree.pkl using shell (bash)!')
+else:
+	## Build neighbor caches for detections
+	print >> sys.stderr, "Building neighbor cache (detections): ",
+	db.build_neighbor_cache(det_tabname)
 
-## Build neighbor caches for images tables
-print >> sys.stderr, "Building neighbor cache (exposures): ",
-smf.make_image_cache(db, det_tabname, exp_tabname)
+	## Build neighbor caches for images tables
+	print >> sys.stderr, "Building neighbor cache (exposures): ",
+	smf.make_image_cache(db, det_tabname, exp_tabname)
 
 # Sanity check: all queries linking to images must resolve within cell
 print >> sys.stderr, "Consistency check: ",
