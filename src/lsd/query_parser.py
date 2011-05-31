@@ -7,6 +7,12 @@ def check_key_validity(key):
 	if key not in ['nmax', 'dmax', 'inner', 'outer', 'xmatch', 'matchedto']:
 		raise Exception("Unknown keyword '%s' in FROM clause" % key)
 
+def unquote(s):
+	# Unquote if quoted
+	if s and s[0] in frozenset(['"', "'"]):
+		return s[1:-1]
+	return s
+
 def parse(query):
 	""" 
 	    Parse query of the form:
@@ -65,11 +71,13 @@ def parse(query):
 				if token.lower() == "from":
 					# FROM clause
 					while token.lower() not in ['', 'where', 'into']:
-						# Slurp the table path
+						# Slurp the table path, allowing for db.tabname constructs
 						(_, table, _, _, _) = next(g)				# table path
-
-						if table and table[0] in ['"', "'"]:			# Unquote if quoted
-							table = table[1:-1]
+						token = next(g)[1]
+						if token == '.':
+							table += '.' + next(g)[1]
+							token = next(g)[1]
+						table = unquote(table)
 
 						# At this point we expect:
 						# ... [EOL] # <-- end of line
@@ -80,7 +88,6 @@ def parse(query):
 						join_args = []
 						astable = table
 						for _ in xrange(2):
-							(_, token, _, _, _) = next(g)
 							if token == '(':
 								args = dict()
 								while token != ')':
@@ -90,12 +97,16 @@ def parse(query):
 									check_key_validity(key)
 									token = next(g)[1].lower()
 									if token == '=':
+										# Slurp up the value
 										val = next(g)[1]
 										token = next(g)[1]
+										while token not in [')', ',', '']:
+											val += token
+											token = next(g)[1]
 									else:
 										val = None
 										assert token in [',', ')']
-									args[key] = val
+									args[key] = unquote(val)
 								if 'inner' in args and 'outer' in args:
 									raise Exception('Cannot simultaneously have both "inner" and "outer" as join type')
 								if len(args):
@@ -106,6 +117,8 @@ def parse(query):
 								break
 							elif token.lower() in ['', ',', 'where', 'into']:
 								break
+
+							(_, token, _, _, _) = next(g)
 
 						if not join_args:
 							join_args.append(dict())

@@ -62,6 +62,7 @@ class TabletCache:
 		#
 		# NOTE: Unless resolve_blobs=True, this method DOES NOT resolve blobrefs to BLOBs
 		include_cached = self.include_cached if table.name == self.root_name else True
+		print "XXXX", table.name, self.root_name, include_cached
 
 		# Resolve a column name alias
 		name = table.resolve_alias(name)
@@ -845,14 +846,31 @@ class QueryInstance(object):
 			tables.extend(( (name, table) for name, table in self.tables.iteritems() if name != self.root.name ))
 			colname = name
 		else:
-			# Force lookup of a specific table
-			(tabname, colname) = name.split('.')
-			tables = [ (tabname, self.tables[tabname]) ]
+			# Force lookup of a specific table + column ...
+			ns = name.split('.')
+			(tabname, colname) = '.'.join(ns[:-1]), ns[-1]
+			try:
+				tables = [ (tabname, self.tables[tabname]) ]
+			except KeyError:
+				# ... or dbdir + table
+				if tabname == "db":
+					colname = name
+					tables = []
+				else:
+					raise
 		for (tabname, e) in tables:
 			colname = e.table.resolve_alias(colname)
 			if colname in e.table.columns:
 				self[name] = self.load_column(colname, tabname)
 				return self.columns[name]
+
+		# A name of a table? Return a proxy object
+		if name in self.tables:
+			return TableProxy(self, name)
+
+		# A name of a dbdir? Also return a proxy
+		if name == "db":
+			return TableProxy(self, name)
 
 		# A query pseudocolumn?
 		if name in ['_ROWNUM', '_CELLID', '_CELLPATH']:
@@ -863,10 +881,6 @@ class QueryInstance(object):
 		# Note that these _must_ be prefixed by table name
 		if name.find('.') != -1 and name in self.jmap:
 			return self.jmap[name]
-
-		# A name of a table? Return a proxy object
-		if name in self.tables:
-			return TableProxy(self, name)
 
 		# Is this one of the local variables passed in by the user?
 		if name in self.locals:
@@ -1737,9 +1751,17 @@ class DB(object):
 				path = '%s/%s' % (self.path[0], tabname)
 				self.tables[tabname] = Table(path, name=tabname, mode='c')
 			else:
-				# Find the table
+				# Find the table. Allow the database to be specified
+				# using db.tablename syntax
+				if tabname.find('.') != -1:
+					dbdir, tn = tabname.split('.')
+				else:
+					dbdir, tn = None, tabname
+
 				for dbpath in self.path:
-					path = '%s/%s' % (dbpath, tabname)
+					if dbdir is not None:
+						dbpath = '/'.join(dbpath.split('/')[:-1] + [ dbdir ])
+					path = '%s/%s' % (dbpath, tn)
 					if os.path.isdir(path):
 						self.tables[tabname] = Table(path)
 						break
