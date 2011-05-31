@@ -1146,7 +1146,7 @@ class Table:
 			ntot = ntot + nnew
 
 		assert _update or ntot == len(cols), 'ntot != len(cols), ntot=%d, len(cols)=%d, cur_cell_id=%d' % (ntot, len(cols), cur_cell_id)
-		assert len(np.unique1d(cols[key])) == len(cols), 'len(np.unique1d(cols[key])) != len(cols) (%s != %s) in cell %s' % (len(np.unique1d(cols[key])), len(cols), cur_cell_id)
+		assert len(np.unique(cols[key])) == len(cols), 'len(np.unique(cols[key])) != len(cols) (%s != %s) in cell %s' % (len(np.unique(cols[key])), len(cols), cur_cell_id)
 
 		return cols[key]
 
