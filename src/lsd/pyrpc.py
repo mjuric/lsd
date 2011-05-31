@@ -220,7 +220,7 @@ class PyRPCProxy(object):
 	_heatbeat_interval = None	# The interval in which to send heartbeats to the server
 	_hbeat = None			# The heatbeat timer thread
 
-	def __init__(self, host, port, heartbeat_interval=10.):
+	def __init__(self, host, port, heartbeat_interval=5.):
 		# Set up the call lock
 		self._lock = threading.Lock()
 		self._addr = (host, port)

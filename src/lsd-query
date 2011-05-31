@@ -32,7 +32,7 @@ def T(*args):
 		return intervalset(tuple(args))
 
 def usage():
-	print "Usage: %s --db=dbdir --bounds=bounds --format=[fits|text] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
+	print "Usage: %s --db=dbdir --bounds=bounds --format=[fits|text|null] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
 
 if __name__ == "__main__":
 	np.seterr(over='raise')
@@ -41,14 +41,14 @@ if __name__ == "__main__":
 
 	bounds = []
 	format = 'text'
-	output = 'output.fits'
+	output = None
 	progress_callback = None
 	testbounds = True
 	for o, a in optlist:
 		if o in ('-b', '--bounds'):
 			bounds.extend(eval('[' + a + ']'))
 		if o in ('--format', '-f'):
-			if a not in ['text', 'fits']: usage(); exit(-1);
+			if a not in ['text', 'fits', 'null']: usage(); exit(-1);
 			format = a
 		if o in ('--output', '-o'):
 			output = a
@@ -63,22 +63,26 @@ if __name__ == "__main__":
 
 	db = lsd.DB(dbdir)
 	q = db.query(query)
+	nrows = 0
 	if format == 'text':
 		# Text output
 		fmt = None
 		##rprev = None
+		out = sys.stdout if output is None else open(output, 'w')
 		for row in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds):
 			if fmt == None:
-				fmt = make_printf_string(row)
-				print '# ' + ' '.join(row.dtype.names)
-			print fmt % as_tuple(row)
-			##if rprev != None and rprev['ra'] == row['ra']:
-			##	print fmt % as_tuple(row)
-			##	print fmt % as_tuple(rprev)
-			##rprev = row.copy()
-	else:
+				fmt = make_printf_string(row) + '\n'
+				out.write('# ' + ' '.join(row.dtype.names) + '\n')
+			out.write(fmt % as_tuple(row))
+			nrows += 1
+		out.flush()
+	elif format == 'null':
+		for rows in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds, return_blocks=True):
+			nrows += len(rows)
+	elif format == 'fits':
 		# FITS output
 		rows = q.fetch(bounds, progress_callback=progress_callback, testbounds=testbounds)
+		nrows += len(rows)
 
 		if 'cksumok' in rows.dtype.names:
 			# Do ./lsd-query --format=fits ps1 'vecmd5(hdr) == cksum as cksumok'
@@ -110,8 +114,12 @@ if __name__ == "__main__":
 		else:
 			rows = rows.view(dtype=dtype)
 
+		if output is None:
+			output = 'output.fits'
 		if os.path.exists(output):
 			os.unlink(output)
 		pyfits.writeto(output, rows)
 
 		print >> sys.stderr, 'Output in %s' % (output)
+	
+	print >> sys.stderr, '%d rows selected.' % (nrows)

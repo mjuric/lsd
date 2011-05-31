@@ -400,6 +400,7 @@ template<typename Output>
 
 			// find the corresponding m1 block
 			std::tr1::tuple<uint64_t, uint64_t, uint64_t> mm;
+			get<0>(mm) = id+1;	// setting to a value != id, so that the first branch of the if() below gets triggered if we never enter the while() loop
 			while(at < m.size() && get<0>(mm = m[at]) < id) at++;
 
 			// resolve all id->* links

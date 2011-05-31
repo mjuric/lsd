@@ -4,7 +4,7 @@ import StringIO
 import tokenize
 
 def check_key_validity(key):
-	if key not in ['nmax', 'dmax', 'inner', 'outer']:
+	if key not in ['nmax', 'dmax', 'inner', 'outer', 'xmatch', 'matchedto']:
 		raise Exception("Unknown keyword '%s' in FROM clause" % key)
 
 def parse(query):
@@ -77,13 +77,12 @@ def parse(query):
 						# ... (inner/outer)
 						# ... AS asname
 						# ... (inner/outer) AS asname
-						join_args = dict()
+						join_args = []
 						astable = table
 						for _ in xrange(2):
 							(_, token, _, _, _) = next(g)
 							if token == '(':
-								#(_, join_args, _, _, _) = next(g)	# inner/outer
-								#(_, token, _, _, _) = next(g)		# )
+								args = dict()
 								while token != ')':
 									key = next(g)[1].lower()	# key=value or key or )
 									if key == ')':
@@ -96,15 +95,20 @@ def parse(query):
 									else:
 										val = None
 										assert token in [',', ')']
-									join_args[key] = val
-								if 'inner' in join_args and 'outer' in join_args:
+									args[key] = val
+								if 'inner' in args and 'outer' in args:
 									raise Exception('Cannot simultaneously have both "inner" and "outer" as join type')
+								if len(args):
+									join_args.append(args)
 							elif token.lower() == 'as':			# table rename
 								(_, astable, _, _, _) = next(g)
 								(_, token, _, _, _) = next(g)		# next token
 								break
 							elif token.lower() in ['', ',', 'where', 'into']:
 								break
+
+						if not join_args:
+							join_args.append(dict())
 
 						from_clause += [ (astable, table, join_args) ]
 
