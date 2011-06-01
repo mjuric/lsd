@@ -11,18 +11,62 @@ from lsd.utils import *
 from lsd.tui import *
 
 def usage():
-	print "Usage: %s [-c|--create] <obj_table> <det_table>" % sys.argv[0]
+	print "Usage: %s [-a|--auto] [-c|--create] [-r|--radius=<arcsec>] [-f|--fov-radius=<deg>] [-g|--gen-explist] [-e|--explist=explist.txt] <obj_table> <det_table> <exp_table>" % sys.argv[0]
 
-optlist, (dbdir,), (obj_tabname, det_tabname) = tui_getopt('c', ['create'], 2, usage)
+optlist, (dbdir,), (obj_tabname, det_tabname, exp_tabname) = tui_getopt('cge:r:f:a', ['create', 'gen-explist', 'explist=', 'radius=', 'fov-radius=', 'auto'], 3, usage)
 
 create = False
+gen_explist = False
+explist = None
+fovradius = None
+radius = 1.
+auto = False
+make_catalog = True
 for (o, a) in optlist:
-	if o == '-c' or o == '--create':
+	if o == '-a' or o == '--auto':
+		auto = True
+	elif o == '-c' or o == '--create':
 		create = True
+	elif o == '-r' or o == '--radius':
+		radius = float(a)
+	elif o == '-f' or o == '--fov-radius':
+		fovradius = float(a)
+	elif o == '-g' or o == '--gen-explist':
+		gen_explist = True
+	elif o == '-e' or o == '--explist':
+		explist = np.loadtxt(a, dtype=np.uint64, ndmin=1)
+
+if gen_explist:
+	assert explist is None
+	assert not auto
+	make_catalog = False
+
+if explist is not None:
+	assert not gen_explist
+	assert not auto
 
 #
 # Actual work
 #
 
 db = lsd.DB(dbdir)
-smf.make_object_catalog(db, obj_tabname, det_tabname, create=create)
+
+def get_new_exposures(db, obj_tabname, det_tabname):
+	qobj="_EXP from %s, %s" % (obj_tabname, det_tabname)
+	qexp="_ID from %s" % (exp_tabname)
+	return smf.get_new_exposures(db, qobj, qexp)
+
+if create or auto:
+	smf.create_object_table(db, obj_tabname, det_tabname)
+
+if gen_explist or auto:
+	print >> sys.stderr, "Scanning what is already in the database..."
+	explist = get_new_exposures(db, obj_tabname, det_tabname)
+	print >>sys.stderr, "%d new exposures (%d total)." % (len(explist), db.table(exp_tabname).nrows())
+
+if gen_explist:
+	for exp in explist:
+		print exp
+
+if make_catalog:
+	smf.make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=radius/3600., explist=explist, fovradius=fovradius)

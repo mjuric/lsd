@@ -330,14 +330,15 @@ class Table:
 		    and no "true" data belonging to that cell.
 		"""
 		if getattr(self, 'tablet_tree', None) is None:
-			print >> sys.stderr, "No up-to-date tablet tree cache for table %s. Rebuilding." % (self.name),
-
-			data_path = self._get_cgroup_data_path(self.primary_cgroup)
-			pattern   = self._tablet_filename(self.primary_cgroup)
-
-			self.tablet_tree = TabletTreeCache().create_cache(self.pix, data_path, pattern, self.path + '/tablet_tree.pkl')
+		        self.rebuild_tablet_tree_cache()
 
 		return self.tablet_tree.get_cells(bounds, return_bounds, include_cached)
+
+	def rebuild_tablet_tree_cache(self):
+		print >> sys.stderr, "Rebuilding tablet tree cache for table %s" % (self.name)
+		data_path = self._get_cgroup_data_path(self.primary_cgroup)
+		pattern   = self._tablet_filename(self.primary_cgroup)
+		self.tablet_tree = TabletTreeCache().create_cache(self.pix, data_path, pattern, self.path + '/tablet_tree.pkl')
 
 	def is_cell_local(self, cell_id):
 		"""

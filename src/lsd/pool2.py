@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 from multiprocessing import Process, Queue, cpu_count, current_process
-from lsd.pyrpc import PyRPCProxy, RPCError
+from pyrpc import PyRPCProxy, RPCError
 from Queue import Empty
 from collections import defaultdict
 import socket

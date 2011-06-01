@@ -37,13 +37,14 @@ def usage():
 if __name__ == "__main__":
 	np.seterr(over='raise')
 
-	optlist, (dbdir,), (query,) = tui_getopt('b:f:o:q', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds='], 1, usage)
+	optlist, (dbdir,), (query,) = tui_getopt('b:f:o:q', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds=', 'nc'], 1, usage)
 
 	bounds = []
 	format = 'text'
 	output = None
 	progress_callback = None
 	testbounds = True
+	include_cached = False
 	for o, a in optlist:
 		if o in ('-b', '--bounds'):
 			bounds.extend(eval('[' + a + ']'))
@@ -71,7 +72,7 @@ if __name__ == "__main__":
 		fmt = None
 		##rprev = None
 		out = sys.stdout if output is None else open(output, 'w')
-		for row in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds):
+		for row in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds, include_cached=include_cached):
 			if fmt == None:
 				fmt = make_printf_string(row) + '\n'
 				out.write('# ' + ' '.join(row.dtype.names) + '\n')
@@ -79,11 +80,11 @@ if __name__ == "__main__":
 			nrows += 1
 		out.flush()
 	elif format == 'null':
-		for rows in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds, return_blocks=True):
+		for rows in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds, return_blocks=True, include_cached=include_cached):
 			nrows += len(rows)
 	elif format == 'fits':
 		# FITS output
-		rows = q.fetch(bounds, progress_callback=progress_callback, testbounds=testbounds)
+		rows = q.fetch(bounds, progress_callback=progress_callback, testbounds=testbounds, include_cached=include_cached)
 		nrows += len(rows)
 
 		if 'cksumok' in rows.dtype.names:

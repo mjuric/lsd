@@ -1624,7 +1624,7 @@ class DB(object):
 
 		table.create_cgroup(tname, schema)
 
-	def create_table(self, tabname, tabdef):
+	def create_table(self, tabname, tabdef, ignore_if_exists=False):
 		"""
 		Creates a table, given the LSD Table Definition.
 
@@ -1636,6 +1636,10 @@ class DB(object):
 		look into lsd.smf and lsd.sdss modules to see some examples
 		of table definitions.
 		"""
+
+		if ignore_if_exists and self.table_exists(tabname):
+			return self.table(tabname)
+		
 		table = self.table(tabname, create=True)
 
 		# Add fgroups
@@ -1664,7 +1668,7 @@ class DB(object):
 
 		return table
 
-	def define_join(self, name, type, **joindef):
+	def define_join(self, name, type, _overwrite=False, **joindef):
 		"""
 		Define how two tables are joined.
 
@@ -1742,7 +1746,7 @@ class DB(object):
 		#		type:	direct			"type": "direct"
 
 		fname = '%s/%s.join' % (self.path[0], name)
-		if os.access(fname, os.F_OK):
+		if not _overwrite and os.access(fname, os.F_OK):
 			raise Exception('Join relation %s already exist (in file %s)' % (name, fname))
 
 		joindef['type'] = type
@@ -1751,14 +1755,14 @@ class DB(object):
 		f.write(json.dumps(joindef, indent=4, sort_keys=True))
 		f.close()
 
-	def define_default_join(self, tableA, tableB, type, **joindef):
+	def define_default_join(self, tableA, tableB, type, _overwrite=False, **joindef):
 		"""
 		Define a default join relation between two tables.
 		
 		See documentation for DB.define_join() for details on type
 		and joindef arguments.
 		"""
-		return self.define_join('.%s:%s' % (tableA, tableB), type, **joindef)
+		return self.define_join('.%s:%s' % (tableA, tableB), type, _overwrite, **joindef)
 
 	def table_exists(self, tabname):
 		"""
@@ -1941,9 +1945,7 @@ class DB(object):
 			table = self.table(tabname)
 
 			# Compute the tablet tree cache
-			data_path = table._get_cgroup_data_path(table.primary_cgroup)
-			pattern   = table._tablet_filename(table.primary_cgroup)
-			table.tablet_tree = TabletTreeCache().create_cache(table.pix, data_path, pattern, table.path + '/tablet_tree.pkl')
+			table.rebuild_tablet_tree_cache()
 
 			# Scan the number of rows
 			table._nrows = compute_counts(self, tabname)

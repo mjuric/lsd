@@ -9,9 +9,12 @@ import itertools as it
 import bhpix
 from utils import gnomonic, gc_dist
 from colgroup import ColGroup
+import colgroup
 import sys, os
 import logging
 import utils
+from interval import intervalset
+import bounds
 
 logger = logging.getLogger("lsd.smf")
 
@@ -628,50 +631,122 @@ def _exp_store_rows(kv, db, exp_tabname):
 ###############
 # object table creator
 
-def make_object_catalog(db, obj_tabname, det_tabname, radius=1./3600., create=True):
-	# Entry point for creation of image cache
+def _unique_mapper(qresult):
+	for rows in qresult:
+		yield np.unique(rows.column(0))
+
+def get_new_exposures(db, qobj, qexp):
+	""" Get all exposures mentioned in the detections table, and not
+	    mentioned in the object table.
+	"""
+	def get_unique(query):
+		vals = set()
+		for exps in db.query(query).execute([_unique_mapper]):
+			for exp in exps:
+				vals.add(exp)
+		return vals
+
+	all_exps = get_unique(qexp)
+	obj_exps = get_unique(qobj)
+
+	return all_exps - obj_exps
+
+def get_cells_with_dets_from_exps(db, explist, exp_tabname, det_tabname, fovradius=None):
+	""" Get all cells that may contain detections from within exposures
+	    listed in explist. If given, use fovradius (in degrees) as the
+	    radius of the field of view of each exposure, to limit the number
+	    of cells that are considered. If fovradius is None, assume the field
+	    of view of each exposure may extend to the entire sky.
+	"""
+	explist = frozenset(explist)
+
+	bb = {}
+	ti = intervalset()
+	for t, exp, lon, lat in db.query("_TIME, _EXP, _LON, _LAT from %s" % exp_tabname).iterate():
+		if exp not in explist:
+			continue
+
+		if fovradius is not None:
+			tt = np.floor(t)
+			fov = bounds.beam(lon, lat, fovradius)
+			try:
+				bb[tt] |= fov
+			except KeyError:
+				bb[tt] = fov
+		else:
+			ti.add((t-0.2, t+0.2))
+
+	if fovradius is None:
+		b = [(bounds.ALLSKY, ti)]
+	else:
+		b = []
+		for t0, fov in bb.iteritems():
+			b += [ (fov, intervalset((t0, t0+1.))) ]
+
+	# Fetch all detection table cells that are within this interval
+	det_cells = db.table(det_tabname).get_cells(bounds=b)
+
+	return det_cells
+
+def create_object_table(db, obj_tabname, det_tabname):
+	""" Create a new object table, linkage table, and the joins required
+	    to join it to detections table.
+	    
+	    Skip table creation if tables already exists, and overwrite joins
+	    if they already exist.
+	"""
+	# Create a new object table
+	o2d_tabname = '_%s_to_%s' % (obj_tabname, det_tabname)
+	obj_table = db.create_table(obj_tabname, obj_table_def, ignore_if_exists=True)
+	o2d_table = db.create_table(o2d_tabname, o2d_table_def, ignore_if_exists=True)
+
+	# Set up a one-to-X join relationship between the two tables (join obj_table:obj_id->det_table:det_id)
+	db.define_default_join(obj_tabname, det_tabname,
+		type = 'indirect',
+		m1   = (o2d_tabname, "obj_id"),
+		m2   = (o2d_tabname, "det_id"),
+		_overwrite = True
+			)
+
+	# Set up a join between the indirection table and detections table (det_table:det_id->o2d_table:o2d_id)
+	db.define_default_join(det_tabname, o2d_tabname,
+		type = 'indirect',
+		m1   = (o2d_tabname, "det_id"),
+		m2   = (o2d_tabname, "o2d_id"),
+		_overwrite = True
+		)
+
+	# Set up a join between the indirection table and detections table (det_table:det_id->o2d_table:o2d_id)
+	db.define_default_join(obj_tabname, o2d_tabname,
+		type = 'indirect',
+		m1   = (o2d_tabname, "obj_id"),
+		m2   = (o2d_tabname, "o2d_id"),
+		_overwrite = True
+		)
+
+def make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=1./3600., explist=None, fovradius=None):
+	""" Create the object catalog
+	"""
 
 	# For debugging -- a simple check to see if matching works is to rerun
 	# the match across a just matched table. In this case, we expect
 	# all detections to be matched to existing objects, and no new ones added.
 	_rematching = int(os.getenv('REMATCHING', False))
-	if _rematching:
-		create = False
-
-	det_table = db.table(det_tabname)
 
 	o2d_tabname = '_%s_to_%s' % (obj_tabname, det_tabname)
-
-	if create:
-		# Create the new object database
-		obj_table = db.create_table(obj_tabname, obj_table_def)
-		o2d_table = db.create_table(o2d_tabname, o2d_table_def)
-
-		# Set up a one-to-X join relationship between the two tables (join obj_table:obj_id->det_table:det_id)
-		db.define_default_join(obj_tabname, det_tabname,
-			type = 'indirect',
-			m1   = (o2d_tabname, "obj_id"),
-			m2   = (o2d_tabname, "det_id")
-			)
-		# Set up a join between the indirection table and detections table (det_table:det_id->o2d_table:o2d_id)
-		db.define_default_join(det_tabname, o2d_tabname,
-			type = 'indirect',
-			m1   = (o2d_tabname, "det_id"),
-			m2   = (o2d_tabname, "o2d_id")
-			)
-		# Set up a join between the indirection table and detections table (det_table:det_id->o2d_table:o2d_id)
-		db.define_default_join(obj_tabname, o2d_tabname,
-			type = 'indirect',
-			m1   = (o2d_tabname, "obj_id"),
-			m2   = (o2d_tabname, "o2d_id")
-			)
-	else:
-		obj_table = db.table(obj_tabname)
-		o2d_table = db.table(o2d_tabname)
+	det_table = db.table(det_tabname)
+	obj_table = db.table(obj_tabname)
+	o2d_table = db.table(o2d_tabname)
 
 	# Fetch all non-empty cells with detections. Group them by the same spatial
 	# cell ID. This will be the list over which the first kernel will map.
-	det_cells = det_table.get_cells()
+	if explist is None:
+		det_cells = det_table.get_cells()
+	else:
+		# Fetch only those cells that can contain data from the given exposure list
+		print >> sys.stderr, "Enumerating cells with new detections: ",
+		det_cells = get_cells_with_dets_from_exps(db, explist, exp_tabname, det_tabname, fovradius)
+	print "%d cells to process." % (len(det_cells))
 	det_cells_grouped = det_table.pix.group_cells_by_spatial(det_cells).items()
 
 	t0 = time.time()
@@ -681,7 +756,7 @@ def make_object_catalog(db, obj_tabname, det_tabname, radius=1./3600., create=Tr
 	at = 0
 	for (nexp, nobj, ndet, nnew, nmatch, ndetnc) in pool.map_reduce_chain(det_cells_grouped,
 					      [
-						(_obj_det_match, db, obj_tabname, det_tabname, o2d_tabname, radius, _rematching),
+						(_obj_det_match, db, obj_tabname, det_tabname, o2d_tabname, radius, explist, _rematching),
 					      ],
 					      progress_callback=pool2.progress_pass):
 		at += 1
@@ -699,6 +774,11 @@ def make_object_catalog(db, obj_tabname, det_tabname, radius=1./3600., create=Tr
 		pctmatch = 100. * nmatch / ndetnc if ndetnc else 0.
 		print "  match %7d det to %7d obj (%3d exps): %7d new (%6.2f%%), %7d matched (%6.2f%%)  [%.0f/%.0f min.]" % (ndet, nobj, nexp, nnew, pctnew, nmatch, pctmatch, time_pass, time_tot)
 
+	# Force invalidation of tablet tree caches as new tablets may have been added
+	db.table(obj_tabname).rebuild_tablet_tree_cache()
+	db.table(o2d_tabname).rebuild_tablet_tree_cache()
+
+	# Build neighbor caches
 	print >> sys.stderr, "Building neighbor cache for static sky: ",
 	db.build_neighbor_cache(obj_tabname)
 	print >> sys.stderr, "Building neighbor cache for indirection table: ",
@@ -714,7 +794,6 @@ def make_object_catalog(db, obj_tabname, det_tabname, radius=1./3600., create=Tr
 	print "Total of %d objects added." % (ntotobj)
 	print "Rows in the object table: %d." % (obj_table.nrows())
 	print "Rows in the detection table: %d." % (det_table.nrows())
-	assert not _rematching or det_table.nrows() == ntot
 
 def reserve_space(arr, minsize):
 	l = len(arr)
@@ -724,7 +803,7 @@ def reserve_space(arr, minsize):
 	arr.resize(l, refcheck=False)
 
 # Single-pass detections->objects mapper.
-def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, _rematching=False):
+def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, explist=None, _rematching=False):
 	"""
 	This kernel assumes:
 	   a) det_table and obj_table have equal partitioning (equally
@@ -819,7 +898,15 @@ def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, _re
 	det_query = db.query('_ID, _LON, _LAT, _EXP, _CACHED FROM %s' % det_tabname)
 	for det_cell in sorted(det_cells):
 		# fetch detections in this cell, convert to gnomonic coordinates
+		# keep only detections with _EXP in explist, unless explist is None
 		detections = det_query.fetch_cell(det_cell, include_cached=True)
+		if explist is not None:
+			keep = np.in1d(detections._EXP, explist)
+			if not np.all(keep):
+				detections = detections[keep]
+			if len(detections) == 0:
+				yield (None, None, None, None, None, None) # Yield just to have the progress counter properly incremented
+				continue
 		_, ra2, dec2, exposures, cached = detections.as_columns()
 		detections.add_column('xy', np.column_stack(gnomonic(ra2, dec2, clon, clat)))
 
@@ -863,6 +950,10 @@ def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, _re
 					tree = kdtree(xyobj)
 				match_idx, match_d2 = tree.knn(xydet, 1)
 				match_idx = match_idx[:,0]		# First neighbor only
+
+				####
+				#if np.uint64(13828114484734072082) in id2:
+				#	np.savetxt('bla.%d.static=%d.txt' % (det_cell, pix.static_cell_for_cell(det_cell)), objs.as_ndarray(), fmt='%s')
 
 				# Compute accurate distances, and select detections not matched to existing objects
 				dist       = gc_dist(objs['_LON'][match_idx], objs['_LAT'][match_idx], ra2, dec2)
@@ -960,5 +1051,89 @@ def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, _re
 		#       overlapping exposures within a cell; first one will add new objects, second one will match agains them)
 		yield (len(uexposures), nobj0, len(detections), nobjadded, len(join), (cached == False).sum())
 
-if __name__ == '__main__':
-	make_object_catalog('ps1_obj', 'ps1_det')
+###############################
+# Object table sanity checker
+
+def _sanity_check_object_table_mapper(qresult, radius, explist):
+	all_objs = np.empty(0, dtype=np.uint64)
+	havedet_objs = np.empty(0, dtype=np.uint64)
+
+	for rows in qresult:
+		# Prep work for checking #3, at the end.
+		# Collect all objects
+		objs = np.unique(rows.obj_id)					# Get unique IDs
+		objs = objs[~np.in1d(objs, all_objs, assume_unique=True)]	# Keep only those never before seen
+		all_objs = np.append(all_objs, objs)					# Append to a list of all objects
+
+		# Remove outer-joined rows
+		rows = rows[~rows.dnull]
+
+		# Prep work for checking #3, at the end.
+		# Collect objects with linked detections
+		objs = np.unique(rows.obj_id)
+		objs = objs[~np.in1d(objs, havedet_objs, assume_unique=True)]	# Keep only those never before seen
+		havedet_objs = np.append(havedet_objs, objs)			# Append to a list of having a detection
+
+		# Remove all detections that did not originate from explist
+		if explist is not None:
+			rows = rows[np.in1d(rows.exp_id, explist)]
+
+		# Check radius (cond #4)
+		dist = gc_dist(rows.olon, rows.olat, rows.dlon, rows.dlat)
+		assert np.all(dist < radius)
+
+		# Regroup by det_id's cell and yield to reducer.
+		# We do this because some det_id's from other cells may be linked
+		# to an object from this cell
+		cells = qresult.pix.cell_for_id(rows.det_id)
+		for cell_id in np.unique(cells):
+			yield (cell_id, rows[("det_id", "obj_id")][cells == cell_id])
+
+	# Check that each object has exactly one detection (cond #3)
+	all_objs.sort()
+	havedet_objs.sort()
+	assert np.all(all_objs == havedet_objs)
+
+def _sanity_check_object_table_reducer(kv, db, det_tabname, explist):
+	cell_id, rowlist = kv
+	rows = colgroup.fromiter(rowlist, blocks=True)
+	rows.sort(["det_id"])
+
+	# Verify that each detection appears only once (cond #1)
+	if not np.all(np.diff(rows.det_id) != 0):
+		#a1 = np.arange(len(rows))[np.diff(rows.det_id) == 0]
+		with open("cell.%s.txt" % cell_id, 'w') as fp:
+			for row in rows:
+				fp.write("%s\t%s\n" % (row['det_id'], row['obj_id']))
+		print "ERROR -- same detection assigned to multiple objects"
+		x = rows.det_id
+		a1 = np.arange(len(x))[np.diff(x) == 0]
+		print rows[a1]
+		print rows[a1+1]
+	#assert np.all(np.diff(rows.det_id) != 0)
+
+	# Verify that all detections in this cell are linked (cond #2)
+	# This can be restricted to only detections from exposures existing in explist
+	det_rows = db.query("_ID as det_id, _EXP as exp_id FROM '%s'" % det_tabname).fetch_cell(cell_id)
+	if explist is not None:
+		det_rows = det_rows[np.in1d(det_rows.exp_id, explist)]
+	det_rows.sort(["det_id"])
+	assert np.all(np.unique(rows.det_id) == det_rows.det_id), "Not all detections were linked to objects (need to rerun make-object-catalog?): nlinked=%d ntotal=%d cell_id=%s" % (len(rows.det_id), len(det_rows), cell_id)
+
+	yield True
+
+def sanity_check_object_table(db, obj_tabname, det_tabname, radius, explist=None):
+	"""
+		Verify the following:
+		1. Each detection is linked to a single object
+		2. Every detection is linked exactly once
+		3. Each object has at least one detection linked to it
+		4. Each detection is within radius of its parent object
+	"""
+
+	qstr = "obj._ID as obj_id, det._ID as det_id, obj._LON as olon, obj._LAT as olat, det._LON as dlon, det._LAT as dlat, det._ISNULL as dnull, det._EXP as exp_id FROM {obj} as obj, {det}(outer) as det".format(obj=obj_tabname, det=det_tabname)
+	for result in db.query(qstr).execute([
+			(_sanity_check_object_table_mapper, radius, explist),
+			(_sanity_check_object_table_reducer, db, det_tabname, explist)
+		], group_by_static_cell=True):
+		pass
