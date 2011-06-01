@@ -1778,10 +1778,15 @@ class DB(object):
 		This is an internal function; do not use it.
 		"""
 		tablist = []
+		tables_by_path = {}
 
 		# Find the tables involved in the query and instantiate them
 		for tabname, tabpath, join_args in from_clause:
-			tablist.append( ( tabname, (TableEntry(self.table(tabpath), tabname), join_args[0]) ) )
+			entry = TableEntry(self.table(tabpath), tabname)
+			te = ( tabname, (entry, join_args[0]) )
+
+			tablist.append(te)
+			tables_by_path[entry.table.path] = te[1]
 		tables = dict(tablist)
 
 		# Discover and set up JOIN links based on defined JOIN relations
@@ -1799,21 +1804,25 @@ class DB(object):
 			else:
 				# Check for tables that can be joined onto this one (where this one is on the right hand side of the relation)
 				# Look for default .join files named ".<tabname>:*.join"
-				for dbpath in self.path:
-					pattern = "%s/.%s:*.join" % (dbpath, tabname)
-					for fn in glob.iglob(pattern):
-						jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
-						if jtabname not in tables:
-							continue
+				dbpath = os.path.dirname(e.table.path)	# Look only in the table's dbdir
 
-						je, jargs = tables[jtabname]
-						if 'matchedto' in jargs:	# Explicitly joined
-							continue
-						if je.relation is not None:	# Already joined
-							continue
+				pattern = "%s/.%s:*.join" % (dbpath, e.table.name)
+				for fn in glob.iglob(pattern):
+					jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
+					jpath = "%s/%s" % (dbpath, jtabname)
 
-						je.relation = create_join(self, fn, jargs, e.table, je.table)
-						e.joins.append(je)
+					try:
+						je, jargs = tables_by_path[jpath]
+					except KeyError:
+						continue
+
+					if 'matchedto' in jargs:	# Explicitly joined
+						continue
+					if je.relation is not None:	# Already joined
+						continue
+
+					je.relation = create_join(self, fn, jargs, e.table, je.table)
+					e.joins.append(je)
 
 		# Discover the root (the one and only one table that has no links pointing to it)
 		root = None
