@@ -48,12 +48,12 @@ class TabletCache:
 	"""
 	cache = {}		# Cache of loaded tables, in the form of cache[cell_id][include_cached][table][cgroup] = rows
 
-	root_name = None	# The name of the root table (string). Used for figuring out if _not_ to load the cached rows.
+	root_path = None	# The name of the root table (string). Used for figuring out if _not_ to load the cached rows.
 	include_cached = False	# Should we load the cached rows from the root table?
 
-	def __init__(self, root_name, include_cached = False):
+	def __init__(self, root_path, include_cached = False):
 		self.cache = {}
-		self.root_name = root_name
+		self.root_path = root_path
 		self.include_cached = include_cached
 
 	def load_column(self, cell_id, name, table, autoexpand=True, resolve_blobs=False):
@@ -61,7 +61,7 @@ class TabletCache:
 		# Load its tablet if necessary, and cache it for further reuse.
 		#
 		# NOTE: Unless resolve_blobs=True, this method DOES NOT resolve blobrefs to BLOBs
-		include_cached = self.include_cached if table.name == self.root_name else True
+		include_cached = self.include_cached if table.path == self.root_path else True
 
 		# Resolve a column name alias
 		name = table.resolve_alias(name)
@@ -105,7 +105,7 @@ class TabletCache:
 		# will not be cached.
 
 		if table.columns[name].is_blob:
-			include_cached = self.include_cached if table.name == self.root_name else True
+			include_cached = self.include_cached if table.path == self.root_path else True
 			col = table.fetch_blobs(cell_id, column=name, refs=col, include_cached=include_cached)
 
 		return col
@@ -676,7 +676,7 @@ class QueryInstance(object):
 		self.cell_id	= cell_id
 		self.bounds	= bounds
 
-		self.tcache	= TabletCache(self.root.name, include_cached)
+		self.tcache	= TabletCache(self.root.table.path, include_cached)
 		self.columns	= {}
 		
 	def peek(self):
@@ -845,14 +845,31 @@ class QueryInstance(object):
 			tables.extend(( (name, table) for name, table in self.tables.iteritems() if name != self.root.name ))
 			colname = name
 		else:
-			# Force lookup of a specific table
-			(tabname, colname) = name.split('.')
-			tables = [ (tabname, self.tables[tabname]) ]
+			# Force lookup of a specific table + column ...
+			ns = name.split('.')
+			(tabname, colname) = '.'.join(ns[:-1]), ns[-1]
+			try:
+				tables = [ (tabname, self.tables[tabname]) ]
+			except KeyError:
+				# ... or dbdir + table
+				if tabname == "db":
+					colname = name
+					tables = []
+				else:
+					raise
 		for (tabname, e) in tables:
 			colname = e.table.resolve_alias(colname)
 			if colname in e.table.columns:
 				self[name] = self.load_column(colname, tabname)
 				return self.columns[name]
+
+		# A name of a table? Return a proxy object
+		if name in self.tables:
+			return TableProxy(self, name)
+
+		# A name of a dbdir? Also return a proxy
+		if name == "db":
+			return TableProxy(self, name)
 
 		# A query pseudocolumn?
 		if name in ['_ROWNUM', '_CELLID', '_CELLPATH']:
@@ -863,10 +880,6 @@ class QueryInstance(object):
 		# Note that these _must_ be prefixed by table name
 		if name.find('.') != -1 and name in self.jmap:
 			return self.jmap[name]
-
-		# A name of a table? Return a proxy object
-		if name in self.tables:
-			return TableProxy(self, name)
 
 		# Is this one of the local variables passed in by the user?
 		if name in self.locals:
@@ -909,7 +922,7 @@ class IntoWriter(object):
 		# Auto-create a tablet cache if needed
 		if self._tcache is None:
 			into_table   = self.into_clause[0]
-			self._tcache = TabletCache(into_table, False)
+			self._tcache = TabletCache(self.db.table(into_table).path, False)
 		return self._tcache
 
 	#########
@@ -1492,10 +1505,11 @@ class DB(object):
 		Tip: To create a new, empty, database, simply make a new
 		     empty directory.
 		"""
-		self.path = path
+		self.path = path.split(':')
 
-		if not os.path.isdir(path):
-			raise Exception('"%s" is not an acessible directory.' % (path))
+		for path in self.path:
+			if not os.path.isdir(path):
+				raise Exception('"%s" is not an acessible directory.' % (path))
 
 		self.tables = dict()	# A cache of table instances
 
@@ -1503,13 +1517,14 @@ class DB(object):
 	def lock(self, retries=-1):
 		"""
 		Lock the entire database for table or join creation/removal
-		operations.
+		operations. If more than one database directory exists in
+		self.path, the lock is created in the first one.
 
 		TODO: Only DB.create_into_tables() obeys this lock so far.
 		      Make other ops that create tables obey it as well.
 		"""
 		# create a lock file
-		lockfile = self.path + '/dblock.lock'
+		lockfile = self.path[0] + '/dblock.lock'
 		utils.shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, lockfile) )
 
 		# yield self
@@ -1624,6 +1639,9 @@ class DB(object):
 		FROM clause of a query. NOTE: For forward compatibility,
 		define such joins using DB.define_default_join()
 	
+		If more than one database directory exists in self.path,
+		the .join file is defined in the first one.
+
 		type=indirect
 		-------------
 		If type == 'indirect', the join being defined is an
@@ -1683,7 +1701,7 @@ class DB(object):
 		#	- direct joins:				Example: ps1_obj:ps1_calib.join.json	(!!!NOT IMPLEMENTED!!!)
 		#		type:	direct			"type": "direct"
 
-		fname = '%s/%s.join' % (self.path, name)
+		fname = '%s/%s.join' % (self.path[0], name)
 		if os.access(fname, os.F_OK):
 			raise Exception('Join relation %s already exist (in file %s)' % (name, fname))
 
@@ -1728,11 +1746,26 @@ class DB(object):
 		      that).
 		"""
 		if tabname not in self.tables:
-			path = '%s/%s' % (self.path, tabname)
-			if not create:
-				self.tables[tabname] = Table(path)
-			else:
+			if create:
+				path = '%s/%s' % (self.path[0], tabname)
 				self.tables[tabname] = Table(path, name=tabname, mode='c')
+			else:
+				# Find the table. Allow the database to be specified
+				# using db.tablename syntax
+				if tabname.find('.') != -1:
+					dbdir, tn = tabname.split('.')
+				else:
+					dbdir, tn = None, tabname
+
+				for dbpath in self.path:
+					if dbdir is not None:
+						dbpath = '/'.join(dbpath.split('/')[:-1] + [ dbdir ])
+					path = '%s/%s' % (dbpath, tn)
+					if os.path.isdir(path):
+						self.tables[tabname] = Table(path)
+						break
+				else:
+					raise IOError("Table %s not found in %s" % (tabname, ':'.join(self.path)))
 		else:
 			assert not create
 
@@ -1766,21 +1799,22 @@ class DB(object):
 			else:
 				# Check for tables that can be joined onto this one (where this one is on the right hand side of the relation)
 				# Look for default .join files named ".<tabname>:*.join"
-				pattern = "%s/.%s:*.join" % (self.path, tabname)
-				for fn in glob.iglob(pattern):
-					jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
-					if jtabname not in tables:
-						continue
+				for dbpath in self.path:
+					pattern = "%s/.%s:*.join" % (dbpath, tabname)
+					for fn in glob.iglob(pattern):
+						jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
+						if jtabname not in tables:
+							continue
 
-					je, jargs = tables[jtabname]
-					if 'matchedto' in jargs:	# Explicitly joined
-						continue
-					if je.relation is not None:	# Already joined
-						continue
+						je, jargs = tables[jtabname]
+						if 'matchedto' in jargs:	# Explicitly joined
+							continue
+						if je.relation is not None:	# Already joined
+							continue
 
-					je.relation = create_join(self, fn, jargs, e.table, je.table)
-					e.joins.append(je)
-	
+						je.relation = create_join(self, fn, jargs, e.table, je.table)
+						e.joins.append(je)
+
 		# Discover the root (the one and only one table that has no links pointing to it)
 		root = None
 		for _, (e, jargs) in tables.iteritems():
