@@ -48,12 +48,12 @@ class TabletCache:
 	"""
 	cache = {}		# Cache of loaded tables, in the form of cache[cell_id][include_cached][table][cgroup] = rows
 
-	root_name = None	# The name of the root table (string). Used for figuring out if _not_ to load the cached rows.
+	root_path = None	# The name of the root table (string). Used for figuring out if _not_ to load the cached rows.
 	include_cached = False	# Should we load the cached rows from the root table?
 
-	def __init__(self, root_name, include_cached = False):
+	def __init__(self, root_path, include_cached = False):
 		self.cache = {}
-		self.root_name = root_name
+		self.root_path = root_path
 		self.include_cached = include_cached
 
 	def load_column(self, cell_id, name, table, autoexpand=True, resolve_blobs=False):
@@ -61,8 +61,7 @@ class TabletCache:
 		# Load its tablet if necessary, and cache it for further reuse.
 		#
 		# NOTE: Unless resolve_blobs=True, this method DOES NOT resolve blobrefs to BLOBs
-		include_cached = self.include_cached if table.name == self.root_name else True
-		print "XXXX", table.name, self.root_name, include_cached
+		include_cached = self.include_cached if table.path == self.root_path else True
 
 		# Resolve a column name alias
 		name = table.resolve_alias(name)
@@ -106,7 +105,7 @@ class TabletCache:
 		# will not be cached.
 
 		if table.columns[name].is_blob:
-			include_cached = self.include_cached if table.name == self.root_name else True
+			include_cached = self.include_cached if table.path == self.root_path else True
 			col = table.fetch_blobs(cell_id, column=name, refs=col, include_cached=include_cached)
 
 		return col
@@ -677,7 +676,7 @@ class QueryInstance(object):
 		self.cell_id	= cell_id
 		self.bounds	= bounds
 
-		self.tcache	= TabletCache(self.root.name, include_cached)
+		self.tcache	= TabletCache(self.root.table.path, include_cached)
 		self.columns	= {}
 		
 	def peek(self):
@@ -923,7 +922,7 @@ class IntoWriter(object):
 		# Auto-create a tablet cache if needed
 		if self._tcache is None:
 			into_table   = self.into_clause[0]
-			self._tcache = TabletCache(into_table, False)
+			self._tcache = TabletCache(self.db.table(into_table).path, False)
 		return self._tcache
 
 	#########
@@ -1766,7 +1765,7 @@ class DB(object):
 						self.tables[tabname] = Table(path)
 						break
 				else:
-					raise Exception("Table %s not found in %s" % (tabname, ':'.join(self.path)))
+					raise IOError("Table %s not found in %s" % (tabname, ':'.join(self.path)))
 		else:
 			assert not create
 
