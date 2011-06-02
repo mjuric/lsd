@@ -686,6 +686,7 @@ def make_object_catalog(db, obj_tabname, det_tabname, radius=1./3600., create=Tr
 		for row in db.query("_CELLID FROM '%s' WHERE mjd_import > %d" % (det_tabname, MJD_of_last_import)).iterate():
 			det_cells.append(row[0])
 		det_cells = list(set(det_cells))
+	det_cells_grouped = det_table.pix.group_cells_by_spatial(det_cells).items()
 
 	t0 = time.time()
 	pool = pool2.Pool()
