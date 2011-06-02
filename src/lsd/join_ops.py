@@ -355,6 +355,45 @@ class TableEntry:
 	def __str__(self):
 		return self._str_tree(0)
 
+def native_join(id1, id2, kind, cg):
+	"""
+		Helper that performs a join of tables R and S on a common row
+		whose values are given in id1 (for R) and id2 (for S).
+			
+		Join kind can be either 'inner' or 'outer'.
+
+		The id1<->id2 mapping is given by (cg.m1, cg.m2) tuples.
+			
+		Returned are arrays idx1 and idx2, that can be used to constitute
+		a new table by stacking columns produced by R[idx1] and S[idx2].
+
+		Also returned is cg, that has and _ISNULL column == True for
+		each row in the joined table where S's columns were NULL (because
+		of the outer join). cg can also contain additional information,
+		if given on input (e.g., _DIST or _NR).
+	"""
+	(idx1, idx2, idxLink, isnull) = native.table_join(id1, id2, cg.m1, cg.m2, kind)
+
+	if len(cg) > 0:
+		assert np.all(idxLink < len(cg))
+	else:
+		assert np.all(idxLink == 0)
+		assert np.all(idx2 == 0)
+		assert np.all(isnull)
+		cg.resize(1)
+
+	cg = cg[idxLink]
+	cg._ISNULL = isnull
+	del cg.m1, cg.m2
+
+	# Null-out the columns that are NULL
+	for colname in cg.keys():
+		if colname == '_ISNULL':
+			continue
+		set_NULL(cg[colname], cg._ISNULL)
+
+	return (idx1, idx2, cg)
+
 class JoinRelation:
 	kind   = 'inner'
 	db     = None	# Controlling database instance
@@ -434,21 +473,8 @@ class IndirectJoin(JoinRelation):
 
 		id1 = tcache.load_column(cell_id, self.tableR.get_primary_key(), self.tableR)[idx1]
 		id2 = tcache.load_column(cell_id, self.tableS.get_primary_key(), self.tableS)[idx2]
-		
-		(idx1, idx2, idxLink, isnull) = native.table_join(id1, id2, cg.m1, cg.m2, self.kind)
-		assert np.all(idxLink < len(cg))
 
-		cg = cg[idxLink]
-		cg._ISNULL = isnull
-		del cg.m1, cg.m2
-
-		# Null-out the columns that are NULL
-		for colname in cg.keys():
-			if colname == '_ISNULL':
-				continue
-			set_NULL(cg[colname], cg._ISNULL)
-
-		return (idx1, idx2, cg)
+		return native_join(id1, id2, self.kind, cg)
 
 	def __init__(self, db, tableR, tableS, **joindef):
 		JoinRelation.__init__(self, db, tableR, tableS, **joindef)
@@ -533,20 +559,7 @@ class CrossmatchJoin(JoinRelation):
 		# Perform the join
 		assert idx1.dtype == idx2.dtype == np.int64
 		id1, id2 = idx1.view(np.uint64), idx2.view(np.uint64) # Because native.table_join expects uint64 data
-		(idx1, idx2, idxLink, isnull) = native.table_join(id1, id2, join.m1, join.m2, self.kind)
-		assert np.all(idxLink < len(join)), (len(join), np.max(idxLink), idxLink, idx1, idx2, id1, id2)
-
-		join = join[idxLink]
-		join._ISNULL = isnull
-		del join.m1, join.m2
-
-		# Null-out the columns that are NULL
-		for colname in join.keys():
-			if colname == '_ISNULL':
-				continue
-			set_NULL(join[colname], join._ISNULL)
-
-		return (idx1, idx2, join)
+		return native_join(id1, id2, self.kind, join)
 
 #class EquijoinJoin(IndirectJoin):
 #	def __init__(self, db, tableR, tableS, kind, **joindef):
