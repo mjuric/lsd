@@ -279,20 +279,9 @@ class TableEntry:
 				r.drop_column('_INBOUNDS')
 			# Add a dummy _ISNULL column for root table (simplifies the code later on)
 			r["%s._ISNULL" % (self.name)] = np.zeros(len(r), dtype='bool')
-			# Sort the jmap to make the adjacent joined rows show up together in output
-			#       and be sorted by neighbor rank (if it exists)
-			# TODO: Do we really want to waste cycles on this, or is the user the one
-			#       who should to the sorting if they need it?
-			primkeys = [ key for key in r.keys() if key.endswith("._ID") ]
-			sortkeys = []
-			keys = r.keys()
-			for k in primkeys:
-				nrk = k[:-4] + "._NR"
-				if nrk in keys:
-					sortkeys.append(nrk)
-				sortkeys.append(k)
-			r.sort(sortkeys)
+
 			# Drop the primary keys, they're not needed any more
+			primkeys = [ key for key in r.keys() if key.endswith("._ID") ]
 			for k in primkeys:
 				r.drop_column(k)
 
@@ -774,6 +763,34 @@ class QueryInstance(object):
 
 	#################
 
+	def _optimize_idx_and_null(self, idx, isnull):
+		# Profiling showed that indexing ndarrays with other ndarrays
+		# is time-consuming. This function attempts to "compress" the
+		# index array to a simple slice.
+
+		# Optimize idx
+		if len(idx) and np.all(np.diff(idx) == 1):
+			# Block of consecutive indices
+			optimized_idx = np.s_[idx[0]:idx[-1]+1]
+		else:
+			# Unoptimizable
+			optimized_idx = idx
+
+		# Optimize NULLs
+		if np.any(isnull):
+			# Some NULLs
+			if np.all(isnull):
+				# All NULLs
+				optimized_isnull = None
+			else:
+				# Some NULLs
+				optimized_isnull = isnull
+		else:
+			# No NULLs
+			optimized_isnull = []
+
+		return optimized_idx, optimized_isnull
+
 	def load_column(self, name, tabname):
 		# If we're just peeking, construct the column from schema
 		if self.cell_id is None:
@@ -799,11 +816,21 @@ class QueryInstance(object):
 				isnullKey = tabname + '._ISNULL'
 				idx       = self.jmap[tabname]
 				if len(col):
-					# TODO: We can optimize here by remembering if np.all(isnull == 0) and if idx=arange(...)
-					# and storing that into self.jmap.info
-					col = col[idx]
-					isnull = self.jmap[isnullKey]
-					set_NULL(col, isnull)
+					# Optimization: Try to convert idx and isnull arays into slices, if possible
+					try:
+						(optimized_idx, optimized_isnull) = getattr(self.jmap.info, tabname)
+					except AttributeError:
+						(optimized_idx, optimized_isnull) = self._optimize_idx_and_null(idx, self.jmap[isnullKey])
+						setattr(self.jmap.info, tabname, (optimized_idx, optimized_isnull))
+
+					if optimized_isnull is not None:
+						# Regular slicing
+						col = col[optimized_idx]
+						set_NULL(col, optimized_isnull)
+					else:
+						# The entire column is NULL
+						col = np.empty(shape=(len(idx),) + col.shape[1:], dtype=col.dtype)
+						set_NULL(col)
 				elif len(idx):
 					# This tablet is empty, but columns show up here because of an OUTER join.
 					# Just return NULLs of proper dtype
