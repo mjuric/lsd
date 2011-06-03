@@ -12,10 +12,6 @@ from colgroup import ColGroup
 import sys, os
 import logging
 import utils
-import bounds
-from interval import intervalset
-from garbage_dump import dump_garbage
-import gc
 
 logger = logging.getLogger("lsd.smf")
 
@@ -682,15 +678,14 @@ def make_object_catalog(db, obj_tabname, det_tabname, radius=1./3600., create=Tr
 	else:
 		MJD_of_last_import = 0
 	if create:
-#		det_cells = det_table.get_cells()
-		det_cells = det_table.get_cells(bounds=[(bounds.ALLSKY, intervalset((-np.inf, 55562)))])
+		det_cells = det_table.get_cells()
+#		det_cells = det_table.get_cells(bounds=[(bounds.ALLSKY, intervalset((-np.inf, 55562)))])
 	else:
-		det_cells = det_table.get_cells(bounds=[(bounds.ALLSKY, intervalset((55563, np.inf)))])
-#		det_cells = []
-#		for row in db.query("_CELLID FROM '%s' WHERE mjd_import > %d" % (det_tabname, MJD_of_last_import)).iterate():
-#			det_cells.append(row[0])
-#		det_cells = list(set(det_cells))
-
+#		det_cells = det_table.get_cells(bounds=[(bounds.ALLSKY, intervalset((55563, np.inf)))])
+		det_cells = []
+		for row in db.query("_CELLID FROM '%s' WHERE mjd_import > %d" % (det_tabname, MJD_of_last_import)).iterate():
+			det_cells.append(row[0])
+		det_cells = list(set(det_cells))
 	det_cells_grouped = det_table.pix.group_cells_by_spatial(det_cells).items()
 
 	t0 = time.time()
@@ -717,12 +712,6 @@ def make_object_catalog(db, obj_tabname, det_tabname, radius=1./3600., create=Tr
 		pctnew   = 100. * nnew / nobjnew  if nobjnew else 0.
 		pctmatch = 100. * nmatch / ndetnc if ndetnc else 0.
 		print "  match %7d det to %7d obj (%3d exps): %7d new (%6.2f%%), %7d matched (%6.2f%%)  [%.0f/%.0f min.]" % (ndet, nobj, nexp, nnew, pctnew, nmatch, pctmatch, time_pass, time_tot)
-        # show the dirt ;-)
-#        if at % 100. == 0:
-#            gc.collect()
-#            n_collected = gc.collect()
-#            if n_collected > 0:
-#                dump_garbage()
 
 	print >> sys.stderr, "Building neighbor cache for static sky: ",
 	db.build_neighbor_cache(obj_tabname)
