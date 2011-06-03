@@ -27,6 +27,10 @@ BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 1000 * 2**30
 # OS X HFS+ filesystem does not support sparse files
 back_to_disk = platform.system() != 'Darwin'
 
+# allow diskless operation with LSD_DISKLESS environment variable
+if os.getenv("LSD_DISKLESS") == "1":
+	back_to_disk = False
+
 def _profiled_worker(*args, **kwargs):
 	import cProfile, time
 
