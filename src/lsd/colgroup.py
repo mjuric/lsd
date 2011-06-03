@@ -147,6 +147,12 @@ class ColGroup(object):
 		"""
 		self.drop_column(name)
 
+	def _get_slice(self, key):
+		cg = ColGroup(info=self.info)
+		cg.column_map = self.column_map.copy()
+		cg.column_data = [ data[key] for data in self.column_data ]
+		return cg
+
 	def __getitem__(self, key):
 		"""
 		Slicing and indexing.
@@ -176,27 +182,21 @@ class ColGroup(object):
 			# (I personally think that's an annoying inconsistency in numpy)
 			assert len(key) == 0
 			key = np.s_[:]
-		ret = [ (self.column_map[pos], col[key])   for (pos, col) in enumerate(self.column_data) ]
 
 		# Return a ColGroup if the key was an instance of a slice or ndarray,
 		# and numpy.void structure otherwise
 		if isinstance(key, slice) or isinstance(key, np.ndarray):
-			# This turned out to be slow (reported by eschlafly)...
-			#return ColGroup(ret)
-			# ... replaced by optimized ColGroup-to-ColGroup copying
-			cg = ColGroup(info=self.info)
-			cg.column_map = self.column_map.copy()
-			cg.column_data = [ data[key] for data in self.column_data ]
-			return cg
+			return self._get_slice(key)
 		else:
 			#row = self.row.copy()
 			row = make_record(self.dtype)
-			for name, val in ret:
+			for pos, col in enumerate(self.column_data):
+				name = self.column_map[pos]
 				# Special care for vector columns
 				if isinstance(val, np.ndarray):
-					row[name][:] = val
+					row[name][:] = col[key]
 				else:
-					row[name] = val
+					row[name] = col[key]
 			return row
 
 	def drop_column(self, key):

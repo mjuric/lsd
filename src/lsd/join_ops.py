@@ -169,7 +169,6 @@ class TableEntry:
 					c1, c2 = cells, cc
 				cells = ret
 			elif op == 'or':
-				print "or"
 				for cell_id, cbounds in cc.iteritems():
 					assert cell_id not in cells or cells[cell_id] == cbounds # TODO: Debugging -- make sure the timespace constraints are the same
 #					if not (cell_id not in cells or cells[cell_id] == cbounds): # TODO: Debugging -- make sure the timespace constraints are the same
@@ -279,20 +278,9 @@ class TableEntry:
 				r.drop_column('_INBOUNDS')
 			# Add a dummy _ISNULL column for root table (simplifies the code later on)
 			r["%s._ISNULL" % (self.name)] = np.zeros(len(r), dtype='bool')
-			# Sort the jmap to make the adjacent joined rows show up together in output
-			#       and be sorted by neighbor rank (if it exists)
-			# TODO: Do we really want to waste cycles on this, or is the user the one
-			#       who should to the sorting if they need it?
-			primkeys = [ key for key in r.keys() if key.endswith("._ID") ]
-			sortkeys = []
-			keys = r.keys()
-			for k in primkeys:
-				nrk = k[:-4] + "._NR"
-				if nrk in keys:
-					sortkeys.append(nrk)
-				sortkeys.append(k)
-			r.sort(sortkeys)
+
 			# Drop the primary keys, they're not needed any more
+			primkeys = [ key for key in r.keys() if key.endswith("._ID") ]
 			for k in primkeys:
 				r.drop_column(k)
 
@@ -354,6 +342,45 @@ class TableEntry:
 
 	def __str__(self):
 		return self._str_tree(0)
+
+def native_join(id1, id2, kind, cg):
+	"""
+		Helper that performs a join of tables R and S on a common row
+		whose values are given in id1 (for R) and id2 (for S).
+			
+		Join kind can be either 'inner' or 'outer'.
+
+		The id1<->id2 mapping is given by (cg.m1, cg.m2) tuples.
+			
+		Returned are arrays idx1 and idx2, that can be used to constitute
+		a new table by stacking columns produced by R[idx1] and S[idx2].
+
+		Also returned is cg, that has and _ISNULL column == True for
+		each row in the joined table where S's columns were NULL (because
+		of the outer join). cg can also contain additional information,
+		if given on input (e.g., _DIST or _NR).
+	"""
+	(idx1, idx2, idxLink, isnull) = native.table_join(id1, id2, cg.m1, cg.m2, kind)
+
+	if len(cg) > 0:
+		assert np.all(idxLink < len(cg))
+	else:
+		assert np.all(idxLink == 0)
+		assert np.all(idx2 == 0)
+		assert np.all(isnull)
+		cg.resize(1)
+
+	cg = cg[idxLink]
+	cg._ISNULL = isnull
+	del cg.m1, cg.m2
+
+	# Null-out the columns that are NULL
+	for colname in cg.keys():
+		if colname == '_ISNULL':
+			continue
+		set_NULL(cg[colname], cg._ISNULL)
+
+	return (idx1, idx2, cg)
 
 class JoinRelation:
 	kind   = 'inner'
@@ -434,21 +461,8 @@ class IndirectJoin(JoinRelation):
 
 		id1 = tcache.load_column(cell_id, self.tableR.get_primary_key(), self.tableR)[idx1]
 		id2 = tcache.load_column(cell_id, self.tableS.get_primary_key(), self.tableS)[idx2]
-		
-		(idx1, idx2, idxLink, isnull) = native.table_join(id1, id2, cg.m1, cg.m2, self.kind)
-		assert np.all(idxLink < len(cg))
 
-		cg = cg[idxLink]
-		cg._ISNULL = isnull
-		del cg.m1, cg.m2
-
-		# Null-out the columns that are NULL
-		for colname in cg.keys():
-			if colname == '_ISNULL':
-				continue
-			set_NULL(cg[colname], cg._ISNULL)
-
-		return (idx1, idx2, cg)
+		return native_join(id1, id2, self.kind, cg)
 
 	def __init__(self, db, tableR, tableS, **joindef):
 		JoinRelation.__init__(self, db, tableR, tableS, **joindef)
@@ -533,20 +547,7 @@ class CrossmatchJoin(JoinRelation):
 		# Perform the join
 		assert idx1.dtype == idx2.dtype == np.int64
 		id1, id2 = idx1.view(np.uint64), idx2.view(np.uint64) # Because native.table_join expects uint64 data
-		(idx1, idx2, idxLink, isnull) = native.table_join(id1, id2, join.m1, join.m2, self.kind)
-		assert np.all(idxLink < len(join)), (len(join), np.max(idxLink), idxLink, idx1, idx2, id1, id2)
-
-		join = join[idxLink]
-		join._ISNULL = isnull
-		del join.m1, join.m2
-
-		# Null-out the columns that are NULL
-		for colname in join.keys():
-			if colname == '_ISNULL':
-				continue
-			set_NULL(join[colname], join._ISNULL)
-
-		return (idx1, idx2, join)
+		return native_join(id1, id2, self.kind, join)
 
 #class EquijoinJoin(IndirectJoin):
 #	def __init__(self, db, tableR, tableS, kind, **joindef):
@@ -761,6 +762,34 @@ class QueryInstance(object):
 
 	#################
 
+	def _optimize_idx_and_null(self, idx, isnull):
+		# Profiling showed that indexing ndarrays with other ndarrays
+		# is time-consuming. This function attempts to "compress" the
+		# index array to a simple slice.
+
+		# Optimize idx
+		if len(idx) and np.all(np.diff(idx) == 1):
+			# Block of consecutive indices
+			optimized_idx = np.s_[idx[0]:idx[-1]+1]
+		else:
+			# Unoptimizable
+			optimized_idx = idx
+
+		# Optimize NULLs
+		if np.any(isnull):
+			# Some NULLs
+			if np.all(isnull):
+				# All NULLs
+				optimized_isnull = None
+			else:
+				# Some NULLs
+				optimized_isnull = isnull
+		else:
+			# No NULLs
+			optimized_isnull = []
+
+		return optimized_idx, optimized_isnull
+
 	def load_column(self, name, tabname):
 		# If we're just peeking, construct the column from schema
 		if self.cell_id is None:
@@ -786,11 +815,21 @@ class QueryInstance(object):
 				isnullKey = tabname + '._ISNULL'
 				idx       = self.jmap[tabname]
 				if len(col):
-					# TODO: We can optimize here by remembering if np.all(isnull == 0) and if idx=arange(...)
-					# and storing that into self.jmap.info
-					col = col[idx]
-					isnull = self.jmap[isnullKey]
-					set_NULL(col, isnull)
+					# Optimization: Try to convert idx and isnull arays into slices, if possible
+					try:
+						(optimized_idx, optimized_isnull) = getattr(self.jmap.info, tabname)
+					except AttributeError:
+						(optimized_idx, optimized_isnull) = self._optimize_idx_and_null(idx, self.jmap[isnullKey])
+						setattr(self.jmap.info, tabname, (optimized_idx, optimized_isnull))
+
+					if optimized_isnull is not None:
+						# Regular slicing
+						col = col[optimized_idx]
+						set_NULL(col, optimized_isnull)
+					else:
+						# The entire column is NULL
+						col = np.empty(shape=(len(idx),) + col.shape[1:], dtype=col.dtype)
+						set_NULL(col)
 				elif len(idx):
 					# This tablet is empty, but columns show up here because of an OUTER join.
 					# Just return NULLs of proper dtype
@@ -1343,7 +1382,7 @@ class Query(object):
 
 		# Tell _mapper not to test spacetime boundaries if the user requested so
 		if not testbounds:
-			partspecs = dict([ (cell_id, None) for (cell_id, _) in partspecs.iteritems() ])
+			partspecs = dict([ (cell_id, [(None, None)]) for (cell_id, _) in partspecs.iteritems() ])
 
 		# Reorganize cells to a per-static-cell basis, if requested
 		if group_by_static_cell:
@@ -1584,7 +1623,7 @@ class DB(object):
 
 		table.create_cgroup(tname, schema)
 
-	def create_table(self, tabname, tabdef):
+	def create_table(self, tabname, tabdef, ignore_if_exists=False):
 		"""
 		Creates a table, given the LSD Table Definition.
 
@@ -1596,6 +1635,10 @@ class DB(object):
 		look into lsd.smf and lsd.sdss modules to see some examples
 		of table definitions.
 		"""
+
+		if ignore_if_exists and self.table_exists(tabname):
+			return self.table(tabname)
+		
 		table = self.table(tabname, create=True)
 
 		# Add fgroups
@@ -1624,7 +1667,7 @@ class DB(object):
 
 		return table
 
-	def define_join(self, name, type, **joindef):
+	def define_join(self, name, type, _overwrite=False, **joindef):
 		"""
 		Define how two tables are joined.
 
@@ -1702,7 +1745,7 @@ class DB(object):
 		#		type:	direct			"type": "direct"
 
 		fname = '%s/%s.join' % (self.path[0], name)
-		if os.access(fname, os.F_OK):
+		if not _overwrite and os.access(fname, os.F_OK):
 			raise Exception('Join relation %s already exist (in file %s)' % (name, fname))
 
 		joindef['type'] = type
@@ -1711,14 +1754,14 @@ class DB(object):
 		f.write(json.dumps(joindef, indent=4, sort_keys=True))
 		f.close()
 
-	def define_default_join(self, tableA, tableB, type, **joindef):
+	def define_default_join(self, tableA, tableB, type, _overwrite=False, **joindef):
 		"""
 		Define a default join relation between two tables.
 		
 		See documentation for DB.define_join() for details on type
 		and joindef arguments.
 		"""
-		return self.define_join('.%s:%s' % (tableA, tableB), type, **joindef)
+		return self.define_join('.%s:%s' % (tableA, tableB), type, _overwrite, **joindef)
 
 	def table_exists(self, tabname):
 		"""
@@ -1778,10 +1821,15 @@ class DB(object):
 		This is an internal function; do not use it.
 		"""
 		tablist = []
+		tables_by_path = {}
 
 		# Find the tables involved in the query and instantiate them
 		for tabname, tabpath, join_args in from_clause:
-			tablist.append( ( tabname, (TableEntry(self.table(tabpath), tabname), join_args[0]) ) )
+			entry = TableEntry(self.table(tabpath), tabname)
+			te = ( tabname, (entry, join_args[0]) )
+
+			tablist.append(te)
+			tables_by_path[entry.table.path] = te[1]
 		tables = dict(tablist)
 
 		# Discover and set up JOIN links based on defined JOIN relations
@@ -1799,21 +1847,25 @@ class DB(object):
 			else:
 				# Check for tables that can be joined onto this one (where this one is on the right hand side of the relation)
 				# Look for default .join files named ".<tabname>:*.join"
-				for dbpath in self.path:
-					pattern = "%s/.%s:*.join" % (dbpath, tabname)
-					for fn in glob.iglob(pattern):
-						jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
-						if jtabname not in tables:
-							continue
+				dbpath = os.path.dirname(e.table.path)	# Look only in the table's dbdir
 
-						je, jargs = tables[jtabname]
-						if 'matchedto' in jargs:	# Explicitly joined
-							continue
-						if je.relation is not None:	# Already joined
-							continue
+				pattern = "%s/.%s:*.join" % (dbpath, e.table.name)
+				for fn in glob.iglob(pattern):
+					jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
+					jpath = "%s/%s" % (dbpath, jtabname)
 
-						je.relation = create_join(self, fn, jargs, e.table, je.table)
-						e.joins.append(je)
+					try:
+						je, jargs = tables_by_path[jpath]
+					except KeyError:
+						continue
+
+					if 'matchedto' in jargs:	# Explicitly joined
+						continue
+					if je.relation is not None:	# Already joined
+						continue
+
+					je.relation = create_join(self, fn, jargs, e.table, je.table)
+					e.joins.append(je)
 
 		# Discover the root (the one and only one table that has no links pointing to it)
 		root = None
@@ -1892,9 +1944,7 @@ class DB(object):
 			table = self.table(tabname)
 
 			# Compute the tablet tree cache
-			data_path = table._get_cgroup_data_path(table.primary_cgroup)
-			pattern   = table._tablet_filename(table.primary_cgroup)
-			table.tablet_tree = TabletTreeCache().create_cache(table.pix, data_path, pattern, table.path + '/tablet_tree.pkl')
+			table.rebuild_tablet_tree_cache()
 
 			# Scan the number of rows
 			table._nrows = compute_counts(self, tabname)

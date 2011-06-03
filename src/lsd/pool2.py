@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 from multiprocessing import Process, Queue, cpu_count, current_process
-from lsd.pyrpc import PyRPCProxy, RPCError
+from pyrpc import PyRPCProxy, RPCError
 from Queue import Empty
 from collections import defaultdict
 import socket
@@ -26,6 +26,23 @@ BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 1000 * 2**30
 
 # OS X HFS+ filesystem does not support sparse files
 back_to_disk = platform.system() != 'Darwin'
+
+# allow diskless operation with LSD_DISKLESS environment variable
+if os.getenv("LSD_DISKLESS") == "1":
+	back_to_disk = False
+
+def _profiled_worker(*args, **kwargs):
+	import cProfile, time
+
+	tmin = float(os.getenv("PROFILE_MIN_RUNTIME", "0"))
+
+	profiler = cProfile.Profile()
+	t0 = time.time()
+	try:
+		return profiler.runcall(_worker, *args, **kwargs)
+	finally:
+		if time.time() - t0 > tmin:
+			profiler.dump_stats('%s/%s.%d.profile' % (os.getenv("PROFILE_DIR", "."), current_process().name, os.getpid()))
 
 def _worker(ident, qcmd, qbroadcast, qin, qout):
 	""" Waits for commands on qcmd. Possible commands are:
@@ -250,7 +267,9 @@ class Pool:
 		self.qbroadcast = Queue()
 		self.qout = Queue(self.nworkers*2)
 		self.qcmd = [ Queue() for _ in xrange(self.nworkers) ]
-		self.ps = [ Process(target=_worker, name="%s{%02d}" % (current_process().name, i), args=(i, self.qcmd[i], self.qbroadcast, self.qin, self.qout)) for i in xrange(self.nworkers) ]
+		
+		target = _worker if not os.getenv("PROFILE", 0) else _profiled_worker
+		self.ps = [ Process(target=target, name="%s{%02d}" % (current_process().name, i), args=(i, self.qcmd[i], self.qbroadcast, self.qin, self.qout)) for i in xrange(self.nworkers) ]
 
 		for p in self.ps:
 			p.daemon = True
