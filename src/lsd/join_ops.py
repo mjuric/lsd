@@ -1356,7 +1356,7 @@ class Query(object):
 
 		# Tell _mapper not to test spacetime boundaries if the user requested so
 		if not testbounds:
-			partspecs = dict([ (cell_id, None) for (cell_id, _) in partspecs.iteritems() ])
+			partspecs = dict([ (cell_id, [(None, None)]) for (cell_id, _) in partspecs.iteritems() ])
 
 		# Reorganize cells to a per-static-cell basis, if requested
 		if group_by_static_cell:

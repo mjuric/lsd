@@ -55,7 +55,9 @@ if __name__ == "__main__":
 		if o in ('--quiet', '-q'):
 			progress_callback = pool2.progress_pass
 		if o in ('--testbounds'):
-			testbounds = bool(a)
+			testbounds = a.lower() in ['true', '1', 't', 'y', 'yes']
+		if o in ('--nc'):
+			include_cached = True
 
 	######### Actual work
 
