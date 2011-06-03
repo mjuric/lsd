@@ -169,7 +169,6 @@ class TableEntry:
 					c1, c2 = cells, cc
 				cells = ret
 			elif op == 'or':
-				print "or"
 				for cell_id, cbounds in cc.iteritems():
 					assert cell_id not in cells or cells[cell_id] == cbounds # TODO: Debugging -- make sure the timespace constraints are the same
 #					if not (cell_id not in cells or cells[cell_id] == cbounds): # TODO: Debugging -- make sure the timespace constraints are the same
