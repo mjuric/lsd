@@ -55,15 +55,31 @@ class CallResultCache(object):
 		def wrapper(*args, **kwds):
 			# Construct the hash of the arguments, using the buffer protocol where
 			# possible
-			m = hashlib.md5()
-			for k, a in zip('\0'*len(args), args) + sorted(kwds.items()):
-				m.update(k)
-				try:
-					m.update(a)
-				except TypeError:
-					m.update(cPickle.dumps(a, -1))
-			funcname = func.__module__ + "." + func.__name__
-			hash = funcname + '-' + m.hexdigest()
+			if True:
+				m = hashlib.md5()
+				for k, a in zip('\0'*len(args), args) + sorted(kwds.items()):
+					m.update(k)
+					try:
+						m.update(a)
+					except TypeError:
+						m.update(cPickle.dumps(a, -1))
+				funcname = func.__module__ + "." + func.__name__
+				hash = funcname + '-' + m.hexdigest()
+			else:
+				# Note: for 32bit hash, probability of collision of any two
+				# is about 1% for ~10k hashes, 50% for ~80k hashes
+				# This is bad.
+				import zlib
+				m = 0
+				csum = zlib.crc32
+				for k, a in zip('\0'*len(args), args) + sorted(kwds.items()):
+					m = csum(k, m)
+					try:
+						m = csum(a, m)
+					except TypeError:
+						m = csum(cPickle.dumps(a, -1), m)
+				funcname = func.__module__ + "." + func.__name__
+				hash = funcname + '-crc-' + str(m + 0x80000000)
 			#print "HASH: ", hash
 
 			# See if it's in memory cache (LRU)
