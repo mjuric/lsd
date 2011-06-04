@@ -234,7 +234,7 @@ class LockManager(object):
 
 	def __init__(self, urlfile):
 		lfile = urlfile + ".lock"
-		shell('/usr/bin/lockfile -1 "%s"' % (lfile) )
+		shell('lockfile -1 "%s"' % (lfile) )
 		try:
 			try:
 				url, token = [ line.strip() for line in open(urlfile).xreadlines() ]
