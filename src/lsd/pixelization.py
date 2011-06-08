@@ -394,7 +394,7 @@ class Pixelization(object):
 		""" Split the array of cell_ids into subarrays,
 		    one per each static sky cell it belongs to
 		"""
-		cell_ids   = np.array(cell_ids, copy=False)
+		cell_ids   = np.asarray(cell_ids, dtype=np.uint64)
 		cell_id_xy = self.static_cell_for_cell(cell_ids)
 
 		ret = {}

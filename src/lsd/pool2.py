@@ -240,6 +240,7 @@ class Pool:
 		self.terminate(try_joining=True)
 
 	def terminate(self, try_joining=False):
+		return
 
 		# Try waiting for workers to shut down by themselves
 		if try_joining:

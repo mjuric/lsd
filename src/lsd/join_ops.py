@@ -6,11 +6,13 @@ Contains (among others) DB, Query, QueryEngine and QueryInstance classes, as
 well as the JOIN machinery.
 
 """
-import os, json, glob, copy
+import os, json, glob, copy, sys
 import numpy as np
 import cPickle
 import pyfits
 import logging
+import time
+import locking
 
 from contextlib  import contextmanager
 from collections import defaultdict
@@ -1099,15 +1101,15 @@ class IntoWriter(object):
 
 	def create_into_table(self):
 		# called to auto-create the destination table
-		(tabname, dtype, into_col, keyexpr) = self.into_clause[:4]
-		assert dtype is None, "User-supplied dtype not supported yet."
+		(tabname, into_args, into_col, keyexpr) = self.into_clause[:4]
+		assert 'dtype' not in into_args, "User-supplied dtype not supported yet."
 
 		db = self.db
 		dtype = self.rows.dtype
 		schema = {
 			'columns': [],
-			'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 		}
+
 		with db.lock():
 			if db.table_exists(tabname):
 				# Must have a designated key for updating to work
@@ -1129,9 +1131,17 @@ class IntoWriter(object):
 				# Creating a new table
 				table = db.table(tabname, True)
 
+				# Enable compression
+				table.set_default_filters(**{ 'complevel': 5, 'complib': 'blosc', 'fletcher32': False })
+
 				# Create all columns
 				schema['columns'] = [ (name, utils.str_dtype(dtype[name])) for name in dtype.names ]
-				
+
+				if 'spatial_keys' in into_args:
+					schema['spatial_keys'] = into_args['spatial_keys']
+				if 'temporal_key' in into_args:
+					schema['temporal_key'] = into_args['temporal_key']
+
 				# If key is specified, and is a column name from self.rows, name the primary
 				# key after it
 				#if keyexpr is not None and keyexpr in self.rows:
@@ -1148,6 +1158,28 @@ class IntoWriter(object):
 			# Add a primary key column (if needed)
 			if 'primary_key' in schema and schema['primary_key'] not in dict(schema['columns']):
 				schema['columns'].insert(0, (schema['primary_key'], 'u8'))
+
+			if 'spatial_keys' in schema:
+				spatial_keys = table.get_spatial_keys()
+				if spatial_keys != (None, None):
+					if tuple(schema['spatial_keys']) != spatial_keys:
+						raise Exception('Redefining spatial keys is not allowed for tables in INTO clauses.')
+					else:
+						del schema['spatial_keys']
+				spatial_keys = schema['spatial_keys']
+				collist = [ c[0] for c in schema['columns'] ]
+				assert spatial_keys[0] in collist, (spatial_keys, collist) 
+				assert spatial_keys[1] in collist, (spatial_keys, collist) 
+				table.define_commit_hooks(table._default_commit_hooks) # Default commit hook rebuilds the neighbor cache
+
+			if 'temporal_key' in schema:
+				temporal_key = table.get_temporal_key()
+				if temporal_key != None:
+					if schema['temporal_key'] != temporal_key:
+						raise Exception('Redefining temporal key is not allowed for tables in INTO clauses.')
+					else:
+						del schema['temporal_key']
+					assert temporal_key in schema['columns']
 
 			# Create a new cgroup (if needed)
 			if schema['columns']:
@@ -1532,7 +1564,12 @@ class DB(object):
 	used to create new queries, tables and joins, as well as perform
 	house-keeping on the database.
 	"""
-	path = None	#: Path to the root directory of the database, where all tables reside
+	paths = None		#: List of tuples, first member being the path where tables reside, second being the snapshot ID
+	snapid = 0		#: Snapshot ID
+	_transaction = False	#: Whether we're in an open transaction
+
+	def _tsnap_to_snapid(self, tsnap):
+		return "%s.%06d" % (time.strftime("%Y%m%d%H%M%S", time.gmtime(tsnap)), int(1e6*(tsnap-int(tsnap))))
 
 	def __init__(self, path):
 		"""
@@ -1545,6 +1582,7 @@ class DB(object):
 		     empty directory.
 		"""
 		self.path = path.split(':')
+		self.snapid = self._tsnap_to_snapid(time.time())
 
 		for path in self.path:
 			if not os.path.isdir(path):
@@ -1552,25 +1590,110 @@ class DB(object):
 
 		self.tables = dict()	# A cache of table instances
 
+	def _check_transaction(self):
+		if not self._transaction:
+			raise Exception("Trying to modify the database without starting a transaction")
+
+	def begin_transaction(self, join=False):
+		"""
+		Begin a transaction.
+		"""
+		with self.lock():
+			# Start a new transaction, or join an existing one
+			transfile = self.path[0] + '/.__transaction'
+			try:
+				(snapid,) = [ s.strip() for s in open(transfile).xreadlines() if s.strip()[:1] != '#' ][:1]
+				if join == False:
+					raise Exception('Another transaction is already ongoing')
+				self.snapid = snapid
+			except IOError:
+				with open(transfile, 'w') as fp:
+					fp.write(self.snapid + '\n')
+
+			# Start the transaction on any tables that were
+			# already instantiated, that belong to path[0] datadir
+			for table in self.tables.itervalues():
+				if table.path.startswith(self.path[0]):
+					table.begin_transaction(self.snapid)
+
+			# Done.
+			self._transaction = True
+
+	def rollback(self):
+		""" Rollback a transaction """
+		if not self._transaction:
+			raise Exception("You're not in a transaction")
+
+		with self.lock():
+			transfile = self.path[0] + '/.__transaction'
+			os.unlink(transfile)
+
+			print >>sys.stderr, "------ rolling back %s ---------\n" % (self.snapid)
+			self._transaction = False
+
+	def commit(self):
+		""" Commit a transaction """
+		with self.lock():
+			if not self._transaction:
+				raise Exception("Not in a transaction.")
+
+			# Commit the transaction on all tables, in two phases.
+			# Phase #0 does the post-transaction house-keeping.
+			# When all of phase #1 completes successfully, execute
+			# phase #1 that actually does the commit
+			tables = []
+			for name in os.listdir(self.path[0]):
+				if os.path.isdir('%s/%s' % (self.path[0], name)):
+					path = '%s/%s/snapshots/%s' % (self.path[0], name, self.snapid)
+					if os.path.isdir(path):
+						# This table has data in new snapshot that needs to be committed
+						tables.append(self.table(name))
+					elif name in self.tables:
+						# This table has no data in the new snapshot, but is loaded and needs to be
+						# signaled to leave the transaction
+						self.tables[name].rollback()
+
+			if len(tables):
+				print >>sys.stderr, "\n-------- committing %s [%s] ---------" % (self.snapid, ', '.join(t.name for t in tables))
+
+				for pri in xrange(-1, 11):
+					for t in tables:
+						t.commit0(self, pri)
+
+				for t in tables:
+					t.commit1()
+
+				# Remove the transaction marker
+				transfile = self.path[0] + '/.__transaction'
+				os.unlink(transfile)
+
+				self._transaction = False
+				print >>sys.stderr, "----------- success %s [%s] ---------\n" % (self.snapid, ', '.join(t.name for t in tables))
+
+	def in_transaction(self):
+		return self._transaction
+
 	@contextmanager
-	def lock(self, retries=-1):
+	def transaction(self, join=False):
+
+		self.begin_transaction()
+		try:
+			yield
+			self.commit()
+		except:
+			self.rollback()
+			raise
+
+	def lock(self, timeout=None):
 		"""
 		Lock the entire database for table or join creation/removal
 		operations. If more than one database directory exists in
 		self.path, the lock is created in the first one.
 
-		TODO: Only DB.create_into_tables() obeys this lock so far.
-		      Make other ops that create tables obey it as well.
 		"""
-		# create a lock file
-		lockfile = self.path[0] + '/dblock.lock'
-		utils.shell('lockfile -1 -r%d "%s"' % (retries, lockfile) )
+		lockfile = self.path[0] + '/.__dblock.lock'
 
-		# yield self
-		yield self
-
-		# unlock
-		os.unlink(lockfile)
+		return locking.lock(lockfile, timeout)
 
 	### URI (Uniform Resource Identifier) management routines
 	def resolve_uri(self, uri):
@@ -1584,7 +1707,7 @@ class DB(object):
 		return self.table(tabname).resolve_uri(uri)
 
 	@contextmanager
-	def open_uri(self, uri, mode='r', clobber=True):
+	def open_uri(self, uri, mode='r'):
 		if uri[:4] != 'lsd:':
 			# Interpret this as a general URL
 			import urllib
@@ -1596,7 +1719,7 @@ class DB(object):
 		else:
 			# Pass on to the controlling table
 			_, tabname, _ = uri.split(':', 2)
-			with self.table(tabname).open_uri(uri, mode, clobber) as f:
+			with self.table(tabname).open_uri(uri, mode) as f:
 				yield f
 
 	def query(self, query, locals={}):
@@ -1638,7 +1761,10 @@ class DB(object):
 
 		if ignore_if_exists and self.table_exists(tabname):
 			return self.table(tabname)
-		
+
+		if not self._transaction:
+			raise Exception("You can't create tables outside of an open transaction")
+
 		table = self.table(tabname, create=True)
 
 		# Add fgroups
@@ -1648,6 +1774,9 @@ class DB(object):
 
 		# Add filters
 		table.set_default_filters(**tabdef.get('filters', {}))
+
+		# Commit hooks
+		table.define_commit_hooks(tabdef.get('commit_hooks', table._default_commit_hooks)) # Default commit hook rebuilds the neighbor cache
 
 		# Add column groups
 		tschema = tabdef['schema']
@@ -1777,7 +1906,7 @@ class DB(object):
 		except IOError:
 			return False
 
-	def table(self, tabname, create=False):
+	def table(self, tabname, create=False, snapid=None):
 		"""
 		Returns a Table instance for a given table name.
 
@@ -1788,10 +1917,18 @@ class DB(object):
 		      directly, though a Table instance (use queries for
 		      that).
 		"""
-		if tabname not in self.tables:
+		if snapid is None:
+			snapid = self.snapid
+
+		try:
+			t = self.tables[tabname]
+			assert not create
+			return t
+		except KeyError:
 			if create:
+				self._check_transaction()
 				path = '%s/%s' % (self.path[0], tabname)
-				self.tables[tabname] = Table(path, name=tabname, mode='c')
+				self.tables[tabname] = Table(path, name=tabname, mode='c', snapid=snapid)
 			else:
 				# Find the table. Allow the database to be specified
 				# using db.tablename syntax
@@ -1805,12 +1942,14 @@ class DB(object):
 						dbpath = '/'.join(dbpath.split('/')[:-1] + [ dbdir ])
 					path = '%s/%s' % (dbpath, tn)
 					if os.path.isdir(path):
-						self.tables[tabname] = Table(path)
+						self.tables[tabname] = Table(path, snapid=snapid)
 						break
 				else:
 					raise IOError("Table %s not found in %s" % (tabname, ':'.join(self.path)))
-		else:
-			assert not create
+
+			# Begin transaction on this table, if the database has one opened
+			if self._transaction:
+				self.tables[tabname].begin_transaction(self.snapid)
 
 		return self.tables[tabname]
 
@@ -1881,7 +2020,7 @@ class DB(object):
 		# Return the root of the tree, and a dict of all the Table instances
 		return root, dict((  (tabname, table) for (tabname, (table, _)) in tables.iteritems() ))
 
-	def build_neighbor_cache(self, tabname, margin_x_arcsec=30):
+	def build_neighbor_cache(self, tabname, snapid, margin_x_arcsec=30):
 		""" 
 		(Re)Build the neighbor cache in a given table.
 		
@@ -1905,17 +2044,23 @@ class DB(object):
 		# _cache_maker_reducer auxilliary routines.
 		margin_x = np.sqrt(2.) / 180. * (margin_x_arcsec/3600.)
 
+		# Only get the cells that were modified in snapshot 'snapid'
+		cells = self.table(tabname).get_cells_in_snapshot(snapid)
+		if len(cells) == 0:
+			print >>sys.stderr, "Already up to date."
+			return
+
 		ntotal = 0
 		ncells = 0
 		query = "_ID, _LON, _LAT FROM %s" % (tabname)
 		for (_, ncached) in self.query(query).execute([
 						(_cache_maker_mapper,  margin_x, self, tabname),
 						(_cache_maker_reducer, self, tabname)
-					]):
+					], cells=cells):
 			ntotal = ntotal + ncached
 			ncells = ncells + 1
 			#print self._cell_prefix(cell_id), ": ", ncached, " cached objects"
-		print "Total %d cached objects in %d cells" % (ntotal, ncells)
+		print >>sys.stderr, "%sTotal %d cached objects in %d cells" % (' '*(len(tabname)+3), ntotal, ncells)
 
 	def compute_summary_stats(self, *tables):
 		"""
@@ -1939,12 +2084,9 @@ class DB(object):
 		      (or better yet, do away with it alltogether).
 		"""
 		from tasks import compute_counts
-		from fcache import TabletTreeCache
 		for tabname in tables:
 			table = self.table(tabname)
-
-			# Compute the tablet tree cache
-			table.rebuild_tablet_tree_cache()
+			print >>sys.stderr, "[%s] Updating stats:" % tabname,
 
 			# Scan the number of rows
 			table._nrows = compute_counts(self, tabname)
@@ -1999,7 +2141,7 @@ def _cache_maker_mapper(qresult, margin_x, db, tabname):
 
 		# Fetch only the rows that are within the margin
 		idsInMargin = rows['_ID'][inMargin]
-		q           = db.query("* FROM '%s' WHERE np.in1d(_ID, idsInMargin, assume_unique=True)" % tabname, {'idsInMargin': idsInMargin} )
+		q           = db.query("_ID, * FROM '%s' WHERE np.in1d(_ID, idsInMargin, assume_unique=True)" % tabname, {'idsInMargin': idsInMargin} )
 		data        = q.fetch_cell(cell_id)
 
 		# Send these to neighbors
@@ -2012,20 +2154,32 @@ def _cache_maker_mapper(qresult, margin_x, db, tabname):
 def _cache_maker_reducer(kv, db, tabname):
 	# Cache all rows to be cached in this cell
 	cell_id, rowblocks = kv
-
-	# Delete existing neighbors
 	table = db.table(tabname)
-	table.drop_row_group(cell_id, 'cached')
 
-	# Add to cache
-	ncached = 0
-	for rows in rowblocks:
-		table.append(rows, cell_id=cell_id, group='cached')
-		ncached += len(rows)
-		##print cell_id, len(rows), table.pix.path_to_cell(cell_id)
+	# Get new neighbors
+	rows = colgroup.fromiter(rowblocks, blocks=True)
+	rcells = np.unique(table.pix.cell_for_id(rows._ID))
+	del rows._ID
+
+	# Fetch existing, keep only those not supplanted by new
+	oldn = db.query("_ID, * FROM '%s' WHERE _CACHED == True" % tabname).fetch_cell(cell_id, include_cached=True)
+#	print "OLD N:", len(oldn)
+	ocells = table.pix.cell_for_id(oldn._ID)
+	del oldn._ID
+	oldn = oldn[~np.in1d(ocells, rcells)]
+#	if len(oldn):
+#		print "Kept N:", len(oldn)
+
+	# Merge
+	rows = colgroup.fromiter([rows, oldn], blocks=True)
+#	print "New N:", len(rows)
+
+	# Delete existing and append new ones
+	table.drop_row_group(cell_id, 'cached')
+	table.append(rows, cell_id=cell_id, group='cached')
 
 	# Return the number of new rows cached into this cell
-	yield cell_id, ncached
+	yield cell_id, len(rows)
 
 ###############################################################
 # Aux. functions implementing Query.iterate() and

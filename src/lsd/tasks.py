@@ -7,6 +7,7 @@ import pool2
 import numpy as np
 from itertools import izip
 import bhpix
+import sys
 from utils import as_columns, gnomonic, gc_dist, unpack_callable
 from colgroup import ColGroup
 from join_ops import IntoWriter
@@ -95,6 +96,14 @@ def compute_counts(db, table, include_cached=False):
 	for (_, nobjects) in db.query("_ID FROM %s" % table).execute([ls_mapper], include_cached=include_cached):
 		ntotal = ntotal + nobjects
 	return ntotal
+###################################################################
+
+###################################################################
+## Default neighbor cache building hook
+def commit_hook__build_neighbor_cache(db, table):
+	db.build_neighbor_cache(table.name, snapid=table.snapid)
+	print >> sys.stderr, "[%s] Updating tablet catalog:" % (table.name),
+	table.build_tablet_tree_cache()
 ###################################################################
 
 ###################################################################

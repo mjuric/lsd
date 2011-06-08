@@ -57,6 +57,7 @@ import pool2
 import numpy as np
 import bounds as bn
 import bhpix
+import utils
 from pixelization import Pixelization
 from interval import intervalset
 from collections import defaultdict
@@ -86,7 +87,7 @@ class TabletTreeCache:
 	
 	_tablet_path = None
 	_pix = None
-
+	
 	#################
 
 	def _get_cells_recursive(self, outcells, bounds_xy, bounds_t, i = 0, j = 0, lev = 0, dx = 2.):
@@ -114,7 +115,7 @@ class TabletTreeCache:
 			xybounds = None if(bounds_xy.area() == box.area()) else bounds_xy
 			next = 0
 			while next != END_MARKER:
-				(t, next) = self._leaves[offs]
+				(t, _, _, next) = self._leaves[offs]
 				has_data = next > 0
 				next = abs(next)
 				if next != END_MARKER:	# Not really necessary, but numpy warns of overflow otherwise.
@@ -208,6 +209,11 @@ class TabletTreeCache:
 		else:
 			return cells
 
+	def get_cells_in_snapshot(self, snapid):
+		""" Return a list of cells that are physically stored in snapshot snapid """
+		cells = self._leaves['cell_id'][self._leaves['snapid'] == snapid]
+		return cells
+
 	#################
 
 	def _get_temporal_siblings(self, path, pattern):
@@ -226,16 +232,25 @@ class TabletTreeCache:
 	def _scan_recursive(self, lev = 0, x = 0., y = 0.):
 		dx = bhpix.pix_size(lev)
 
-		# Check if the cell directory exists (give up if it doesn't)
-		path = self._tablet_path + '/' + self._pix._path_to_cell_base_xy(x, y, lev)
-		if not os.path.isdir(path):
+		# Check if the cell directory exists in any allowable snapshot
+		# Snapshots are ordered oldest-to-newest, so every siblings.update
+		# overwrites the outdated entries from the older snapshot
+		# Note: This will need rethinking when adaptive resolution cells get implemented
+		siblings = dict()
+		found = False
+		for (snapid, snapshot_path) in self._snapshots:
+			# .../snapshots/XXXXXX/tablets/-0.5+0.5/..../
+			path = '%s/tablets/%s' % (snapshot_path,  self._pix._path_to_cell_base_xy(x, y, lev))
+			if os.path.isdir(path):
+				siblings.update((tcell, (snapid, fn)) for tcell, fn in self._get_temporal_siblings(path, self._pattern))
+				found = True
+		if not found:
 			return
 
-		# If we reached the bottom of the hierarchy
-		siblings = list(self._get_temporal_siblings(path, self._pattern))
 		if len(siblings):
+			siblings = siblings.items()
 			offs0 = len(self._leaves)
-			for i, (t, fn) in enumerate(siblings):
+			for i, (t, (snapid, fn)) in enumerate(siblings):
 				# check if there are any non-cached data in here
 				try:
 					with tables.openFile(fn) as fp:
@@ -250,8 +265,11 @@ class TabletTreeCache:
 				if not has_data:
 					next *= -1
 
+				# Compute cell ID
+				cell_id = self._pix._cell_id_for_xyt(x, y, t)
+
 				# Add to leaves
-				self._leaves.append((t, next))
+				self._leaves.append((t, snapid, cell_id, next))
 
 			if offs0 != len(self._leaves):
 				assert self._bmap.shape[0] == bhpix.width(lev), "Update this code if multi-resolution cells need to be supported"
@@ -269,18 +287,33 @@ class TabletTreeCache:
 	def _reset(self):
 		w = bhpix.width(self._pix.level)
 
-		self._leaves = [(np.inf, END_MARKER)]*2		# A floating point list of (mjd, next_delta) tuples. next_delta is positive if the cell has non-cached data.
+		self._leaves = [(np.inf, 0, 0., END_MARKER)]*2	# A floating point list of (mjd, snapid, next_delta) tuples. next_delta is positive if the cell has non-cached data.
 		self._bmap = np.zeros((w, w), dtype=np.int32)	# A map with indices to self._leaves for static cells that have an entry, zero otherwise
 
-	def scan_table(self, pix, tablet_path, pattern):
+	def scan_table(self, pix, table_path, snapid, pattern, quiet=False):
 		self._pix = pix
-		self._tablet_path = tablet_path
 		self._pattern = pattern
+
+		# Enumerate all snapshots older or equal to snapid
+		snapshots = {
+			snapid : '%s/snapshots/%s' % (table_path, snapid),
+			0      : '%s' % table_path # Backwards compatibility (WARNING: this line _must_ follow the preceeding one to correctly handle snapid=0 case)
+			}
+		for path in glob.iglob('%s/snapshots/*/.committed' % (table_path)):
+			t = path.split('/')[-2]
+			if t <= snapid:
+				snapshots[t] = os.path.dirname(path)
+		# Sorted list of snapshots, oldest first
+		self._snapshots = [ (t, snapshots[t]) for t in sorted(snapshots.keys()) ]
 
 		self._reset()
 
+		# Check if this is a new table being created (has no directories with data)
+		# Avoids some problems with table creation in queries with INTO statements
+		new = sum(os.path.isdir(os.path.join(path, 'tablets')) for _, path in self._snapshots) == 0
+
 		# Populate _bmap
-		if False:
+		if new:
 			self._scan_recursive()
 		else:
 			pool = pool2.Pool()
@@ -291,10 +324,11 @@ class TabletTreeCache:
 			x, y =  (i - w2 + 0.5)*dx, (j - w2 + 0.5)*dx
 
 			# When running in single-threaded mode, these get overwritten.
+			progress_callback = pool2.progress_pass if quiet else None
 			bmap = self._bmap
 			leaves = self._leaves
 			self._reset()
-			for b, l in pool.imap_unordered(zip(x, y), _scan_recursive_kernel, (lev, self)):
+			for b, l in pool.imap_unordered(zip(x, y), _scan_recursive_kernel, (lev, self), progress_callback=progress_callback):
 				# Adjust offsets
 				b[b > 0] += len(leaves) - 2
 				leaves.extend(l[2:])
@@ -302,14 +336,20 @@ class TabletTreeCache:
 				bmap |= b
 			del pool
 			# Store the number of elements in the array to 'next' field of the first array element
-			leaves[0] = (np.inf, len(leaves))
+			leaves[0] = (np.inf, 0, 0, len(leaves))
 			self._bmap = bmap
 			self._leaves = leaves
 
 		# Convert _leaves to numpy array
-		npl = np.empty(len(self._leaves), dtype=[('mjd', 'f4'), ('next', 'i4')])
-		for (i, (offs, next)) in enumerate(self._leaves):
-			npl[i] = (offs, next)
+		npl = np.empty(len(self._leaves), dtype=[('mjd', 'f4'), ('snapid', object), ('cell_id', 'u8'), ('next', 'i4')])
+		seen = dict()
+		for (i, (mjd, snapid, cell_id, next)) in enumerate(self._leaves):
+			# Make equal strings refer to the same string object
+			try:
+				snapid = seen[snapid]
+			except KeyError:
+				seen[snapid] = snapid
+			npl[i] = (mjd, snapid, cell_id, next)
 		self._leaves = npl
 
 		# Recompute mipmaps
@@ -339,10 +379,23 @@ class TabletTreeCache:
 
 			self._bmaps[lev] = m0
 
-	def create_cache(self, pix, tablet_path, pattern, fn):
-		self.scan_table(pix, tablet_path, pattern)
-		cPickle.dump((self._bmaps, self._leaves, self._pix), file(fn, mode='w'))
+	def create_cache(self, pix, table_path, snapid, pattern, quiet=False):
+		self.scan_table(pix, table_path, snapid, pattern, quiet=quiet)
+
+		self._cell_to_snapshot = dict(v for v in izip(self._leaves['cell_id'][2:], self._leaves['snapid'][2:]))
+		assert len(self._cell_to_snapshot) == len(self._leaves)-2, (len(self._cell_to_snapshot), len(self._leaves))
+
 		return self
+
+	def save(self, fn):
+		utils.mkdir_p(os.path.dirname(fn))
+		cPickle.dump((self._bmaps, self._leaves, self._pix), file(fn, mode='w'), -1)
+
+	def snapshot_of_cell(self, cell_id):
+		try:
+			return self._cell_to_snapshot[cell_id]
+		except KeyError:
+			return 0.
 
 	def __init__(self, fn = None):
 		if fn is None:
@@ -350,6 +403,15 @@ class TabletTreeCache:
 
 		self._bmaps, self._leaves, self._pix = cPickle.load(file(fn))
 		self._bmap = self._bmaps[self._pix.level]
+
+		try:
+			# cell_id -> snapshot containing the data lookup
+			self._cell_to_snapshot = dict(v for v in izip(self._leaves['cell_id'][2:], self._leaves['snapid'][2:]))
+			assert len(self._cell_to_snapshot) == len(self._leaves)-2, (len(self._cell_to_snapshot), len(self._leaves))
+		except KeyError:
+			# Backwards compatibility
+			self._cell_to_snapshot = dict()
+			pass
 
 if __name__ == '__main__':
 	if 1:

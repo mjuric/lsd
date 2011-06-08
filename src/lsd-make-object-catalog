@@ -56,17 +56,18 @@ def get_new_exposures(db, obj_tabname, det_tabname):
 	qexp="_ID from %s" % (exp_tabname)
 	return smf.get_new_exposures(db, qobj, qexp)
 
-if create or auto:
-	smf.create_object_table(db, obj_tabname, det_tabname)
+with db.transaction():
+	if create or auto:
+		smf.create_object_table(db, obj_tabname, det_tabname)
 
-if gen_explist or auto:
-	print >> sys.stderr, "Scanning what is already in the database..."
-	explist = get_new_exposures(db, obj_tabname, det_tabname)
-	print >>sys.stderr, "%d new exposures (%d total)." % (len(explist), db.table(exp_tabname).nrows())
+	if gen_explist or auto:
+		print >> sys.stderr, "Scanning what is already in the database..."
+		explist = get_new_exposures(db, obj_tabname, det_tabname)
+		print >>sys.stderr, "%d new exposures (%d total)." % (len(explist), db.table(exp_tabname).nrows())
 
-if gen_explist:
-	for exp in explist:
-		print exp
+	if gen_explist:
+		for exp in explist:
+			print exp
 
-if make_catalog:
-	smf.make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=radius/3600., explist=explist, fovradius=fovradius)
+	if make_catalog:
+		smf.make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=radius/3600., explist=explist, fovradius=fovradius)

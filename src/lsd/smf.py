@@ -12,9 +12,9 @@ from colgroup import ColGroup
 import colgroup
 import sys, os
 import logging
-import utils
 from interval import intervalset
 import bounds
+import locking
 
 logger = logging.getLogger("lsd.smf")
 
@@ -282,8 +282,11 @@ def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=Fals
 	    Note: Assumes underlying shared storage for all table
 	          cells (i.e., any worker is able to write to any cell).
 	"""
-	with utils.lock(db.path + "/smf-import-lock.lock"):
+	with locking.lock(db.path[0] + "/.__smf-import-lock.lock"):
 		if not db.table_exists(det_tabname) and create:
+			# Set up commit hooks
+			exp_table_def['commit_hooks'] = [ ('Updating neighbors', 1, 'lsd.smf', 'make_image_cache', [det_tabname]) ]
+
 			# Create new tables
 			det_table  = db.create_table(det_tabname, det_table_def)
 			exp_table  = db.create_table(exp_tabname, exp_table_def)
@@ -310,7 +313,7 @@ def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=Fals
 		t1 = time.time()
 		time_pass = (t1 - t0) / 60
 		time_tot = time_pass / at * len(smf_files)
-		print('  ===> Imported %s [%d/%d, %5.2f%%] +%-6d %9d (%.0f/%.0f min.)' % (file, at, len(smf_files), 100 * float(at) / len(smf_files), nloaded, ntot, time_pass, time_tot))
+		print >>sys.stderr, '  ===> Imported %s [%d/%d, %5.2f%%] +%-6d %9d (%.0f/%.0f min.)' % (file, at, len(smf_files), 100 * float(at) / len(smf_files), nloaded, ntot, time_pass, time_tot)
 	del pool
 
 def add_lb(cols):
@@ -426,7 +429,7 @@ def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f, survey):
 
 	# Store the primary and all chip headers in external linked files
 	uri = 'lsd:%s:hdr:%s/primary.txt' % (exp_table.name, fn)
-	with exp_table.open_uri(uri, mode='w', clobber=False) as f:
+	with exp_table.open_uri(uri, mode='w') as f:
 		f.write(str(imhdr) + '\n')
 		exp_cols['hdr']	= np.array([uri], dtype=object)
 
@@ -448,7 +451,7 @@ def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f, survey):
 			hdr = hdus[i].header
 			
 			uri = 'lsd:%s:hdr:%s/%s.txt' % (exp_table.name, fn, chip_xy)
-			with exp_table.open_uri(uri, mode='w', clobber=False) as f:
+			with exp_table.open_uri(uri, mode='w') as f:
 				f.write(str(hdr) + '\n')
 				exp_cols['chip_hdr'][0][chip_id] = uri
 
@@ -529,6 +532,12 @@ def make_image_cache(db, det_tabname, exp_tabname):
 				      ],
 				      include_cached=True):
 		pass;
+
+def commit_hook__make_image_cache(db, table, det_tabname):
+	# Commit hook
+	make_image_cache(db, det_tabname, table.name)
+	print >> sys.stderr, "[%s] Updating tablet catalog:" % (table.name),
+	table.build_tablet_tree_cache()
 
 def _exp_id_gather(qresult):
 	# Fetch all exp_ids referenced from this cell
@@ -755,10 +764,10 @@ def make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=1./360
 	ntotobj = 0
 	at = 0
 	for (nexp, nobj, ndet, nnew, nmatch, ndetnc) in pool.map_reduce_chain(det_cells_grouped,
-					      [
-						(_obj_det_match, db, obj_tabname, det_tabname, o2d_tabname, radius, explist, _rematching),
-					      ],
-					      progress_callback=pool2.progress_pass):
+				      [
+					(_obj_det_match, db, obj_tabname, det_tabname, o2d_tabname, radius, explist, _rematching),
+				      ],
+				      progress_callback=pool2.progress_pass):
 		at += 1
 		if nexp is None:
 			continue
@@ -773,22 +782,6 @@ def make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=1./360
 		pctnew   = 100. * nnew / nobjnew  if nobjnew else 0.
 		pctmatch = 100. * nmatch / ndetnc if ndetnc else 0.
 		print "  match %7d det to %7d obj (%3d exps): %7d new (%6.2f%%), %7d matched (%6.2f%%)  [%.0f/%.0f min.]" % (ndet, nobj, nexp, nnew, pctnew, nmatch, pctmatch, time_pass, time_tot)
-
-	# Force invalidation of tablet tree caches as new tablets may have been added
-	db.table(obj_tabname).rebuild_tablet_tree_cache()
-	db.table(o2d_tabname).rebuild_tablet_tree_cache()
-
-	# Build neighbor caches
-	print >> sys.stderr, "Building neighbor cache for static sky: ",
-	db.build_neighbor_cache(obj_tabname)
-	print >> sys.stderr, "Building neighbor cache for indirection table: ",
-	db.build_neighbor_cache(o2d_tabname)
-
-	# Compute summary stats for object table
-	print >> sys.stderr, "Computing summary statistics for static sky: ",
-	db.compute_summary_stats(obj_tabname)
-	print >> sys.stderr, "Computing summary statistics for indirection table: ",
-	db.compute_summary_stats(o2d_tabname)
 
 	print "Matched a total of %d sources." % (ntot)
 	print "Total of %d objects added." % (ntotobj)

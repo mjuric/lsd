@@ -141,17 +141,6 @@ def shell(cmd):
 		raise err
 	return out;
 
-@contextlib.contextmanager
-def lock(lockfile, retries=-1):
-	""" Acquire a lock by creating lockfile """
-
-	shell('lockfile -1 -r%d "%s"' % (retries, lockfile) )
-	
-	yield
-
-	os.unlink(lockfile)
-
-
 def mkdir_p(path):
 	''' Recursively create a directory, but don't fail if it already exists. '''
 	try:
