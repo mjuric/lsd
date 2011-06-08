@@ -178,7 +178,7 @@ def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm, n_neighbors):
 
 xm_table_def = \
 {
-	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 	'schema': {
 		'main': {
 			'columns': [

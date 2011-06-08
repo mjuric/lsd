@@ -1106,7 +1106,7 @@ class IntoWriter(object):
 		dtype = self.rows.dtype
 		schema = {
 			'columns': [],
-			'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+			'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 		}
 		with db.lock():
 			if db.table_exists(tabname):

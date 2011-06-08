@@ -26,7 +26,7 @@ exp_table_def = \
 			'filter': ('bzip2', {'compresslevel': 9})
 		}
 	},
-	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 	'schema': {
 		#
 		#	 LSD column name      Type    FITS column      Description
@@ -115,7 +115,7 @@ exp_table_def = \
 
 det_table_def = \
 {
-	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 	'schema': {
 		#
 		#	 LSD column name      Type    FITS column      Description
@@ -210,7 +210,7 @@ det_table_def = \
 
 obj_table_def = \
 {
-	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 	'schema': {
 		#
 		#	 LSD column name      Type    FITS column      Description
@@ -231,7 +231,7 @@ obj_table_def = \
 
 o2d_table_def = \
 {
-	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 	'schema': {
 		'main': {
 			'columns': [
