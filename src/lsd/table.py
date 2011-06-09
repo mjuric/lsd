@@ -597,7 +597,7 @@ class Table:
 		if not os.path.exists(path):
 			utils.mkdir_p(path)
 
-		utils.shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, fn) )
+		utils.shell('lockfile -1 -r%d "%s"' % (retries, fn) )
 		logger.debug("Acquired lockfile %s" % (fn))
 		return fn
 

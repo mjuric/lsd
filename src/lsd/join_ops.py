@@ -1564,7 +1564,7 @@ class DB(object):
 		"""
 		# create a lock file
 		lockfile = self.path[0] + '/dblock.lock'
-		utils.shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, lockfile) )
+		utils.shell('lockfile -1 -r%d "%s"' % (retries, lockfile) )
 
 		# yield self
 		yield self

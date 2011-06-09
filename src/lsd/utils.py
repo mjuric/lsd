@@ -145,7 +145,7 @@ def shell(cmd):
 def lock(lockfile, retries=-1):
 	""" Acquire a lock by creating lockfile """
 
-	shell('/usr/bin/lockfile -1 -r%d "%s"' % (retries, lockfile) )
+	shell('lockfile -1 -r%d "%s"' % (retries, lockfile) )
 	
 	yield
 
