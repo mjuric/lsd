@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 from multiprocessing import Process, Queue, cpu_count, current_process
+import threading
 from pyrpc import PyRPCProxy, RPCError
 from Queue import Empty
 from collections import defaultdict
@@ -15,6 +16,7 @@ import mmap
 import traceback
 import platform
 import logging
+import signal
 from utils import unpack_callable
 
 logger = logging.getLogger('lsd.pool2')
@@ -80,12 +82,16 @@ def _worker(ident, qcmd, qbroadcast, qin, qout):
 							qout.put((ident, 'RESULT', (i, result)))
 						qout.put((ident, 'DONE', i))
 					except KeyboardInterrupt:
-						return
+						# Handle Ctrl-C by just exiting and not spewing output to stderr
+						raise
 					except:
 						type, value, tb = sys.exc_info()
 						tb_str = traceback.format_tb(tb)
 						del tb    # See docs for sys.exec_info() for why this has to be here
 						qout.put((ident, 'EXCEPT', (type, value, tb_str)))
+						
+						# Unhandled exceptions mean death.
+						return
 
 					check_bqueue()
 
@@ -231,29 +237,42 @@ class Pool:
 		for q in self.qcmd:
 			q.put('EXIT')
 
-		kill = []
+		self.terminate(try_joining=True)
+
+	def terminate(self, try_joining=False):
+
+		# Try waiting for workers to shut down by themselves
+		if try_joining:
+			for p in self.ps:
+				try:
+					p.join(1)
+				except:
+					pass
+			self.ps = [ p for p in self.ps if p.is_alive() ]
+
+		# Force them to quit with SIGINT (CTRL-C)
 		for p in self.ps:
 			try:
-				p.join(5)
-				if p.is_alive():
-					kill.append(p)
-			except:
-				kill.append(p)
+				os.kill(p.pid, signal.SIGINT)
+			except OSError:
 				pass
 
-		for p in kill:
-			p.terminate()
+		# Wait for it to take effect (5 sec, with 0.1sec pooling interval)
+		for rep in xrange(50):
+			self.ps = [ p for p in self.ps if p.is_alive() ]
 
-		self.qcmd = self.qin = self.qbroadcast = self.qout = None
-		del self.ps[:]
+			if len(self.ps) == 0:
+				break
 
-	def terminate(self):
+			time.sleep(0.1)
+
+		# Send SIGTERM if this didn't work
 		for p in self.ps:
 			p.terminate()
 
+		# Release the queues and worker objects
+		del self.ps[:]
 		self.qcmd = self.qin = self.qbroadcast = self.qout = None
-		if len(self.ps):
-			del self.ps[:]
 
 	def _create_workers(self):
 		""" Lazily create workers, when needed. This routine
@@ -321,8 +340,8 @@ class Pool:
 		if parallel:
 			try:
 				# Create workers (if not created already)
-				self._create_workers()
 				_mgr = PyRPCProxy("localhost", 5432)
+				self._create_workers()
 
 				# Connect to worker manager and stop workers over the limit
 				stopped   = set()				# Idents of stopped workers
@@ -368,9 +387,9 @@ class Pool:
 					elif what == 'EXCEPT':
 						# Unhandled Exception was raised in one of the workers.
 						# Terminate the workers and re-raise it.
-						self.terminate()
 						type, value, tb_str = data
-						print >> sys.stderr, 'Remote Traceback (most recent call last):\n', ''.join(tb_str)
+						print >> sys.stderr, 'Remote Traceback (most recent call last):\n', ''.join(tb_str),
+						print >> sys.stderr, ''.join(traceback.format_exception_only(type, value))
 						raise value
 
 					#
@@ -406,9 +425,12 @@ class Pool:
 				assert k == n			# All items must have been processed
 				assert nstopping == 0		# No outstanding STOP orders
 
-			except:
+			except BaseException as e:
 				# Terminate the workers if an exception ocurred
-				self.terminate()
+				# If the reason we're exiting is a KeyboardInterrupt, assume all
+				# workers have also received it and will gracefully shut down
+
+				self.terminate(try_joining=isinstance(e, KeyboardInterrupt))
 				raise
 			finally:
 				# Make sure the connection to manager is closed (e.g., if an

@@ -1,0 +1,15 @@
+#!/bin/bash
+
+#BSUB -u mjuric@cfa.harvard.edu
+#BSUB -J "lsdimport[1-80]"
+#BSUB -e import_log/task-%I.err
+#BSUB -o import_log/task-%I.out
+#BSUB -q itc
+#--BSUB -n 2
+#--BSUB -R "span[ptile=2]"
+
+export LSD_DB=/n/pan/mjuric/lsd_test
+export NWORKERS=1
+export PYTHONPATH=".:$PYTHONPATH"
+
+./attic/locking/test.py

@@ -1,0 +1,13 @@
+Quick tests for new locking routines.
+
+To test on pan, go to the src directory, and execute:
+
+	echo "0" > /n/panlfs/mjuric/sumfile.txt; PYTHONPATH=".:$PYTHONPATH" ./attic/locking/test.py; cat /n/panlfs/mjuric/sumfile.txt
+
+To test on odyssey, execute:
+
+	echo "0" > /n/panlfs/mjuric/sumfile.txt; bsub < ./attic/locking/test.bsub
+
+The test program will increment the number in sumfile.txt. For the
+single-machine run, the final count must be 100 (if the locking works), while
+for the Odyssey run it should be 8000 (80 machines x 100 each).
