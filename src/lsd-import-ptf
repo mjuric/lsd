@@ -1,0 +1,62 @@
+#!/usr/bin/env python
+#
+# Initial run: ./lsd-import-ptf-test -c -f file_list test_det test_exp >output_test 2>errors_test
+
+import sys, os
+import getopt
+#import lsd
+from lsd import DB
+import surveys.ptf as ptf
+from lsd.utils import *
+from lsd.tui import *
+import numpy as np
+import shutil
+import lsd.smf as smf
+
+def usage():
+    print "Usage: %s [-c|--create] [-f|--file] <det_table> <exp_table>" % sys.argv[0]
+
+optlist, (dbdir,), (det_tabname, exp_tabname) = tui_getopt('cf:', ['create', 'file=', ], 2, usage, argn_max=2)
+
+create = False
+filelist = 'None'
+for (o, a) in optlist:
+	if o == '-c' or o == '--create':
+		create = True
+	if o == '-f' or o == '--file':
+		filelist = str(a)
+
+if create:
+	if os.access(dbdir+'/'+det_tabname, os.F_OK):
+		shutil.rmtree(dbdir+'/'+det_tabname)
+	if os.access(dbdir+'/'+exp_tabname, os.F_OK):
+		shutil.rmtree(dbdir+'/'+exp_tabname)
+	if os.access(dbdir+'/.'+det_tabname+':'+exp_tabname+'.join', os.F_OK):
+		os.remove(dbdir+'/.'+det_tabname+':'+exp_tabname+'.join')
+
+#
+# Actual work
+#
+db = DB(dbdir)
+db.begin_transaction(join=True)
+
+files = np.genfromtxt(filelist, dtype='a')
+
+print "Importing SExtractor catalog files:"
+ptf.import_from_catalogs(db, det_tabname, exp_tabname, files, create, all)
+print " done."
+
+# Commit the result
+db.commit()
+
+# Sanity check: all queries linking to images must resolve within cell
+print >> sys.stderr, "Consistency check: ",
+q = db.query('_CELLID, det_id, ra, dec, exp_id, equinox FROM "%s", "%s"(outer) WHERE equinox == 0' % (det_tabname, exp_tabname))
+for row in q.iterate():
+	raise Exception("Inconsistency detected: (cell_id, det_id, ra, dec, exp_id, equinox) = " + str(row))
+
+# Done
+det_table = db.table(det_tabname)
+exp_table = db.table(exp_tabname)
+print "Import done.", det_table.nrows(), "detections in", exp_table.nrows() , "exposures."
+
