@@ -1974,7 +1974,7 @@ class DB(object):
 		# Discover and set up JOIN links based on defined JOIN relations
 		# TODO: Expand this to allow the 'joined to via' and related syntax, once it becomes available in the parser
 		for tabname, (e, jargs) in tablist:
-			# Check for 'matchedto' keys in join_args
+			# Check if this table explicitly joins to another, using matchedto
 			if 'matchedto' in jargs:
 				# Test query:
 				# NWORKERS=1 ./lsd-query "select ra, dec, galex_gr5.ra, galex_gr5.dec, sdss._NR, sdss._DIST*3600 from galex_gr5, sdss(matchedto=galex_gr5,nmax=5,dmax=15)" | head -n 20
@@ -1983,28 +1983,30 @@ class DB(object):
 				e.relation = create_join(self, None, jargs, entry.table, e.table, jclass=CrossmatchJoin)
 				##e.relation = create_join(self, "/n/pan/mjuric/db/.galex_gr5:sdss.join", jargs, entry.table, e.table)
 				entry.joins.append(e)
-			else:
-				# Check for tables that can be joined onto this one (where this one is on the right hand side of the relation)
-				# Look for default .join files named ".<tabname>:*.join"
-				dbpath = os.path.dirname(e.table.path)	# Look only in the table's dbdir
+				print "Matched to", entry.table.name
 
-				pattern = "%s/.%s:*.join" % (dbpath, e.table.name)
-				for fn in glob.iglob(pattern):
-					jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
-					jpath = "%s/%s" % (dbpath, jtabname)
+		for tabname, (e, jargs) in tablist:
+			# Check for tables that can be joined onto this one (where this one is on the right hand side of the relation)
+			# Look for default .join files named ".<tabname>:*.join"
+			dbpath = os.path.dirname(e.table.path)	# Look only in the table's dbdir
 
-					try:
-						je, jargs = tables_by_path[jpath]
-					except KeyError:
-						continue
+			pattern = "%s/.%s:*.join" % (dbpath, e.table.name)
+			for fn in glob.iglob(pattern):
+				jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
+				jpath = "%s/%s" % (dbpath, jtabname)
 
-					if 'matchedto' in jargs:	# Explicitly joined
-						continue
-					if je.relation is not None:	# Already joined
-						continue
+				try:
+					je, jargs = tables_by_path[jpath]
+				except KeyError:
+					continue
 
-					je.relation = create_join(self, fn, jargs, e.table, je.table)
-					e.joins.append(je)
+				if 'matchedto' in jargs:	# Explicitly joined
+					continue
+				if je.relation is not None:	# Already joined
+					continue
+
+				je.relation = create_join(self, fn, jargs, e.table, je.table)
+				e.joins.append(je)
 
 		# Discover the root (the one and only one table that has no links pointing to it)
 		root = None
