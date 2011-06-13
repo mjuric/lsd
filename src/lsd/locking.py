@@ -4,6 +4,7 @@ import os
 import time
 import errno
 import contextlib
+import socket
 
 wait_interval = 0.1
 max_timeout = int(100*3600*24*365)
@@ -61,14 +62,33 @@ def lock(lockfile, timeout=None):
 ##  Internal ############
 
 def _lock_acquire(lockfile, retries):
+	# NFS-safe lockfile creation. Follows the prescription given in open(2)
+	# man page.
+
 	# Returns normally only if the lockfile is successfuly created
+	tmpname = "%s.%s.%s" % (lockfile, socket.gethostname(), os.getpid())
 	while True:
+		fd = None
 		try:
-			os.close(os.open(lockfile, os.O_CREAT | os.O_EXCL))
-			return
-		except OSError as e:
-			if e.errno not in [errno.EEXIST, errno.EINTR]:
-				raise
+			fd = os.open(tmpname, os.O_EXCL | os.O_CREAT)		# This must succeed, otherwise it's an error
+			try:
+				os.link(tmpname, lockfile)			# If this succeeds, we've acquired the lock and should return
+				return
+			except OSError as e:
+				if e.errno not in [errno.EEXIST, errno.EINTR]:	# If failed for EEXIST or EINTR, retry later. Otherwise ...
+					if os.fstat(fd).st_nlink != 2:		# If appears to have failed but hardlink count == 2, we've succeeded. Otherwise...
+						raise				# An error has happened. pass it along.
+		except:
+			# Try to clean-up an already acquired lock
+			if fd is not None and os.fstat(fd).st_nlink == 2:
+				unlink(lockfile)
+			raise
+		finally:
+			if fd is not None:		# Whatever happened, ensure the file descriptor is closed and the temp file unlocked
+				os.close(fd)
+				os.unlink(tmpname)
+			elif os.path.exists(tmpname):	# fd == None and path existing can happen if a signal interrupted fd = os.open() call
+				os.unlink(tmpname)	#    after open() executed, but before its result was assigned to fd
 
 		if retries == 0:
 			break
