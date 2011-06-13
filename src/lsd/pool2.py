@@ -89,9 +89,6 @@ def _worker(ident, qcmd, qbroadcast, qin, qout):
 						tb_str = traceback.format_tb(tb)
 						del tb    # See docs for sys.exec_info() for why this has to be here
 						qout.put((ident, 'EXCEPT', (type, value, tb_str)))
-						
-						# Unhandled exceptions mean death.
-						return
 
 					check_bqueue()
 
@@ -104,7 +101,10 @@ def _worker(ident, qcmd, qbroadcast, qin, qout):
 				qout.put((ident, 'MAPDONE', None))
 
 	except KeyboardInterrupt:
-		pass;
+		# Cancel all queue feeder threads, otherwise the child will
+		# hang trying to send the data back to the parent
+		for q in [qcmd, qbroadcast, qin, qout]:
+			q.cancel_join_thread()
 
 def _unserializer(file, offsets):
 	# Helper for _reduce_from_pickle_jar -- takes a filename and
@@ -240,8 +240,6 @@ class Pool:
 		self.terminate(try_joining=True)
 
 	def terminate(self, try_joining=False):
-		return
-
 		# Try waiting for workers to shut down by themselves
 		if try_joining:
 			for p in self.ps:
@@ -273,6 +271,16 @@ class Pool:
 
 		# Release the queues and worker objects
 		del self.ps[:]
+
+		# Close all queues
+		for qq in [ self.qcmd, self.qin, self.qbroadcast, self.qout ]:
+			if qq is None:
+				continue
+
+			if not isinstance(qq, list):
+				qq = [ qq ]
+			for q in qq:
+				q.close()
 		self.qcmd = self.qin = self.qbroadcast = self.qout = None
 
 	def _create_workers(self):
@@ -387,7 +395,7 @@ class Pool:
 						nrunning -= 1
 					elif what == 'EXCEPT':
 						# Unhandled Exception was raised in one of the workers.
-						# Terminate the workers and re-raise it.
+						# The workers will be terminated by the except clause at the end
 						type, value, tb_str = data
 						print >> sys.stderr, 'Remote Traceback (most recent call last):\n', ''.join(tb_str),
 						print >> sys.stderr, ''.join(traceback.format_exception_only(type, value))
@@ -402,7 +410,7 @@ class Pool:
 						# If all items have been exhausted, unstop all workers so they can
 						# finish cleanly
 						ntarget = self.nworkers
-						
+					
 						# Rescind outstanding STOP orders, if any
 						if wf == self.nworkers:
 							for _ in xrange(nstopping):
