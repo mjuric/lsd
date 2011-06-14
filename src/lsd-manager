@@ -52,6 +52,6 @@ if __name__ == "__main__":
 	optlist, (max_cores,) = tui_getopt('q', ['quiet'], 1, usage, stdopts=False)
 
 	# Instantiate a server
-	server = PyRPCServer("localhost", 5432)
+	server = PyRPCServer("localhost", 9029)
 	server.register_instance(ActiveWorkerManager(int(max_cores)))
 	server.serve_forever()

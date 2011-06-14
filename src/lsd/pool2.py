@@ -349,7 +349,7 @@ class Pool:
 		if parallel:
 			try:
 				# Create workers (if not created already)
-				_mgr = PyRPCProxy("localhost", 5432)
+				_mgr = PyRPCProxy("localhost", 9029)
 				self._create_workers()
 
 				# Connect to worker manager and stop workers over the limit
