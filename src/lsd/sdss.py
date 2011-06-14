@@ -7,7 +7,7 @@ import time
 
 sdss_table_def = \
 {
-	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 	'schema': {
 		#
 		#	 LSD column name      Type    FITS (sweep files) column

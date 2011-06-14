@@ -20,7 +20,7 @@ longdesc = """Large Survey Database"""
 
 args = { 
 	'name'			: "lsd",
-	'version'		: "0.3.1", # When you change this, modify __version__ in __init__.py
+	'version'		: "0.5.0", # When you change this, modify __version__ in __init__.py
 	'description'	 	: "Large Survey Database Python Module",
 	'long_description'	: longdesc,
 	'license'		: "GPLv2",

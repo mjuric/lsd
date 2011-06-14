@@ -3,15 +3,60 @@
 import StringIO
 import tokenize
 
-def check_key_validity(key):
-	if key not in ['nmax', 'dmax', 'inner', 'outer', 'xmatch', 'matchedto']:
-		raise Exception("Unknown keyword '%s' in FROM clause" % key)
+valid_keys_from = frozenset(['nmax', 'dmax', 'inner', 'outer', 'xmatch', 'matchedto'])
+valid_keys_into = frozenset(['spatial_keys', 'temporal_key', 'dtype'])
 
 def unquote(s):
 	# Unquote if quoted
 	if s and s[0] in frozenset(['"', "'"]):
 		return s[1:-1]
 	return s
+
+def parse_args(g, token, valid_keys):
+	args = dict()
+	while token != ')':
+		key = next(g)[1].lower()	# key=value or key or )
+		if key == ')':
+			break
+		if key not in valid_keys:
+			raise Exception("Unknown keyword '%s' found in table arguments" % key)
+		token = next(g)[1].lower()
+		if token == '=':
+			# Slurp up the value
+			val = next(g)[1]
+			token = next(g)[1]
+
+			# Allow constructs such as: spatial_keys=(ra, dec)
+			# and parse these into a list
+			if val in ['(', '[']:
+				# List of values
+				end_token = ')' if val == '(' else ']'
+				val = []
+				v = []
+				while token != end_token:
+					if token != ',':
+						v.append(token)
+					else:
+						val.append(' '.join(v))
+						v = []
+					token = next(g)[1]
+				if v:
+					val.append(' '.join(v))
+
+				token = next(g)[1]
+				assert token in [',', ')'], token
+			else:
+				while token not in set([')', ',', '']):
+					val += token
+					token = next(g)[1]
+
+		else:
+			val = None
+			assert token in [',', ')']
+
+		args[key] = unquote(val) if not isinstance(val, list) else [ unquote(v) for v in val ]
+
+	return args, token
 
 def parse(query):
 	""" 
@@ -89,24 +134,7 @@ def parse(query):
 						astable = table
 						for _ in xrange(2):
 							if token == '(':
-								args = dict()
-								while token != ')':
-									key = next(g)[1].lower()	# key=value or key or )
-									if key == ')':
-										break
-									check_key_validity(key)
-									token = next(g)[1].lower()
-									if token == '=':
-										# Slurp up the value
-										val = next(g)[1]
-										token = next(g)[1]
-										while token not in [')', ',', '']:
-											val += token
-											token = next(g)[1]
-									else:
-										val = None
-										assert token in [',', ')']
-									args[key] = unquote(val)
+								args, token = parse_args(g, token, valid_keys_from)
 								if 'inner' in args and 'outer' in args:
 									raise Exception('Cannot simultaneously have both "inner" and "outer" as join type')
 								if len(args):
@@ -138,16 +166,18 @@ def parse(query):
 					if token.lower() == 'into':
 						(_, table, _, _, _) = next(g)
 						(_, token, _, _, _) = next(g)
-						dtype = into_col = keyexpr = None
+						into_col = keyexpr = None
+						into_args = {}
 						kind = 'append'
 
-						# Look for explicit dtype in parenthesis
+						# Look for explicit into_args in parenthesis
 						if token == '(':
-							dtype = ''
-							(_, token, _, _, _) = next(g)
-							while token not in [')']:
-								dtype += token
-								(_, token, _, _, _) = next(g)
+							into_args, token = parse_args(g, token, valid_keys_into)
+							#dtype = ''
+							#(_, token, _, _, _) = next(g)
+							#while token not in [')']:
+							#	dtype += token
+							#	(_, token, _, _, _) = next(g)
 
 							(_, token, _, _, _) = next(g)
 
@@ -176,7 +206,7 @@ def parse(query):
 								tokens.append(token)
 							keyexpr = ''.join(tokens)
 
-						into_clause = (table, dtype, into_col, keyexpr, kind)
+						into_clause = (table, into_args, into_col, keyexpr, kind)
 					
 					if token != '':
 						raise Exception('Syntax error near "%s"', token)

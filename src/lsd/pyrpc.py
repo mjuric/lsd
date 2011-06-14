@@ -218,6 +218,7 @@ class PyRPCProxy(object):
 	_lock = None	# lock protecting rfile/wfile/sock
 
 	_heatbeat_interval = None	# The interval in which to send heartbeats to the server
+	_hbeat_run = True		# Whether to run a heartbeat thread or not
 	_hbeat = None			# The heatbeat timer thread
 
 	def __init__(self, host, port, heartbeat_interval=5.):
@@ -225,6 +226,7 @@ class PyRPCProxy(object):
 		self._lock = threading.Lock()
 		self._addr = (host, port)
 		self._heartbeat_interval = heartbeat_interval
+		self._hbeat_run = False
 
 		#self._connect()
 
@@ -237,6 +239,7 @@ class PyRPCProxy(object):
 			self._wfile = self._sock.makefile('wb', 0)
 
 			# Start the hearbeat thread
+			self._hbeat_run = True
 			self._heartbeat()
 
 	# Deletion/closure of proxy object
@@ -271,20 +274,19 @@ class PyRPCProxy(object):
 				self._wfile.write("\n")
 
 				# Schedule next firing
-				i = self._heartbeat_interval
-				if i is not None:
-					self._hbeat = threading.Timer(i, self._heartbeat)
+				if self._hbeat_run:
+					self._hbeat = threading.Timer(self._heartbeat_interval, self._heartbeat)
 					self._hbeat.daemon = True
 					self._hbeat.start()
 		except Exception as e:
-			print e
-			pass
+			logger.warning("Lost connection to %s:%s (%s)" % (self._addr[0], self._addr[1], e))
 
 	def _stop_heartbeat(self):
-		if self._heartbeat_interval and self._hbeat:
-			self._hbeat.cancel()
-			self._heartbeat_interval = None
-			self._hbeat = None
+		with self._lock:
+			if self._hbeat:
+				self._hbeat.cancel()
+				self._hbeat = None
+				self._hbeat_run = False
 
 	# Remote procedure caller
 	class _Method:
@@ -408,9 +410,18 @@ class TestPyRPCProxy:
 		time.sleep(1)
 		try:
 			svr.bar()
-			assert 0 == "Should have failed"
+			assert 0, "Should have failed"
 		except RPCError as e:
 			pass
+
+		print "Reconnecting and checking if heartbeats will restart."
+		assert svr.login("mjuric", "bla")
+		svr.bar()
+		time.sleep(2)
+		try:
+			svr.bar()
+		except RPCError as e:
+			assert 0, "Failed to keep connection"
 		svr.close()
 
 		print "Returning timeout to old value"

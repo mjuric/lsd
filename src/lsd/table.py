@@ -4,15 +4,18 @@ Implementation of class Table, representing tables in the database.
 """
 
 import logging
+import locking
 import subprocess
 import tables
 import numpy as np
-import os
+import os, os.path
 import sys
 import json
 import utils
 import cPickle
 import copy
+import glob
+import shutil
 from fcache       import TabletTreeCache
 from utils        import is_scalar_of_type
 from pixelization import Pixelization
@@ -71,6 +74,7 @@ class Table:
 	_cgroups = None		#: Column groups in the table ( OrderedDict of table definitions (dicts), keyed by tablename; the first table is the primary one)
 	_fgroups = None		#: Map of file group name -> file group definition. File groups define where and how external blobs are stored.
 	_filters = None		#: Default PyTables filters to be applied to every Leaf in the file (can be overridden on per-tablet and per-blob basis)
+	_commit_hooks = None	#: List of hooks to be called upon COMMIT
 
 	columns        = None	#: OrderedDict of ColumnType objects describing the columns in the table
 	primary_cgroup = None	#: The primary cgroup of this table (IDs and spatial/temporal keys are always in the primary group)
@@ -78,47 +82,323 @@ class Table:
 	spatial_keys   = None	#: A tuple of two ColumnType instances, for (lon, lat). None if no spatial key exists.
 	temporal_key   = None	#: A ColumnType instance for the temporal key. None if no temporal key exist.
 
+	snapid         = 0      #: Snapshot ID of the opened table
+	_snapshots     = [ 0 ]  #: Sorted (newest to oldest) list of available, committed, snapshots
+	transaction    = False  #: True if we're in a transaction (the current snapshot is writable)
+
+	_default_commit_hooks = [('Updating neighbors', 0, 'lsd.tasks', 'build_neighbor_cache')] #: Default commit hook rebuilds the neighbor cache
+
+	### Transaction/Snapshotting support
+	def set_snapshot(self, snapid):
+		#### NOTE: This may get called even before the schema is loaded
+		####
+
+		# Snapshot ID
+		self.snapid = snapid
+
+		# Load the list of committed snapshots that are older than this one
+		self._snapshots = [ 0 ]
+		for path in glob.iglob('%s/snapshots/*/.committed' % (self.path)):
+			s = path.split('/')[-2]
+			if s <= snapid:
+				self._snapshots.append(s)
+		# Sorted list of snapshots, newest first
+		self._snapshots.sort(reverse=True)
+
+		# Check if this table is participating in an open transaction.
+		if self.snapid != self._snapshots[0]:
+			path = self._snapshot_path(self.snapid)
+			assert not os.path.isdir(path) or not os.path.isfile('%s/.committed' % path)
+			self.transaction = True
+
+        def _load_catalog(self):
+		# Load the tablet cache.
+		#
+		tabtreepkl = self._find_metadata_path('catalog.pkl')
+		if os.path.isfile(tabtreepkl):
+			self.tablet_tree = TabletTreeCache(tabtreepkl)
+		elif os.path.isdir(os.path.join(self.path, 'tablets')) and not os.path.isdir(os.path.join(self.path, 'tablets', 'snapshots')):
+			# Backwards compatibility: Auto-create it for old-style (pre v0.4) tables
+		        assert self._snapshots[0] == 0
+			print >> sys.stderr, "[%s] Updating tablet catalog:" % (self.name),
+ 			self.build_tablet_tree_cache(0)
+		else:
+			raise Exception("Table data catalog corruption detected")
+
+	def get_cells_in_snapshot(self, snapid):
+		return self.tablet_tree.get_cells_in_snapshot(snapid)
+
+	def build_tablet_tree_cache(self, snapid = None, save=True, quiet=False):
+		self._check_transaction()
+
+		if snapid is None:
+			snapid = self.snapid
+
+		pattern   = self._tablet_filename(self.primary_cgroup)
+		self.tablet_tree = TabletTreeCache().create_cache(self.pix, self.path, snapid, pattern, quiet=quiet)
+
+		if save:
+			tabtreepkl = self._snapshot_path(snapid) + '/catalog.pkl'
+			self.tablet_tree.save(tabtreepkl)
+
+	def _check_transaction(self):
+		if not self.transaction:
+			raise Exception("Trying to modify a table without starting a transaction")
+
+	def begin_transaction(self, snapid):
+		# Begin a new transaction
+		path = self._snapshot_path(self.snapid)
+		if os.path.isfile('%s/.committed' % path):
+			raise Exception("Trying to reopen an already committed transaction")
+
+		if self.snapid != snapid:
+			self.set_snapshot(snapid)
+			self._load_schema()
+			self._load_catalog()
+
+		self.transaction = True
+
+	def commit0(self, db, pri):
+		""" Do post-transaction housekeeping """
+		if pri == -1:
+			# Build the tablet cache (hardwired)
+			print >> sys.stderr, "[%s] Updating tablet catalog:" % (self.name),
+			self.build_tablet_tree_cache()
+			self._snapshots.insert(0, self.snapid)
+
+		# Call post-commit hooks of the given priority. By default, these
+		# rebuild the neighbor cache.
+		import importlib
+		for hookdef in self._commit_hooks:
+			(msg, priority, module, func) = hookdef[:4]
+
+			if priority == pri:
+				print >>sys.stderr, "[%s] %s:" % (self.name, msg),
+				try:
+					args = hookdef[4]
+				except IndexError:
+					args = []
+				try:
+					kwargs = hookdef[5]
+				except IndexError:
+					kwargs = {}
+
+				m = importlib.import_module(module)
+				func = "commit_hook__" + func
+				getattr(m, func)(db, self, *args, **kwargs)
+
+		if pri == 10:
+			print >>sys.stderr, "[%s] Updating stats:" % self.name,
+			# Compute summary stats (hardwired)
+			from tasks import compute_counts
+			self._nrows = compute_counts(db, self.name)
+			self._store_schema()
+
+			# Set all files read only
+			print >>sys.stderr, "[%s] Marking tablets read-only..." % self.name
+			path = os.path.abspath(self._snapshot_path(self.snapid))
+			for root, dirs, files in os.walk(path):
+				root = os.path.abspath(root)
+				if root != path:
+					os.chmod(root, 0555)			# r-x
+				for f in files:
+					os.chmod(os.path.join(root, f), 0444)	# r--
+
+	def commit1(self):
+		""" Do the actual commit """
+		# Set commit marker
+		path = self._snapshot_path(self.snapid)
+		commit_marker = '%s/.committed' % path
+		open(commit_marker, 'w').close()
+
+		os.chmod(commit_marker, 0444)
+		os.chmod(path, 0555)
+
+		self.transaction = False
+
+	def rollback(self):
+		""" Abort the transaction """
+		self.transaction = False
+
+		# Reload pristine state
+		self.set_snapshot(self.snapid)
+		self._load_schema()
+		self._load_catalog()
+
 	### File name/path related methods
-	def _get_cgroup_data_path(self, cgroup):
+	def _resolve_uri(self, uri, mode, return_parts=False):
 		"""
-		Allow individual cgroups to override where they're placed
+		Resolve an lsd: URI referring to this table. Used _only_ from
+		open_uri()
 
-		This may someday come in handy for direct JOINs (not used yet).
-		
-		TODO: This seems like a dumb idea, in retrospect. A single
-		      join is not that expensive, and it's infinitely more
-		      flexible and robust than a row-by-row JOIN. Remove it
-		      at some point.
-		"""
-		schema = self._get_schema(cgroup)
-		return schema.get('path', '%s/tablets' % (self.path))
-
-	def _get_fgroup_path(self, fgroup):
-		"""
-		Allow specification of per-filegroup paths.
-		"""
-		if fgroup not in self._fgroups or 'path' not in self._fgroups:
-			return '%s/files/%s' % (self.path, fgroup)
-
-		return self._fgroups[fgroup]['path']
-
-	def resolve_uri(self, uri, return_parts=False):
-		"""
-		Resolve an lsd: URI referring to this table.
-		
-		TODO: Clean up and document lsd URIs
+		If mode == 'w', resolve into the path of last snapshot.
+		If mode == 'r', find the latest snapshot that has the file.
 		"""
 		assert uri[:4] == 'lsd:'
 
 		_, tabname, fgroup, fn = uri.split(':', 3)
 
 		(file, args, suffix) = self._get_fgroup_filter(fgroup)
-		path = '%s/%s%s' % (self._get_fgroup_path(fgroup), fn, suffix)
-		
+		subpath = 'files/%s/%s%s' % (fgroup, fn, suffix)
+
+		if mode == 'r':
+			# Go through the list of snapshots until one is found that
+			# has our file.
+			for snapid in self._snapshots:
+				path = '%s/%s' % (self._snapshot_path(snapid), subpath)
+				if os.path.exists(path):
+					break
+			else:
+				raise IOError((errno.ENOENT, "No file for URI", uri))
+		elif mode == 'w':
+			self._check_transaction()
+			path = '%s/%s' % (self._snapshot_path(self.snapid), subpath)
+		else:
+			raise Exception("Invalid file access mode '%s'" % mode)
+
 		if not return_parts:
 			return path
 		else:
 			return path, (tabname, fgroup, fn), (file, args, suffix)
+
+	@contextmanager
+	def open_uri(self, uri, mode='r'):
+		"""
+		Open the resource (a file) identified by the URI
+		and return a file-like object. The resource is
+		closed automatically when the context is exited.
+
+		Parameters
+		----------
+		uri : string
+		    The URI of the file to be opened. It is assumed that the
+		    URI is an lsd: URI, referring to this table (i.e., it
+		    must begin with lsd:tablename:).
+		mode : string
+		    The mode keyword is passed to the call that opens the
+		    URI, but in general it is the same or similar to the
+		    mode keyword of file(). If mode != 'r', the resource is
+		    assumed to be opened for writing.
+		"""
+		(fn, (_, _, _), (file, kwargs, _)) = self._resolve_uri(uri, mode, return_parts=True)
+
+		if mode != 'r':
+			# Create directory to the file, if it
+			# doesn't exist.
+			path = fn[:fn.rfind('/')];
+			if not os.path.exists(path):
+				utils.mkdir_p(path)
+
+		f = file(fn, mode, **kwargs)
+		
+		yield f
+		
+		f.close()
+
+	def _snapshot_path(self, snapid, create=False):
+		""" Return full path to given snapshot """
+		if snapid != 0:
+			path = "%s/snapshots/%s" % (self.path, snapid)
+		else:
+			path = self.path
+
+		if create:
+			utils.mkdir_p(path)
+
+		return path
+
+	def _cell_path(self, cell_id, mode='r'):
+		""" Return the full path to a particular cell """
+		if mode == 'r':
+			snapid = self.tablet_tree.snapshot_of_cell(cell_id)
+		elif mode in ['w', 'r+']:
+			self._check_transaction()
+			snapid = self.snapid
+		else:
+			raise Exception("Invalid mode '%s'" % mode)
+
+		return '%s/tablets/%s' % (self._snapshot_path(snapid), self.pix.path_to_cell(cell_id))
+
+	def _tablet_filename(self, cgroup):
+		""" Return the filename of a tablet of the given cgroup """
+		return '%s.%s.h5' % (self.name, cgroup)
+
+	def _tablet_file(self, cell_id, cgroup, mode='r'):
+		"""
+		Return the full path to the tablet of the given cgroup
+		"""
+		path = self._cell_path(cell_id, mode)
+		return '%s/%s' % (path, self._tablet_filename(cgroup))
+
+	def tablet_exists(self, cell_id, cgroup=None):
+		"""
+		Check if a tablet exists.
+
+		Return True if the given tablet exists in cell_id. For
+		pseudo-cgroups check the existence of primary_cgroup.
+
+		"""
+		if cgroup is None or self._is_pseudotablet(cgroup):
+			cgroup = self.primary_cgroup
+
+		assert cgroup in self._cgroups
+
+		fn = self._tablet_file(cell_id, cgroup)
+		return os.access(fn, os.R_OK)
+
+	#############
+
+	def get_cells(self, bounds=None, return_bounds=False, include_cached=True):
+		"""
+		Returns a list of cells (cell_id-s) overlapping the bounds.
+
+		Used by the query engine to retrieve the list of cells to
+		visit when evaluating a query. Uses TabletTreeCache to
+		accelelrate the lookup (and autocreates it if it doesn't
+		exist).
+
+		Parameters
+		----------
+		bounds : list of (Polygon, intervalset) tuples or None
+		    The bounds to be checked
+		return_bounds : boolean
+		    If true, for return a list of (cell_id, bounds) tuples,
+		    where the returned bounds in each tuple are the
+		    intersection of input bounds and the bounds of that
+		    cell (i.e., for an object known to be in that cell, you
+		    only need to check the associated bounds to verify
+		    whether it's within the input bounds).
+		    If the bounds cover the entire cell, (cell_id, (None,
+		    None)) will be returned.
+		include_cached : boolean
+		    If true, return the cells that have cached data only,
+		    and no "true" data belonging to that cell.
+		"""
+		return self.tablet_tree.get_cells(bounds, return_bounds, include_cached)
+
+	def static_if_no_temporal(self, cell_id):
+		"""
+		Return the associated static cell, if no data exist in
+		temporal.
+
+		See if we have data in cell_id. If not, return a
+		corresponding static sky cell_id. Useful when evaluating
+		static-temporal JOINs
+		
+		If the cell_id already refers to a static cell, this
+		function is a NOOP.
+		"""
+		if not self.pix.is_temporal_cell(cell_id):
+			return cell_id
+
+		if self.tablet_exists(cell_id):
+			##print "Temporal cell found!", self._cell_prefix(cell_id)
+			return cell_id
+
+		# return corresponding static-sky cell
+		cell_id = self.pix.static_cell_for_cell(cell_id)
+		#print "Reverting to static sky", self._cell_prefix(cell_id)
+		return cell_id
 
 	def _get_fgroup_filter(self, fgroup):
 		"""
@@ -172,45 +452,6 @@ class Table:
 
 		return file, kwargs, suffix
 
-	@contextmanager
-	def open_uri(self, uri, mode='r', clobber=True):
-		"""
-		Open the resource (a file) identified by the URI
-		and return a file-like object. The resource is
-		closed automatically when the context is exited.
-
-		Parameters
-		----------
-		uri : string
-		    The URI of the file to be opened. It is assumed that the
-		    URI is an lsd: URI, referring to this table (i.e., it
-		    must begin with lsd:tablename:).
-		mode : string
-		    The mode keyword is passed to the call that opens the
-		    URI, but in general it is the same or similar to the
-		    mode keyword of file(). If mode != 'r', the resource is
-		    assumed to be opened for writing.
-		clobber : boolean
-		    If False, an exception will be thrown if the file being
-		    opened exists and mode != 'r'
-		"""
-		(fn, (_, _, _), (file, kwargs, _)) = self.resolve_uri(uri, return_parts=True)
-
-		if mode != 'r':
-			# Create directory to the file, if it
-			# doesn't exist.
-			path = fn[:fn.rfind('/')];
-			if not os.path.exists(path):
-				utils.mkdir_p(path)
-			if clobber == False and os.access(fn, os.F_OK):
-				raise Exception('File %s exists and clobber=False' % fn)
-
-		f = file(fn, mode, **kwargs)
-		
-		yield f
-		
-		f.close()
-
 	def set_default_filters(self, **filters):
 		"""
 		Set default PyTables filters (compression, checksums)
@@ -218,6 +459,10 @@ class Table:
 		Immediately commits the change to disk.
 		"""
 		self._filters = filters
+		self._store_schema()
+
+	def define_commit_hooks(self, hooks):
+		self._commit_hooks = hooks
 		self._store_schema()
 
 	def define_fgroup(self, fgroup, fgroupdef):
@@ -228,128 +473,6 @@ class Table:
 		"""
 		self._fgroups[fgroup] = fgroupdef
 		self._store_schema()
-
-	def _tablet_filename(self, cgroup):
-		""" Return the filename of a tablet of the given cgroup """
-		return '%s.%s.h5' % (self.name, cgroup)
-
-	def _tablet_file(self, cell_id, cgroup):
-		"""
-		Return the full path to the tablet of the given cgroup
-		"""
-		return '%s/%s/%s' % (self._get_cgroup_data_path(cgroup), self.pix.path_to_cell(cell_id), self._tablet_filename(cgroup))
-
-	def tablet_exists(self, cell_id, cgroup=None):
-		"""
-		Check if a tablet exists.
-
-		Return True if the given tablet exists in cell_id. For
-		pseudo-cgroups check the existence of primary_cgroup.
-
-		"""
-		if cgroup is None or self._is_pseudotablet(cgroup):
-			cgroup = self.primary_cgroup
-
-		assert cgroup in self._cgroups
-
-		fn = self._tablet_file(cell_id, cgroup)
-		return os.access(fn, os.R_OK)
-
-	def _cell_prefix(self, cell_id):
-		"""
-		Return the full path prefix to a particular cell.
-
-		The prefix is unique to this table. It is useful if several
-		tables share the same tablet tree, as it ensures that the
-		files at the leaves will be unique, if constructed from this
-		prefix.
-
-		It is used by Table._lock_cell() to construct a unique
-		filename for a lock.
-
-		Example
-		-------
-
-		For a table named 'ps1_det', in database 'some_db', in some
-		cell, this function will return:
-		
-		    >>> tab._cell_prefix(cell_id)
-		    'db/ps1_det/tablets/..../-0.328125+0.265625/T55249/ps1_det
-
-		"""
-		return '%s/%s/%s' % (self._get_cgroup_data_path(self.primary_cgroup), self.pix.path_to_cell(cell_id), self.name)
-
-	def static_if_no_temporal(self, cell_id):
-		"""
-		Return the associated static cell, if no data exist in
-		temporal.
-
-		See if we have data in cell_id. If not, return a
-		corresponding static sky cell_id. Useful when evaluating
-		static-temporal JOINs
-		
-		If the cell_id already refers to a static cell, this
-		function is a NOOP.
-		"""
-		if not self.pix.is_temporal_cell(cell_id):
-			return cell_id
-
-		if self.tablet_exists(cell_id):
-			##print "Temporal cell found!", self._cell_prefix(cell_id)
-			return cell_id
-
-		# return corresponding static-sky cell
-		cell_id = self.pix.static_cell_for_cell(cell_id)
-		#print "Reverting to static sky", self._cell_prefix(cell_id)
-		return cell_id
-
-	def get_cells(self, bounds=None, return_bounds=False, include_cached=True):
-		"""
-		Returns a list of cells (cell_id-s) overlapping the bounds.
-
-		Used by the query engine to retrieve the list of cells to
-		visit when evaluating a query. Uses TabletTreeCache to
-		accelelrate the lookup (and autocreates it if it doesn't
-		exist).
-
-		Parameters
-		----------
-		bounds : list of (Polygon, intervalset) tuples or None
-		    The bounds to be checked
-		return_bounds : boolean
-		    If true, for return a list of (cell_id, bounds) tuples,
-		    where the returned bounds in each tuple are the
-		    intersection of input bounds and the bounds of that
-		    cell (i.e., for an object known to be in that cell, you
-		    only need to check the associated bounds to verify
-		    whether it's within the input bounds).
-		    If the bounds cover the entire cell, (cell_id, (None,
-		    None)) will be returned.
-		include_cached : boolean
-		    If true, return the cells that have cached data only,
-		    and no "true" data belonging to that cell.
-		"""
-		if getattr(self, 'tablet_tree', None) is None:
-		        self.rebuild_tablet_tree_cache()
-
-		return self.tablet_tree.get_cells(bounds, return_bounds, include_cached)
-
-	def rebuild_tablet_tree_cache(self):
-		print >> sys.stderr, "Rebuilding tablet tree cache for table %s" % (self.name)
-		data_path = self._get_cgroup_data_path(self.primary_cgroup)
-		pattern   = self._tablet_filename(self.primary_cgroup)
-		self.tablet_tree = TabletTreeCache().create_cache(self.pix, data_path, pattern, self.path + '/tablet_tree.pkl')
-
-	def is_cell_local(self, cell_id):
-		"""
-		Returns True if the cell is local to the current machine.
-
-		A placeholder for if/when I decide to make this into a true
-		distributed database.
-		"""
-		return True
-
-	#############
 
 	def _unicode_to_str(self, arr):
 		"""
@@ -368,6 +491,14 @@ class Table:
 			else:
 				self._unicode_to_str(v)
 
+	def _find_metadata_path(self, fn):
+		if self.transaction:
+			path = os.path.join(self._snapshot_path(self.snapid), fn)
+			if os.path.isfile(path):
+				return path
+
+		return os.path.join(self._snapshot_path(self._snapshots[0]), fn)
+
 	def _load_schema(self):
 		"""
 		Load the table schema.
@@ -376,7 +507,7 @@ class Table:
 		the internal representation of the table (the self.columns
 		dict).
 		"""
-		schemacfg = self.path + '/schema.cfg'
+		schemacfg = self._find_metadata_path('schema.cfg')
 		data = json.loads(file(schemacfg).read(), object_pairs_hook=OrderedDict)
 		self._unicode_to_str(data)
 
@@ -403,7 +534,8 @@ class Table:
 		self._fgroups = data.get('fgroups', {})
 		self._filters = data.get('filters', {})
 		self._aliases = data.get('aliases', {})
-
+		self._commit_hooks = data.get('commit_hooks', self._default_commit_hooks)
+		
 		# Add pseudocolumns cgroup
 		self._cgroups['_PSEUDOCOLS'] = \
 		{
@@ -414,16 +546,9 @@ class Table:
 			]
 		}
 
-		# Load the file tree cache if it's not older than 'schema.cfg' file
-		# TODO: I should add a last row modification time to schema.cfg and decide
-		#       based on that whether to invalidate the cache or not.
-		tabtreepkl = self.path + '/tablet_tree.pkl'
-		if os.path.exists(tabtreepkl) and (os.stat(schemacfg)[8] < os.stat(tabtreepkl)[8]):
-			self.tablet_tree = TabletTreeCache(tabtreepkl)
-
 		self._rebuild_internal_schema()
 
-	def _store_schema(self):
+	def _store_schema(self, force=False):
 		"""
 		Store the table schema.
 
@@ -437,8 +562,12 @@ class Table:
 		data["fgroups"] = self._fgroups
 		data["filters"] = self._filters
 		data["aliases"] = self._aliases
+		data["commit_hooks"] = self._commit_hooks
 
-		f = open(self.path + '/schema.cfg', 'w')
+		if not force:
+			self._check_transaction()
+		fn = self._snapshot_path(self.snapid, create=True) + '/schema.cfg'
+		f = open(fn, 'w')
 		f.write(json.dumps(data, indent=4, sort_keys=True))
 		f.close()
 
@@ -569,44 +698,42 @@ class Table:
 		self._store_schema()
 
 	### Cell locking routines
-	def _lock_cell(self, cell_id, retries=-1):
+	def _lock_cell(self, cell_id, timeout=None):
 		"""
 		Low-level: Lock a given cell for writing.
 
 		You should prefer the lock_cell() context manager to this
 		function.
 
-		If retries != -1, and the cell is locked, we will retry
-		<retries> times, with 1 second pause in between, to lock the
-		cell. If all attempts fail, subprocess.CalledProcessError
-		will be thrown.
+		If timeout != None, and the cell is locked, we will retry
+		for timeout seconds to lock the cell.  If all attempts fail,
+		locking.LockTimeout exception will be thrown.
 
 		Returns
 		-------
-		fn : string
-		    The filename of the lock file.
-		    
-		Note: For forward-compatibility, you should use
-		      Table._unlock_cell(fn) to unlock the cell, and not
-		      remove the lockfile directly (e.g., using os.unlink)
+		lock : opaque object
+		    The lock handle.
 		"""
-		# create directory if needed
-		fn = self._cell_prefix(cell_id) + '.lock'
+		self._check_transaction()
 
-		path = fn[:fn.rfind('/')];
+		# create directory if needed
+		path = self._cell_path(cell_id, 'w')
 		if not os.path.exists(path):
 			utils.mkdir_p(path)
 
-		utils.shell('lockfile -1 -r%d "%s"' % (retries, fn) )
-		logger.debug("Acquired lockfile %s" % (fn))
-		return fn
+		fn = '%s/.__%s.lock' % (path, self.name)
+
+		lock = locking.acquire(fn, timeout)
+		logger.debug("Acquired lock %s" % (fn))
+
+		return lock
 
 	def _unlock_cell(self, lock):
 		"""
-		Unlock a cell.
+		Unlock a previously locked cell.
 		"""
-		os.unlink(lock)
-		logger.debug("Released lockfile %s" % (lock))
+		locking.release(lock)
+		logger.debug("Released lock %s" % (lock))
 
 	#### Low level tablet creation/access routines. These employ no locking
 	def _get_row_group(self, fp, group, cgroup):
@@ -674,7 +801,7 @@ class Table:
 		TODO: I feel this whole 'group' business hasn't been well
 		      though out and should be reconsidered/redesigned...
 		"""
-		with self.lock_cell(cell_id, mode='w') as cell:
+		with self.lock_cell(cell_id, mode='r+') as cell:
 			for cgroup in self._cgroups:
 				if self._is_pseudotablet(cgroup):
 					continue
@@ -709,71 +836,54 @@ class Table:
 		"""
 		Open (or create) a tablet.
 
-		Open a given tablet in read or write mode, autocreating if
-		necessary. Autocreation happens only if mode=='w'.
+		mode='r' : Open an existing tablet, read-obly
+		mode='w' : Open or create a tablet, truncating its contents
+		mode='r+': Open an existing tablet, for reading/writing
+
+		Modes that imply writablility require a transaction to be
+		open.
 
 		Employs no locking of any kind.
 		"""
-		fn = self._tablet_file(cell_id, cgroup)
+		fn_r = self._tablet_file(cell_id, cgroup)
 
-       		logger.debug("Opening tablet %s (mode='%s')" % (fn, mode))
+		logger.debug("Opening tablet %s (mode='%s')" % (fn_r, mode))
 		if mode == 'r':
 		        # --- hack: preload the entire file to have it appear in filesystem cache
 		        #     this will speed up subsequent random reads within the file
-			with open(fn) as f:
-        			f.read()
+			with open(fn_r) as f:
+				f.read()
 			# ---
-			fp = tables.openFile(fn)
-		elif mode == 'w':
-			if not os.path.isfile(fn):
-				fp = self._create_tablet(fn, cgroup)
+			fp = tables.openFile(fn_r)
+#			print "OPEN(r):", fn_r
+		elif mode == 'r+':
+			self._check_transaction()
+			fn_w = self._tablet_file(cell_id, cgroup, mode='w')
+			if os.path.isfile(fn_w):
+				fp = tables.openFile(fn_w, mode='a')
+#				print "OPEN(a):", fn_w
+			elif os.path.isfile(fn_r):
+				# A file exists in an older snapshot. Copy it over here.
+				assert fn_r != fn_w, (fn_r, fn_w)
+				shutil.copy(fn_r, fn_w)
+				os.chmod(fn_w, 0664)	# Ensure it's writable
+				fp = tables.openFile(fn_w, mode='a')
+#				print "OPEN(a):", fn_w
 			else:
-				fp = tables.openFile(fn, mode='a')
+				# No file exists
+				fp = self._create_tablet(fn_w, cgroup)
+		elif mode == 'w':
+			self._check_transaction()
+			fn_w = self._tablet_file(cell_id, cgroup, mode='w')
+			fp = self._create_tablet(fn_w, cgroup)
+#			print "OPEN(w):", fn_w
 		else:
-			raise Exception("Mode must be one of 'r' or 'w'")
+			raise Exception("Mode must be one of 'r', 'r+', or 'w'")
 
 		return fp
 
-	def _drop_tablet(self, cell_id, cgroup):
-		"""
-		Remove a tablet.
-		
-		Remove a tablet file. Employs no locking.
-		"""
-		assert 0, "Not currently used."
-
-		if not self.tablet_exists(cell_id, cgroup):
-			return
-
-		fn = self._tablet_file(cell_id, cgroup)
-		os.unlink(fn)
-
-	def _append_tablet(self, cell_id, cgroup, rows):
-		"""
-		Internal: Append a set of rows to a tablet.
-
-		Employs no locking.
-
-		Parameters
-		----------
-		cell_id : integer
-		    The cell_id into which to write
-		cgroup : string
-		    The column group into which to write
-		rows : structured ndarray
-		    The structured array, compatible with the tablet's
-		    table, that is to be appended to the tablet.
-		"""
-		assert 0, "Not currently used."
-
-		fp  = self._open_tablet(cell_id, mode='w', cgroup=cgroup)
-
-		fp.root.main.table.append(rows)
-
-		fp.close()
-
 	### Public methods
-	def __init__(self, path, mode='r', name=None, level=None, t0=None, dt=None):
+	def __init__(self, path, snapid, mode='r', name=None, level=None, t0=None, dt=None):
 		"""
 		Constructor.
 		
@@ -782,28 +892,38 @@ class Table:
 		"""
 		self.pix = Pixelization(level=int(os.getenv("PIXLEVEL", 6)), t0=54335, dt=1)
 		if mode == 'c':
-			assert name is not None
-			self._create(name, path, level, t0, dt)
+			self._create(snapid, name, path, level, t0, dt)
 		else:
 			self.path = path
 			if not os.path.isdir(self.path):
 				raise IOError('Cannot access table: "%s" is inexistant or not readable.' % (path))
-			self._load_schema()
 
-	def _create(self, name, path, level, t0, dt):
+        		# Load the table from the requested snapshot
+        		self.set_snapshot(snapid)
+        		self._load_schema()
+        		self._load_catalog()
+
+	def _create(self, snapid, name, path, level, t0, dt):
 		"""
 		Create an empty table and store its schema.
+		
+		Note: You must call _load_schema() after this for the table to actually be loaded.
 		"""
+		assert name is not None
+
+		self.transaction = True
 		self.path = path
 
-		utils.mkdir_p(self.path)
-		if os.path.isfile(self.path + '/schema.cfg'):
+		for path in glob.iglob('%s/snapshots/*/.committed' % (self.path)):
 			raise Exception("Creating a new table in '%s' would overwrite an existing one." % self.path)
+
+		utils.mkdir_p(self.path)
 
 		self._cgroups = OrderedDict()
 		self._fgroups = dict()
 		self._filters = dict()
 		self._aliases = dict()
+		self._commit_hooks = []
 		self.columns = OrderedDict()
 		self.name = name
 
@@ -812,8 +932,11 @@ class Table:
 		if    dt is None: dt = self.pix.dt
 		self.pix = Pixelization(level, t0, dt)
 
+		# Save table definition into the snapshot
+		self.set_snapshot(snapid)
 		self._store_schema()
-		self._load_schema()	# This will trigger the addition of pseudotables
+		self._load_schema()	# To construct internal state
+		self.build_tablet_tree_cache(snapid, quiet=True)
 
 	def define_alias(self, alias, colname):
 		"""
@@ -884,6 +1007,9 @@ class Table:
 
 		assert group in ['main', 'cached']
 		assert _update == False or group != 'cached'
+
+		# Must be in a transaction to modify things
+		self._check_transaction()
 
 		# Resolve aliases in the input, and prepare a ColGroup()
 		cols = ColGroup()
@@ -965,11 +1091,11 @@ class Table:
 					cur_cell_id = unique_cells[i]
 
 					# Try to acquire a lock for the entire cell
-					lock = self._lock_cell(cur_cell_id, retries=0)
+					lock = self._lock_cell(cur_cell_id, timeout=1)
 
 					unique_cells.pop(i)
 					break
-				except subprocess.CalledProcessError as _:
+				except locking.LockTimeout as _:
 #					print "LOCK:", _
 					pass
 			else:
@@ -984,7 +1110,7 @@ class Table:
 					continue
 
 				# Get the tablet file handles
-				fp    = self._open_tablet(cur_cell_id, mode='w', cgroup=cgroup)
+				fp    = self._open_tablet(cur_cell_id, mode='r+', cgroup=cgroup)
 				g     = self._get_row_group(fp, group, cgroup)
 				t     = g.table
 				blobs = schema['blobs'] if 'blobs' in schema else dict()
@@ -1072,7 +1198,7 @@ class Table:
 					# -- bug in PyTables ??
 					logger.debug("Closing tablet (%s)" % (fp.filename))
 					fp.close()
-					fp = self._open_tablet(cur_cell_id, mode='w', cgroup=cgroup)
+					fp = self._open_tablet(cur_cell_id, mode='r+', cgroup=cgroup)
 					g  = self._get_row_group(fp, group, cgroup)
 					t  = g.table
 
@@ -1457,7 +1583,7 @@ class Table:
 			fp.close()
 
 	@contextmanager
-	def lock_cell(self, cell_id, mode='r', retries=-1):
+	def lock_cell(self, cell_id, mode='r', timeout=None):
 		""" Open and return a proxy object for the given cell, that allows
 		    one to safely open individual tablets stored there.
 
@@ -1465,12 +1591,13 @@ class Table:
 		    for the duration of this context manager, and automatically
 		    unlocked upon exit.
 		"""
-		lockfile = None if mode == 'r' else self._lock_cell(cell_id, retries=retries)
+		lock = None if mode == 'r' else self._lock_cell(cell_id, timeout=None)
 
-		yield Table.CellProxy(self, cell_id, mode=mode)
-
-		if lockfile != None:
-			self._unlock_cell(lockfile)
+		try:
+        		yield Table.CellProxy(self, cell_id, mode=mode)
+                finally:
+        		if lock != None:
+        			self._unlock_cell(lock)
 
 	def get_spatial_keys(self):
 		"""

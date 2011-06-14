@@ -7,6 +7,7 @@ import pool2
 import numpy as np
 from itertools import izip
 import bhpix
+import sys
 from utils import as_columns, gnomonic, gc_dist, unpack_callable
 from colgroup import ColGroup
 from join_ops import IntoWriter
@@ -98,6 +99,14 @@ def compute_counts(db, table, include_cached=False):
 ###################################################################
 
 ###################################################################
+## Default neighbor cache building hook
+def commit_hook__build_neighbor_cache(db, table):
+	db.build_neighbor_cache(table.name, snapid=table.snapid)
+	print >> sys.stderr, "[%s] Updating tablet catalog:" % (table.name),
+	table.build_tablet_tree_cache()
+###################################################################
+
+###################################################################
 ## Cross-match two tables
 
 def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm, n_neighbors):
@@ -178,7 +187,7 @@ def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm, n_neighbors):
 
 xm_table_def = \
 {
-	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+	'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 	'schema': {
 		'main': {
 			'columns': [

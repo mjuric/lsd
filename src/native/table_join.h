@@ -438,8 +438,7 @@ template<typename Output>
 						}
 					}
 
-					mm = m[++at];
-				} while(get<0>(mm) == id);
+				} while(++at < m.size() && get<0>(mm = m[at]) == id);
 			}
 			at1 = o.size;
 
