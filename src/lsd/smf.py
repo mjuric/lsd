@@ -792,8 +792,6 @@ def make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=1./360
 
 	print "Matched a total of %d sources." % (ntot)
 	print "Total of %d objects added." % (ntotobj)
-	print "Rows in the object table: %d." % (obj_table.nrows())
-	print "Rows in the detection table: %d." % (det_table.nrows())
 
 def reserve_space(arr, minsize):
 	l = len(arr)

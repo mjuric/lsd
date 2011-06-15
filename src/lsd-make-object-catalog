@@ -71,3 +71,7 @@ with db.transaction():
 
 	if make_catalog:
 		smf.make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=radius/3600., explist=explist, fovradius=fovradius)
+
+if make_catalog:
+	print "Rows in the object table: %d." % (db.table(obj_tabname).nrows())
+	print "Rows in the detection table: %d." % (db.table(det_tabname).nrows())
