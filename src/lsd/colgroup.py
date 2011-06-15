@@ -192,11 +192,12 @@ class ColGroup(object):
 			row = make_record(self.dtype)
 			for pos, col in enumerate(self.column_data):
 				name = self.column_map[pos]
+				val = col[key]
 				# Special care for vector columns
 				if isinstance(val, np.ndarray):
-					row[name][:] = col[key]
+					row[name][:] = val
 				else:
-					row[name] = col[key]
+					row[name] = val
 			return row
 
 	def drop_column(self, key):
