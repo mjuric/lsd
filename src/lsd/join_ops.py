@@ -644,6 +644,12 @@ class TableColsProxy:
 		self.root_table = root_table
 		self.tables = tables
 
+	def keys(self):
+		# Return all tables, ensuring the root table
+		# gets returned first
+		ret = [ t for t in self.tables.keys() if t != self.root_table ]
+		return [ self.root_table ] + ret
+
 	def __getitem__(self, tabname):
 		# Return a list of columns in table tabname, unless
 		# they're pseudocolumns

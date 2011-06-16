@@ -226,7 +226,20 @@ def resolve_wildcards(select_clause, tablecols):
 	ret = []
 	for ascol, col in select_clause:
 		if col == '*':
-			ret.extend(( (col, col) for col in tablecols[''] ))
+			# Construct a list of all columns from all tables, prefixing
+			# some with their table name to avoid ambiguity.
+			# Note that the first table returned by tablecols.keys() is
+			# assumed to be the root table (its columns will never get
+			# prefixed)
+			selcols = set()
+			for tbl in tablecols.keys():
+				for col in tablecols[tbl]:
+					if col in selcols:
+						c = tbl+'.'+col
+					else:
+						c = col
+						selcols.add(c)
+					ret.append((c,c))
 		elif len(col) > 2 and col[-2:] == '.*':
 			tbl = col[:-2]
 			ret.extend(( (tbl+'.'+col, tbl+'.'+col) for col in tablecols[tbl] ))
