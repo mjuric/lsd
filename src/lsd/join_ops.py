@@ -987,6 +987,14 @@ class IntoWriter(object):
 		return np.empty(0, dtype='u8')
 
 	def write(self, cell_id, rows):
+		# Public API: write the given rows into a table.
+		# Return (cell_id, rows) tuple
+		assert isinstance(rows, ColGroup)
+		return self._write(cell_id, rows.copy())
+
+	def _write(self, cell_id, rows):
+		# Write the rows into the table, and modify them
+		# to keep only the _ID column. Return the result.
 		assert isinstance(rows, ColGroup)
 		self.rows = rows
 
@@ -2214,7 +2222,7 @@ def _iterate_mapper(qresult):
 def _into_writer(kw, qwriter):
 	cell_id, irows = kw
 	for rows in irows:
-		rows = qwriter.write(cell_id, rows)
+		rows = qwriter._write(cell_id, rows)
 		yield rows
 
 ###############################
