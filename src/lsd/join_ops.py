@@ -1994,27 +1994,61 @@ class DB(object):
 				print "Matched to", entry.table.name
 
 		for tabname, (e, jargs) in tablist:
-			# Check for tables that can be joined onto this one (where this one is on the right hand side of the relation)
+			# Find tables that can be joined onto this one (where this one is on the left hand side of the relation)
+			# We look for this first, so that if there are 'FROM a, b', with both having .join files, a x b join will be
+			# the one to prefer
+
 			# Look for default .join files named ".<tabname>:*.join"
 			dbpath = os.path.dirname(e.table.path)	# Look only in the table's dbdir
+			pathlist = [dbpath] + self.path		# List of paths to check to find the join destination table. Our path is the first one.
 
 			pattern = "%s/.%s:*.join" % (dbpath, e.table.name)
 			for fn in glob.iglob(pattern):
 				jtabname = fn[fn.rfind(':')+1:fn.rfind('.join')]
-				jpath = "%s/%s" % (dbpath, jtabname)
 
-				try:
+				for dbpath in pathlist:
+					jpath = "%s/%s" % (dbpath, jtabname)
+					if jpath not in tables_by_path:
+						continue
+
 					je, jargs = tables_by_path[jpath]
-				except KeyError:
+					break
+				else:
 					continue
 
-				if 'matchedto' in jargs:	# Explicitly joined
-					continue
 				if je.relation is not None:	# Already joined
 					continue
 
 				je.relation = create_join(self, fn, jargs, e.table, je.table)
 				e.joins.append(je)
+
+		# Find tables onto which the still unjoined tables can be joined
+		# via a .join file
+		for tabname, (e, jargs) in tablist:
+			# Ignore if already joined
+			if e.relation is not None:
+				continue
+
+			# Look for default .join files named ".*:<tabname>.join"
+			dbpath = os.path.dirname(e.table.path)	# Look only in the table's dbdir for .join
+			pathlist = [dbpath] + self.path		# List of paths to check to find the join destination table. Our path is the first one.
+
+			pattern = "%s/.*:%s.join" % (dbpath, e.table.name)
+			for fn in glob.iglob(pattern):
+				jtabname = fn[fn.rfind('/')+2:fn.rfind(':')]
+
+				for dbpath in pathlist:
+					jpath = "%s/%s" % (dbpath, jtabname)
+					if jpath not in tables_by_path:
+						continue
+
+					je, jargs = tables_by_path[jpath]
+					break
+				else:
+					continue
+
+				e.relation = create_join(self, fn, jargs, je.table, e.table)
+				je.joins.append(e)
 
 		# Discover the root (the one and only one table that has no links pointing to it)
 		root = None
