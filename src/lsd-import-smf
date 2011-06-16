@@ -43,18 +43,13 @@ files = files[offset::stride]
 #
 
 db = DB(dbdir)
-db.begin_transaction(join=True)
 
-# SMF file import
-if not mode or mode == 'import':
+def run_import():
 	print >> sys.stderr, "Importing SMF files:"
 	smf.import_from_smf(db, det_tabname, exp_tabname, files, survey, create=create)
 	print >> sys.stderr, "done."
 
-if not mode or mode == 'postprocess':
-	# Commit the result
-	db.commit()
-
+def run_checks():
 	# Sanity check: all queries linking to images must resolve within cell
 	print >> sys.stderr, "Consistency check: ",
 	q = db.query('_CELLID, det_id, ra, dec, exp_id, equinox FROM "%s", "%s"(outer) WHERE equinox == 0' % (det_tabname, exp_tabname))
@@ -65,3 +60,23 @@ if not mode or mode == 'postprocess':
 	det_table = db.table(det_tabname)
 	exp_table = db.table(exp_tabname)
 	print "Import done.", det_table.nrows(), "detections in", exp_table.nrows() , "exposures."
+
+if mode is not None:
+	# Run in two stages, import and postprocess,
+	# keeping the transaction alive after import
+
+	db.begin_transaction(join=True)
+
+	# SMF file import
+	if mode == 'import':
+		run_import()
+
+	if mode == 'postprocess':
+		db.commit()
+		db.run_checks()
+
+else:
+	with db.transaction():
+		run_import()
+
+	run_checks()
