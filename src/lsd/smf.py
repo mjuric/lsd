@@ -276,6 +276,17 @@ def gen_tab2type(tabdef):
 		
 	return tab2type
 
+def store_smf_list(db, exp_tabname, new_list):
+	""" Store a human-readable list of loaded SMF files, for
+	    fast lookup by ps1-load.
+	"""
+	smf_fn = db.query("select smf_fn from %s" % exp_tabname).fetch(progress_callback=pool2.progress_pass).smf_fn
+	smf_fn = np.append(smf_fn, new_list)
+
+	uri = 'lsd:%s:metadata:all_exposures.txt' % (exp_tabname)
+	with db.table(exp_tabname).open_uri(uri, mode='w') as f:
+		np.savetxt(f, smf_fn, fmt='%s')
+
 def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=False):
 	""" Import a PS1 table from DVO
 
@@ -295,7 +306,8 @@ def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=Fals
 			db.define_default_join(det_tabname, exp_tabname,
 				type = 'indirect',
 				m1   = (det_tabname, "det_id"),
-				m2   = (det_tabname, "exp_id")
+				m2   = (det_tabname, "exp_id"),
+				_overwrite=create
 				)
 		else:
 			det_table = db.table(det_tabname)
@@ -307,7 +319,9 @@ def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=Fals
 	t0 = time.time()
 	at = 0; ntot = 0
 	pool = pool2.Pool()
-	for (file, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_table, exp_table, det_c2f, exp_c2f, survey), progress_callback=pool2.progress_pass):
+	smf_fns = []
+	for (file, smf_fn, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_table, exp_table, det_c2f, exp_c2f, survey), progress_callback=pool2.progress_pass):
+		smf_fns.append(smf_fn)
 		at = at + 1
 		ntot = ntot + nloaded
 		t1 = time.time()
@@ -315,6 +329,8 @@ def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=Fals
 		time_tot = time_pass / at * len(smf_files)
 		print >>sys.stderr, '  ===> Imported %s [%d/%d, %5.2f%%] +%-6d %9d (%.0f/%.0f min.)' % (file, at, len(smf_files), 100 * float(at) / len(smf_files), nloaded, ntot, time_pass, time_tot)
 	del pool
+
+	return smf_fns
 
 def add_lb(cols):
 	(ra, dec) = cols['ra'], cols['dec']
@@ -509,7 +525,7 @@ def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f, survey):
 
 	ids = det_table.append(det_cols_all)
 
-	yield (file, len(ids), len(ids))
+	yield (file, fn, len(ids), len(ids))
 
 #########
 

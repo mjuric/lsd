@@ -46,8 +46,9 @@ db = DB(dbdir)
 
 def run_import():
 	print >> sys.stderr, "Importing SMF files:"
-	smf.import_from_smf(db, det_tabname, exp_tabname, files, survey, create=create)
+	new_smfs = smf.import_from_smf(db, det_tabname, exp_tabname, files, survey, create=create)
 	print >> sys.stderr, "done."
+	return new_smfs
 
 def run_checks():
 	# Sanity check: all queries linking to images must resolve within cell
@@ -73,10 +74,11 @@ if mode is not None:
 
 	if mode == 'postprocess':
 		db.commit()
-		db.run_checks()
+		run_checks()
 
 else:
 	with db.transaction():
-		run_import()
+		new_smfs = run_import()
+		smf.store_smf_list(db, exp_tabname, new_smfs)
 
 	run_checks()
