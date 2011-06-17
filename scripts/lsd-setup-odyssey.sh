@@ -33,8 +33,8 @@ export LSD_DB
 # ==============================================
 . $LSD_ODYSSEY_MODULES_SCRIPT
 
-export LSD_BIN="$LSD_BASE/lsd_$LSD_VER/bin"
-export PYLSD="$LSD_BASE/lsd_$LSD_VER/lib/python"
+export LSD_BIN="$LSD_BASE/$LSD_VER/bin"
+export PYLSD="$LSD_BASE/$LSD_VER/lib/python"
 
 # Test for whether we have LSD in PYTHONPATH
 test x$(echo -n $PYTHONPATH | awk -v RS=: '"'$PYLSD'" == $1' | head -n 1) == x"$PYLSD" || export PYTHONPATH="$PYLSD:$PYTHONPATH"

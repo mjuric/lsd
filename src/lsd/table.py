@@ -16,6 +16,7 @@ import cPickle
 import copy
 import glob
 import shutil
+import errno
 from fcache       import TabletTreeCache
 from utils        import is_scalar_of_type
 from pixelization import Pixelization
@@ -447,7 +448,7 @@ class Table:
 			# Plain file
 			import __builtin__
 			file = __builtin__.file
-			kwargs = ()
+			kwargs = {}
 			suffix = ''
 
 		return file, kwargs, suffix
@@ -1348,13 +1349,14 @@ class Table:
 			# bug workaround -- PyTables 2.2 returns a scalar for length-1 arrays
 			objlist = [ objlist ]
 
-		# Note: using np.empty followed by [:] = ... (as opposed to
+		# Note: using np.empty followed by a loop (as opposed to
 		#       np.array) ensures a 1D array will be created, even
 		#       if objlist[0] is an array (in which case np.array
 		#       misinterprets it as a request to create a 2D numpy
 		#       array)
 		blobs    = np.empty(len(objlist), dtype=object)
-		blobs[:] = objlist
+		for i, obj in enumerate(objlist):
+			blobs[i] = obj
 		blobs = blobs[idx]
 
 		#print >> sys.stderr, 'Loaded %d unique objects for %d refs' % (len(objlist), len(idx))

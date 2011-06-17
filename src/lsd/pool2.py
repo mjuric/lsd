@@ -551,6 +551,7 @@ class Pool:
 
 		if back_to_disk:
 			fp, prev_fp = None, None
+			mm, prev_mm = None, None
 
 		for i, K in enumerate(kernels):
 			K_fun, K_args = unpack_callable(K)
@@ -576,43 +577,60 @@ class Pool:
 					os.ftruncate(fd, BUFSIZE)
 					mm = mmap.mmap(fd, 0)
 
-			# Call the distributed mappers
-			mresult = defaultdict(list)
-			for r in self.imap_unordered(input, K_fun, K_args, progress_callback=progress_callback, progress_callback_stage=stage):
-				if last_step:
-					# yield the final result
-					yield r
-				else:
-					(k, v) = r
+			try:
+				# Call the distributed mappers
+				mresult = defaultdict(list)
+				for r in self.imap_unordered(input, K_fun, K_args, progress_callback=progress_callback, progress_callback_stage=stage):
+					if last_step:
+						# yield the final result
+						yield r
+					else:
+						(k, v) = r
 
-					if back_to_disk:
-						(hash, v) = v
-						if hash in unique_objects:
-							v = unique_objects[hash]
-						else:
-							# The output value has already been pickled (but not the key). Store the
-							# pickled value into the pickle jar, and keep the (key, offset) tuple.
-							offs = mm.tell()
-							mm.write(v)
-							assert len(v) == mm.tell() - offs
-							v = offs
-							unique_objects[hash] = offs
+						if back_to_disk:
+							(hash, v) = v
+							if hash in unique_objects:
+								v = unique_objects[hash]
+							else:
+								# The output value has already been pickled (but not the key). Store the
+								# pickled value into the pickle jar, and keep the (key, offset) tuple.
+								offs = mm.tell()
+								mm.write(v)
+								assert len(v) == mm.tell() - offs
+								v = offs
+								unique_objects[hash] = offs
 
-					# Prepare for next reduction
-					mresult[k].append(v)
+						# Prepare for next reduction
+						mresult[k].append(v)
 
-			input = mresult.items()
+				input = mresult.items()
+			except:
+				# In case of an exception, delete the temporary file so the kernel
+				# won't attempt to flush them to the disk
+				if back_to_disk:
+					if mm is not None:
+						mm.resize(1)
+						mm.close()
+						mm = None
 
-			if back_to_disk:
-				# Close/clear the intermediate result backing store from the previous step
-				if prev_fp is not None:
-					prev_mm.resize(1)
-					prev_mm.close()
-					os.ftruncate(prev_fp.file.fileno(), 0)
-					prev_fp.close()
+					if fp is not None:
+						os.ftruncate(fp.file.fileno(), 0)
+						fp.close()
+						fp = None
+					raise
+			finally:
+				if back_to_disk:
+					# Close/clear the intermediate result backing store from the previous step
+					# ensuring it's truncated first so it doesn't hit the disk if it hasn't
+					# already.
+					if prev_fp is not None:
+						prev_mm.resize(1)
+						prev_mm.close()
+						os.ftruncate(prev_fp.file.fileno(), 0)
+						prev_fp.close()
 
-				if fp is not None:
-					prev_fp, prev_mm = fp, mm
+					if fp is not None:
+						prev_fp, prev_mm = fp, mm
 
 		if progress_callback != None:
 			progress_callback('mapreduce', 'end', None, None, None)
