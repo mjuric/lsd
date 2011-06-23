@@ -209,9 +209,12 @@ class TabletTreeCache:
 		else:
 			return cells
 
-	def get_cells_in_snapshot(self, snapid):
+	def get_cells_in_snapshot(self, snapid, include_cached=True):
 		""" Return a list of cells that are physically stored in snapshot snapid """
-		cells = self._leaves['cell_id'][self._leaves['snapid'] == snapid]
+		keep = self._leaves['snapid'] == snapid
+		if not include_cached:
+			keep &= self._leaves['next'] > 0
+		cells = self._leaves['cell_id'][keep]
 		return cells
 
 	#################

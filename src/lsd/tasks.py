@@ -10,7 +10,7 @@ import bhpix
 import sys
 from utils import as_columns, gnomonic, gc_dist, unpack_callable
 from colgroup import ColGroup
-from join_ops import IntoWriter
+from join_ops import IntoWriter, DB
 
 ###################################################################
 ## Sky-coverage computation
@@ -86,16 +86,60 @@ def compute_coverage(db, query, dx = 0.5, bounds=None, include_cached=False, fil
 
 ###################################################################
 ## Count the number of objects in the table
-def ls_mapper(qresult):
+def ls_mapper(cell_id, db, tabname):
 	# return the number of rows in this chunk, keyed by the filename
-	for rows in qresult:
-		yield rows.info.cell_id, len(rows)
+	try:
+		with db.table(tabname).lock_cell(cell_id) as cell:
+			with cell.open() as fp:
+				n = fp.root.main.table.nrows
+	except IOError:
+		# This can occur when counting from cells in previous snapshots,
+		# and the cell in question was not populated there
+		return
 
-def compute_counts(db, table, include_cached=False):
+	yield n
+
+def compute_counts_aux(db, tabname, cells, progress_callback=None):
 	ntotal = 0
-	for (_, nobjects) in db.query("_ID FROM %s" % table).execute([ls_mapper], include_cached=include_cached):
-		ntotal = ntotal + nobjects
+
+	pool = pool2.Pool()
+	for nobjects in pool.map_reduce_chain(cells, [(ls_mapper, db, tabname)], progress_callback=progress_callback):
+		ntotal += nobjects
+
 	return ntotal
+
+def compute_counts(db, tabname, force=False):
+	if not force:
+		# Use the saved count from previous snapshot, and
+		# just add the rows added by this one
+		assert db.in_transaction()
+
+		# Load the count that was valid before this transaction
+		db2 = DB(':'.join(db.path))
+		try:
+			nrows = db2.table(tabname).nrows()
+		except IOError:
+			# This is a new table
+			nrows = 0
+
+		# Fetch all cells modified by this transaction
+		cells = db.table(tabname).get_cells_in_snapshot(db.snapid)
+
+		# Count up rows before modification
+		nrows_old = compute_counts_aux(db2, tabname, cells, progress_callback=pool2.progress_pct_nnl)
+
+		# Count up rows in modified cells
+		nrows_new = compute_counts_aux(db,  tabname, cells)
+
+		# The new row count
+		nrows += nrows_new - nrows_old
+	else:
+		# Directly count everything
+		cells = db.table(tabname).get_cells()
+		nrows = compute_counts_aux(db, tabname, cells)
+
+	return nrows
+
 ###################################################################
 
 ###################################################################

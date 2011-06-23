@@ -22,6 +22,7 @@ fovradius = None
 radius = 1.
 auto = False
 make_catalog = True
+oldexps = None
 for (o, a) in optlist:
 	if o == '-a' or o == '--auto':
 		auto = True
@@ -51,26 +52,21 @@ if explist is not None:
 
 db = lsd.DB(dbdir)
 
-def get_new_exposures(db, obj_tabname, det_tabname):
-	qobj="_EXP from %s, %s" % (obj_tabname, det_tabname)
-	qexp="_ID from %s" % (exp_tabname)
-	return smf.get_new_exposures(db, qobj, qexp)
-
 with db.transaction():
 	if create or auto:
 		smf.create_object_table(db, obj_tabname, det_tabname)
 
 	if gen_explist or auto:
 		print >> sys.stderr, "Scanning what is already in the database..."
-		explist = get_new_exposures(db, obj_tabname, det_tabname)
-		print >>sys.stderr, "%d new exposures (%d total)." % (len(explist), db.table(exp_tabname).nrows())
+		newexp, oldexps = smf.get_new_exposures(db, obj_tabname, det_tabname, exp_tabname)
+		print >>sys.stderr, "%d new exposures (%d total)." % (len(newexp), db.table(exp_tabname).nrows())
 
 	if gen_explist:
-		for exp in explist:
+		for exp in newexp:
 			print exp
 
 	if make_catalog:
-		smf.make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=radius/3600., explist=explist, fovradius=fovradius)
+		smf.make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=radius/3600., explist=newexp, oldexps=oldexps, fovradius=fovradius)
 
 if make_catalog:
 	print "Rows in the object table: %d." % (db.table(obj_tabname).nrows())

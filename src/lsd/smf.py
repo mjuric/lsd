@@ -276,16 +276,29 @@ def gen_tab2type(tabdef):
 		
 	return tab2type
 
-def store_smf_list(db, exp_tabname, new_list):
-	""" Store a human-readable list of loaded SMF files, for
-	    fast lookup by ps1-load.
-	"""
-	smf_fn = db.query("select smf_fn from %s" % exp_tabname).fetch(progress_callback=pool2.progress_pass).smf_fn
-	smf_fn = np.append(smf_fn, new_list)
+def store_smf_list(db, exp_tabname, new_exps):
+	""" Store a human-readable list of loaded SMF files and their exp_ids,
+	    for fast lookup by ps1-load and lsd-make-object-catalog.
 
-	uri = 'lsd:%s:metadata:all_exposures.txt' % (exp_tabname)
-	with db.table(exp_tabname).open_uri(uri, mode='w') as f:
-		np.savetxt(f, smf_fn, fmt='%s')
+	    Note: For forward-compatibility, readers of this file should assume it has an
+	    unspecified number of columns. I.e., don't do (a, b) = line.split(), but
+	    do (a, b) = line.split()[:2]
+	"""
+	uri = 'lsd:%s:cache:all_exposures.txt' % (exp_tabname)
+	
+	# Try to load from cache, query otherwise
+	try:
+		with db.open_uri(uri) as f:
+			old_exps = np.loadtxt(f, dtype=[('_EXP', 'u8'),('smf_fn', 'a40')])
+	except IOError:
+		old_exps = db.query("select _EXP, smf_fn from %s" % exp_tabname).fetch(progress_callback=pool2.progress_pass)
+
+	exps = colgroup.fromiter([old_exps, new_exps], blocks=True) if len(old_exps) else new_exps
+
+	# Store to cache
+	with db.open_uri(uri, mode='w') as f:
+		for exp_id, exp_fn in exps:
+			f.write("%d %s\n" % (exp_id, exp_fn))
 
 def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=False):
 	""" Import a PS1 table from DVO
@@ -320,8 +333,10 @@ def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=Fals
 	at = 0; ntot = 0
 	pool = pool2.Pool()
 	smf_fns = []
-	for (file, smf_fn, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_table, exp_table, det_c2f, exp_c2f, survey), progress_callback=pool2.progress_pass):
+	exp_ids = []
+	for (file, exp_id, smf_fn, nloaded, nin) in pool.imap_unordered(smf_files, import_from_smf_aux, (det_table, exp_table, det_c2f, exp_c2f, survey), progress_callback=pool2.progress_pass):
 		smf_fns.append(smf_fn)
+		exp_ids.append(exp_id)
 		at = at + 1
 		ntot = ntot + nloaded
 		t1 = time.time()
@@ -330,7 +345,10 @@ def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=Fals
 		print >>sys.stderr, '  ===> Imported %s [%d/%d, %5.2f%%] +%-6d %9d (%.0f/%.0f min.)' % (file, at, len(smf_files), 100 * float(at) / len(smf_files), nloaded, ntot, time_pass, time_tot)
 	del pool
 
-	return smf_fns
+	ret = colgroup.ColGroup()
+	ret._EXP   = np.array(exp_ids, dtype=np.uint64)
+	ret.smf_fn = np.array(smf_fns, dtype='a40')
+	return ret
 
 def add_lb(cols):
 	(ra, dec) = cols['ra'], cols['dec']
@@ -525,7 +543,7 @@ def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f, survey):
 
 	ids = det_table.append(det_cols_all)
 
-	yield (file, fn, len(ids), len(ids))
+	yield (file, exp_id, fn, len(ids), len(ids))
 
 #########
 
@@ -667,21 +685,30 @@ def _unique_mapper(qresult):
 	for rows in qresult:
 		yield np.unique(rows.column(0))
 
-def get_new_exposures(db, qobj, qexp):
-	""" Get all exposures mentioned in the detections table, and not
-	    mentioned in the object table.
-	"""
-	def get_unique(query):
+def get_unique(db, query, cache_uri=None):
+	# Get all unique exposures returned by the query
+	#
+	# Try to fetch the result from the cache, otherwise
+	# execite the query (for backwards compatibility)
+	try:
+		with db.open_uri(cache_uri) as f:
+			vals = set( int(s.strip().split()[0]) for s in f.xreadlines() )
+	except IOError:
 		vals = set()
 		for exps in db.query(query).execute([_unique_mapper]):
 			for exp in exps:
 				vals.add(exp)
-		return vals
 
-	all_exps = get_unique(qexp)
-	obj_exps = get_unique(qobj)
+	return vals
 
-	return all_exps - obj_exps
+def get_new_exposures(db, obj_tabname, det_tabname, exp_tabname):
+	""" Get all exposures mentioned in the detections table, and not
+	    mentioned in the object table.
+	"""
+	all_exps = get_unique(db, "_ID from %s" % (exp_tabname), "lsd:%s:cache:all_exposures.txt" % exp_tabname)
+	obj_exps = get_unique(db, "_EXP from %s, %s" % (obj_tabname, det_tabname), "lsd:%s:cache:all_matched_exposures.txt" % obj_tabname)
+
+	return all_exps - obj_exps, obj_exps
 
 def get_cells_with_dets_from_exps(db, explist, exp_tabname, det_tabname, fovradius=None):
 	""" Get all cells that may contain detections from within exposures
@@ -756,7 +783,7 @@ def create_object_table(db, obj_tabname, det_tabname):
 		_overwrite = True
 		)
 
-def make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=1./3600., explist=None, fovradius=None):
+def make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=1./3600., explist=None, oldexps=None, fovradius=None):
 	""" Create the object catalog
 	"""
 
@@ -805,6 +832,15 @@ def make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=1./360
 		pctnew   = 100. * nnew / nobjnew  if nobjnew else 0.
 		pctmatch = 100. * nmatch / ndetnc if ndetnc else 0.
 		print "  match %7d det to %7d obj (%3d exps): %7d new (%6.2f%%), %7d matched (%6.2f%%)  [%.0f/%.0f min.]" % (ndet, nobj, nexp, nnew, pctnew, nmatch, pctmatch, time_pass, time_tot)
+
+	# Save the list of exposures that has been matched to the object table
+	if oldexps is not None and len(explist):
+		allexps = set(oldexps) | set(explist)
+
+		uri = "lsd:%s:cache:all_matched_exposures.txt" % obj_tabname
+		with db.open_uri(uri, mode='w') as f:
+			for exp in allexps:
+				f.write("%d\n" % exp)
 
 	print "Matched a total of %d sources." % (ntot)
 	print "Total of %d objects added." % (ntotobj)

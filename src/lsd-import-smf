@@ -11,13 +11,14 @@ from lsd.utils import *
 from lsd import DB
 
 def usage():
-	print "Usage: %s [-c|--create] [-f|--file-list] [-m|--mode] [-o|--offset] [-s|--stride] <survey_id> <det_table> <exp_table> <smf_file(s)>" % sys.argv[0]
+	print "Usage: %s [-c|--create] [-f|--file-list] [-m|--mode] [-o|--offset] [-s|--stride] [--run-checks] <survey_id> <det_table> <exp_table> <smf_file(s)>" % sys.argv[0]
 
-optlist, (dbdir,), args = tui_getopt('cfm:s:o:', ['create', 'file-list', 'mode=', 'stride=', 'offset='], 4, usage, argn_max=-1)
+optlist, (dbdir,), args = tui_getopt('cfm:s:o:', ['create', 'file-list', 'mode=', 'stride=', 'offset=', 'run-checks'], 4, usage, argn_max=-1)
 (survey, det_tabname, exp_tabname, files) = args[0], args[1], args[2], args[3:]
 
 create = False
 filelist = False
+run_checks_opt = False
 mode = None
 stride = 1
 offset = 0
@@ -32,6 +33,8 @@ for (o, a) in optlist:
 		stride = int(a)
 	if o == '-o' or o == '--offset':
 		offset = int(a)
+	if o == '--run-checks':
+		run_checks_opt = True
 
 if filelist:
 	files = open(files[0]).read().splitlines()
@@ -46,9 +49,9 @@ db = DB(dbdir)
 
 def run_import():
 	print >> sys.stderr, "Importing SMF files:"
-	new_smfs = smf.import_from_smf(db, det_tabname, exp_tabname, files, survey, create=create)
+	new_exps = smf.import_from_smf(db, det_tabname, exp_tabname, files, survey, create=create)
 	print >> sys.stderr, "done."
-	return new_smfs
+	return new_exps
 
 def run_checks():
 	# Sanity check: all queries linking to images must resolve within cell
@@ -57,7 +60,7 @@ def run_checks():
 	for row in q.iterate():
 		raise Exception("Inconsistency detected: (cell_id, det_id, ra, dec, exp_id, equinox) = " + str(row))
 
-	# Done
+def print_stats():
 	det_table = db.table(det_tabname)
 	exp_table = db.table(exp_tabname)
 	print "Import done.", det_table.nrows(), "detections in", exp_table.nrows() , "exposures."
@@ -74,11 +77,19 @@ if mode is not None:
 
 	if mode == 'postprocess':
 		db.commit()
-		run_checks()
+
+		if run_checks_opt:
+			run_checks()
+
+		print_stats()
 
 else:
 	with db.transaction():
-		new_smfs = run_import()
-		smf.store_smf_list(db, exp_tabname, new_smfs)
+		new_exps = run_import()
+		smf.store_smf_list(db, exp_tabname, new_exps)
 
-	run_checks()
+	if run_checks_opt:
+		run_checks()
+
+	print_stats()
+	

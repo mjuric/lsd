@@ -126,8 +126,8 @@ class Table:
 		else:
 			raise Exception("Table data catalog corruption detected")
 
-	def get_cells_in_snapshot(self, snapid):
-		return self.tablet_tree.get_cells_in_snapshot(snapid)
+	def get_cells_in_snapshot(self, snapid, include_cached=True):
+		return self.tablet_tree.get_cells_in_snapshot(snapid, include_cached=include_cached)
 
 	def build_tablet_tree_cache(self, snapid = None, save=True, quiet=False):
 		self._check_transaction()
