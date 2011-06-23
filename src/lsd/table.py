@@ -17,7 +17,7 @@ import copy
 import glob
 import shutil
 import errno
-from fcache       import TabletTreeCache
+from table_catalog import TableCatalog
 from utils        import is_scalar_of_type
 from pixelization import Pixelization
 from collections  import OrderedDict
@@ -117,30 +117,35 @@ class Table:
 		#
 		tabtreepkl = self._find_metadata_path('catalog.pkl')
 		if os.path.isfile(tabtreepkl):
-			self.tablet_tree = TabletTreeCache(tabtreepkl)
+			self.catalog = TableCatalog(fn=tabtreepkl)
 		elif os.path.isdir(os.path.join(self.path, 'tablets')) and not os.path.isdir(os.path.join(self.path, 'tablets', 'snapshots')):
 			# Backwards compatibility: Auto-create it for old-style (pre v0.4) tables
 		        assert self._snapshots[0] == 0
 			print >> sys.stderr, "[%s] Updating tablet catalog:" % (self.name),
- 			self.build_tablet_tree_cache(0)
+ 			self.rebuild_catalog(rebuild_pre_v050_snap=True)
 		else:
 			raise Exception("Table data catalog corruption detected")
 
 	def get_cells_in_snapshot(self, snapid, include_cached=True):
-		return self.tablet_tree.get_cells_in_snapshot(snapid, include_cached=include_cached)
+		return self.catalog.get_cells_in_snapshot(snapid, include_cached=include_cached)
 
-	def build_tablet_tree_cache(self, snapid = None, save=True, quiet=False):
+	def rebuild_catalog(self, rebuild_pre_v050_snap=False):
 		self._check_transaction()
 
-		if snapid is None:
+		# A bit of backwards compatibility for older tables
+		if not rebuild_pre_v050_snap:
 			snapid = self.snapid
+		else:
+			# Initialize an empty catalog
+			snapid = 0
 
-		pattern   = self._tablet_filename(self.primary_cgroup)
-		self.tablet_tree = TabletTreeCache().create_cache(self.pix, self.path, snapid, pattern, quiet=quiet)
+		# Update to the requested snapshot
+		pattern = self._tablet_filename(self.primary_cgroup)
+		self.catalog.update(self.path, pattern, snapid)
 
-		if save:
-			tabtreepkl = self._snapshot_path(snapid) + '/catalog.pkl'
-			self.tablet_tree.save(tabtreepkl)
+		# Save
+		fn = os.path.join(self._snapshot_path(snapid), 'catalog.pkl')
+		self.catalog.save(fn)
 
 	def _check_transaction(self):
 		if not self.transaction:
@@ -164,7 +169,7 @@ class Table:
 		if pri == -1:
 			# Build the tablet cache (hardwired)
 			print >> sys.stderr, "[%s] Updating tablet catalog:" % (self.name),
-			self.build_tablet_tree_cache()
+			self.rebuild_catalog()
 			self._snapshots.insert(0, self.snapid)
 
 		# Call post-commit hooks of the given priority. By default, these
@@ -311,7 +316,7 @@ class Table:
 	def _cell_path(self, cell_id, mode='r'):
 		""" Return the full path to a particular cell """
 		if mode == 'r':
-			snapid = self.tablet_tree.snapshot_of_cell(cell_id)
+			snapid = self.catalog.snapshot_of_cell(cell_id)
 		elif mode in ['w', 'r+']:
 			self._check_transaction()
 			snapid = self.snapid
@@ -354,8 +359,8 @@ class Table:
 		Returns a list of cells (cell_id-s) overlapping the bounds.
 
 		Used by the query engine to retrieve the list of cells to
-		visit when evaluating a query. Uses TabletTreeCache to
-		accelelrate the lookup (and autocreates it if it doesn't
+		visit when evaluating a query. Uses TableCatalog to
+		accelerate the lookup (and autocreates it if it doesn't
 		exist).
 
 		Parameters
@@ -375,7 +380,7 @@ class Table:
 		    If true, return the cells that have cached data only,
 		    and no "true" data belonging to that cell.
 		"""
-		return self.tablet_tree.get_cells(bounds, return_bounds, include_cached)
+		return self.catalog.get_cells(bounds, return_bounds, include_cached)
 
 	def static_if_no_temporal(self, cell_id):
 		"""
@@ -933,11 +938,15 @@ class Table:
 		if    dt is None: dt = self.pix.dt
 		self.pix = Pixelization(level, t0, dt)
 
+		# Empty table catalog
+		self.catalog = TableCatalog(pix=self.pix)
+
 		# Save table definition into the snapshot
 		self.set_snapshot(snapid)
 		self._store_schema()
 		self._load_schema()	# To construct internal state
-		self.build_tablet_tree_cache(snapid, quiet=True)
+
+		#self.rebuild_catalog(snapid, quiet=True)
 
 	def define_alias(self, alias, colname):
 		"""

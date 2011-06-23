@@ -32,6 +32,15 @@ class Pixelization(object):
 	xybits = np.uint64(10)
 	tbits  = u32 - u2*xybits
 
+	def __eq__(self, b):
+		return self.level == b.level and self.t0 == b.t0 and self.dt == b.dt
+
+	def __ne__(self, b):
+		return not (self == b)
+
+	def __repr__(self):
+		return "Pixelization(level=%d,t0=%f,dt=%f)" % (self.level, self.t0, self.dt)
+
 	# Backwards compatibility for instances pickled before we switched the member
 	# variables to uint64 (most notably in TableTreeCache instances).
 	# To be removed once those have disappeared.

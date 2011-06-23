@@ -147,7 +147,7 @@ def compute_counts(db, tabname, force=False):
 def commit_hook__build_neighbor_cache(db, table):
 	db.build_neighbor_cache(table.name, snapid=table.snapid)
 	print >> sys.stderr, "[%s] Updating tablet catalog:" % (table.name),
-	table.build_tablet_tree_cache()
+	table.rebuild_catalog()
 ###################################################################
 
 ###################################################################

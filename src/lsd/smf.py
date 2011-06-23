@@ -578,7 +578,7 @@ def commit_hook__make_image_cache(db, table, det_tabname):
 	# Commit hook
 	make_image_cache(db, det_tabname, table.name, db.snapid)
 	print >> sys.stderr, "[%s] Updating tablet catalog:" % (table.name),
-	table.build_tablet_tree_cache()
+	table.rebuild_catalog()
 
 def _exp_id_gather(qresult):
 	# Fetch all exp_ids referenced from this cell

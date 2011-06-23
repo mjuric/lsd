@@ -2122,7 +2122,6 @@ class DB(object):
 		
 		It:
 		    - counts and stores the number of rows in a table
-		    - constructs and stores a cache to speed up query
 		      startup (TabletTreeCache objects)
 
 		Parameters
