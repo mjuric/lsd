@@ -10,24 +10,70 @@ import lsd.smf as smf
 from lsd.utils import *
 from lsd.tui import *
 
-def usage():
-	print "Usage: %s [--explist=<explist.txt>] [--radius=<arcsec>] <obj_table> <det_table>" % sys.argv[0]
-
-optlist, (dbdir,), (obj_tabname, det_tabname) = tui_getopt('e:r:', ['explist=', 'radius='], 2, usage)
-
-radius = 1.
-explist = None
-for (o, a) in optlist:
-	if o == '-r' or o == '--radius':
-		radius = float(a)
-	elif o == '-e' or o == '--explist':
-		explist = np.loadtxt(a, dtype=np.uint64)
-
+################
 #
 # Actual work
 #
 
-db = lsd.DB(dbdir)
+def check_obj(args):
+	db = lsd.DB(args.db)
+	smf.sanity_check_object_table(db, args.obj_table, args.det_table, args.radius/3600., args.explist)
+	print "Objects table consistent."
 
-smf.sanity_check_object_table(db, obj_tabname, det_tabname, radius/3600., explist)
-print "Database OK."
+def check_cat(args):
+	db = lsd.DB(args.db)
+	table = db.table(args.table)
+
+	pattern = table._tablet_filename(table.primary_cgroup)
+
+	from lsd.table_catalog import check_table_catalog
+	check_table_catalog(table.path, pattern)
+
+	print "Table catalog consistent with data on disk"
+
+def check_nrows(args):
+	db = lsd.DB(args.db)
+	table = db.table(args.table)
+
+	from lsd.tasks import compute_counts
+	nrows = compute_counts(db, args.table, force=True)
+	
+	assert table.nrows() == nrows, "Recorded number of rows (%d) differs from actual (%d)" % (table.nrows(), nrows)
+	print "Number of rows correct (%d)" % table.nrows()
+
+################
+
+import argparse
+parser = argparse.ArgumentParser(description='Verify the consistency of an LSD database',
+	formatter_class=argparse.RawDescriptionHelpFormatter,
+	epilog="""Examples:
+	lsd-check obj ps1_obj ps1_det
+	lsd-check cat ps1_det
+	lsd-check nrows ps1_det
+.
+""")
+parser.add_argument('--db', default=os.getenv('LSD_DB', None), type=str, help='Path to LSD database')
+
+subparsers = parser.add_subparsers()
+
+# Object table checker
+parser_obj = subparsers.add_parser('obj', help='Verify consistency of the object table')
+parser_obj.set_defaults(func=check_obj)
+parser_obj.add_argument('obj_table', type=str, help='Name of the object table')
+parser_obj.add_argument('det_table', type=str, help='Name of the detection table')
+parser_obj.add_argument('--explist', default=None, type=str, help='File with a list of exposure IDs to consider while checking. All others will be ignored')
+parser_obj.add_argument('--radius', default=1., type=float, help='Matching radius (arcsec)')
+
+# Table catalog verifier
+parser_cat = subparsers.add_parser('cat', help='Verify consistency of table (metadata) catalog')
+parser_cat.set_defaults(func=check_cat)
+parser_cat.add_argument('table', type=str, help='The table to check')
+
+# Number-of-rows checker
+parser_nrows = subparsers.add_parser('nrows', help='Verify the recorded number of rows equals the number of rows really in the table')
+parser_nrows.set_defaults(func=check_nrows)
+parser_nrows.add_argument('table', type=str, help='The table to check')
+
+args = parser.parse_args()
+args.func(args)
+
