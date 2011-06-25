@@ -1289,10 +1289,7 @@ class Table:
 
 	def nrows(self):
 		"""
-		Returns the number of rows in the table
-		
-		Note: returns the cached value precomputed by
-		db.compute_summary_statistics()
+		Returns the (cached) number of rows in the table
 		"""
 		return self._nrows
 

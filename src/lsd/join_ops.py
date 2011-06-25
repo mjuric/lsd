@@ -2112,35 +2112,6 @@ class DB(object):
 			#print self._cell_prefix(cell_id), ": ", ncached, " cached objects"
 		print >>sys.stderr, "%sTotal %d cached objects in %d cells" % (' '*(len(tabname)+3), ntotal, ncells)
 
-	def compute_summary_stats(self, *tables):
-		"""
-		Compute summary statistics.
-		
-		Compute and store frequently used summary statistics. This
-		should be called to refresh the stats after insertions or
-		larger modifications to tables.
-		
-		It:
-		    - counts and stores the number of rows in a table
-		      startup (TabletTreeCache objects)
-
-		Parameters
-		----------
-		*tables: strings
-		    One or more names of tables to operate on.
-
-		TODO: Better document *when* this function should be caller
-		      (or better yet, do away with it alltogether).
-		"""
-		from tasks import compute_counts
-		for tabname in tables:
-			table = self.table(tabname)
-			print >>sys.stderr, "[%s] Updating stats:" % tabname,
-
-			# Scan the number of rows
-			table._nrows = compute_counts(self, tabname)
-			table._store_schema()
-
 ###################################################################
 ## Auxilliary functions implementing DB.build_neighbor_cache
 ## functionallity
