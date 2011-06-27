@@ -68,7 +68,7 @@ class Updater(object):
 		except subprocess.CalledProcessError:
 			print >>sys.stderr, "Enumeration of catlog files failed. See cat-filelist.log for details."
 			print >>sys.stderr, "Snippet:"
-			for k, l in enumerate(file('cat-filelist.log').xreadlines()):
+			for k, l in enumerate(file(os.path.join(self.logdir, 'cat-filelist.log')).xreadlines()):
 				print >>sys.stderr, "   ", l.strip()
 				if k == 10: break
 			exit()
@@ -79,9 +79,9 @@ class Updater(object):
 		if db.table_exists('ps1_exp'):
 			# Try loading from summary file that lsd-import-smf makes for us, if it exists
 			try:
-				uri = 'lsd:ps1_exp:metadata:all_exposures.txt'
-				with db.table('ps1_exp').open_uri(uri) as f:
-					smf_fn = [ s.strip() for s in f.xreadlines() ]
+				uri = 'lsd:ps1_exp:cache:all_exposures.txt'
+				with db.open_uri(uri) as f:
+					smf_fn = [ s.strip().split()[1] for s in f.xreadlines() ]
 			except IOError:
 				smf_fn = db.query("select smf_fn from ps1_exp").fetch(progress_callback=pool2.progress_pass).smf_fn
 		else:

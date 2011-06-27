@@ -166,7 +166,12 @@ def progress_default(stage, step, input, index, result):
 	self.dispatch(stage, step, input, index, result)
 
 def progress_pct(stage, step, input, index, result):
-	self = progress_pct
+	running = progress_pct_nnl(stage, step, input, index, result)
+	if not running:
+		sys.stderr.write('\n')
+
+def progress_pct_nnl(stage, step, input, index, result):
+	self = progress_pct_nnl
 
 	# Record the first 'begin' stage as the endstage
 	if step == 'begin' and 't0' not in dir(self):
@@ -195,8 +200,10 @@ def progress_pct(stage, step, input, index, result):
 	elif step == 'end':
 		if stage == self.endstage:
 			t = time.time() - self.t0
-			sys.stderr.write('>  %.2f sec\n' % t)
+			sys.stderr.write('>  %.2f sec' % t)
 			del self.t0
+			return False
+	return True
 
 def progress_dots(stage, step, input, index, result):
 	if step == 'begin':
