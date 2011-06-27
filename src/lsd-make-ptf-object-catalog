@@ -22,7 +22,7 @@ gen_explist = False
 explist = None
 fovradius = 1.0
 radius = 1.5
-auto = False
+auto = True
 make_catalog = True
 oldexps = None
 for (o, a) in optlist:
