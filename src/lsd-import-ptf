@@ -92,10 +92,12 @@ else:
 		f.close()
 
 print "Importing SExtractor catalog files:"
-if create:
-	with db.transaction():
-		ptf.import_from_catalogs(db, det_tabname, exp_tabname, files, create, all)
-else:
-	db.begin_transaction(join=True)
+with db.transaction():
 	ptf.import_from_catalogs(db, det_tabname, exp_tabname, files, create, all)
+#if create:
+#	with db.transaction():
+#		ptf.import_from_catalogs(db, det_tabname, exp_tabname, files, create, all)
+#else:
+#	db.begin_transaction(join=True)
+#	ptf.import_from_catalogs(db, det_tabname, exp_tabname, files, create, all)
 print " done."
