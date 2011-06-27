@@ -1,13 +1,16 @@
 import pyfits
-import lsd.pool2 as pool2
+import pool2
 import numpy as np
 import time
 from pyslalib.slalib import sla_eqgal, sla_caldj
 import itertools as it
+import bhpix
+from utils import gnomonic, gc_dist
+from colgroup import ColGroup
 import sys, os
 import logging
 import datetime
-import lsd.locking as locking
+import locking
 import pywcs
 
 conversion_to_int = 1
@@ -367,112 +370,80 @@ def import_from_catalogs_aux(file, det_table, exp_table, djm, all=False):
 		# test WCS of this image
 		try:
 			wcs = pywcs.WCS(hdr_exp)
+			# find the RA and Dec for the center of this exposure
+			pixcrd = np.array([[1024,2048]], np.float_)
+			sky = wcs.all_pix2sky(pixcrd, 1)
 		except:
 			yield (file, 0, 4, 0)
 		else:
-			# import header data into exposures table
-			try:
-				coldefs = exp_table_def['schema']['main']['columns'] + exp_table_def['schema']['image_quality']['columns']
-				exp_cols = dict( (name, np.array([hdr_exp.get(fitsname)]).astype(coltype)) for (name, coltype, fitsname, _) in coldefs if fitsname != '')
-				coldefs = exp_table_def['schema']['abs_photo']['columns']
-				exp_cols.update(dict( (name, np.array([0]).astype(coltype)) for (name, coltype, fitsname, _) in coldefs if fitsname != ''))
-				exp_cols.update(dict( (name, np.array([hdr_exp.get(fitsname)]).astype(coltype)) for (name, coltype, fitsname, _) in coldefs if (fitsname != '') & (hdr_exp.has_key(fitsname))))
-			except TypeError:
-				yield (file, 0, 2, 0)
+			# test if astrometry is good
+			pixcrd = [[i,0] for i in np.arange(2048)]+[[i,4095] for i in np.arange(2048)]+[[0,i] for i in np.arange(4096)]+[[2047,i] for i in np.arange(4096)]
+			n_pixel = len(pixcrd)
+			hdr_exp['CRVAL1']=20
+			hdr_exp['CRVAL2']=0
+			hdr_exp['CRPIX1']=1024
+			hdr_exp['CRPIX2']=2048
+			wcs = pywcs.WCS(hdr_exp)
+			test_sky = wcs.all_pix2sky(pixcrd, 0)
+#			bad = np.where((test_sky[:,0] < 19.7) + (test_sky[:,0] > 20.3) + (test_sky[:,1] < -0.58) + (test_sky[:,1] > 0.58)) # 5sigma cut
+			bad = np.where((test_sky[:,0] < 19.7095) + (test_sky[:,0] > 20.2902) + (test_sky[:,1] < -0.5783) + (test_sky[:,1] > 0.5782)) # 3sigma cut
+			bad_pixels = len(bad[0])
+			ratio = 1.0*bad_pixels/n_pixel
+			if ratio > 0:
+				yield (file, 0, 4, 0)
 			else:
-				# find the RA and Dec for the center of this exposure
-				pixcrd = np.array([[1024,2048]], np.float_)
-				sky = wcs.all_pix2sky(pixcrd, 1)
-				exp_cols['ra'] = np.array([sky[0][0]])
-				exp_cols['dec'] = np.array([sky[0][1]])
-				(l, b) = np.degrees(sla_eqgal(*np.radians((exp_cols['ra'].squeeze(), exp_cols['dec'].squeeze()))))
-				exp_cols['l'] = np.array([l])
-				exp_cols['b'] = np.array([b])
-				exp_cols['mjd_import'] = np.array([djm]).astype('u4')
-				exp_cols['mumax_med'] = np.array([-99.99]).astype('f4')
-				exp_cols['mumax_rms'] = np.array([-99.99]).astype('f4')
-				exp_cols['n_bright'] = np.array([0]).astype('i2')
-				# Import sources into detection table
-				coldefs = det_table_def['schema']['main']['columns']
+#                print file, ratio, min(sky[:,0]), max(sky[:,0]), min(sky[:,1]), max(sky[:,1])
+				# import header data into exposures table
 				try:
-					if (conversion_to_int == 1):
-						det_cols = dict(( (name, np.around(dat.field(fitsname)*factor).astype(coltype[-2:])) for (name, _, coltype, factor, fitsname, _) in coldefs if fitsname != '' and factor > 1))
-						det_cols.update(dict(( (name, (dat.field(fitsname)*factor).astype(coltype[-2:])) for (name, _, coltype, factor, fitsname, _) in coldefs if fitsname != '' and factor == 1)))
-					else:
-						det_cols = dict(( (name, dat.field(fitsname).astype(coltype[-2:])) for (name, coltype, _, _, fitsname, _) in coldefs if fitsname != ''))
+					coldefs = exp_table_def['schema']['main']['columns'] + exp_table_def['schema']['image_quality']['columns']
+					exp_cols = dict( (name, np.array([hdr_exp.get(fitsname)]).astype(coltype)) for (name, coltype, fitsname, _) in coldefs if fitsname != '')
+					coldefs = exp_table_def['schema']['abs_photo']['columns']
+					exp_cols.update(dict( (name, np.array([0]).astype(coltype)) for (name, coltype, fitsname, _) in coldefs if fitsname != ''))
+					exp_cols.update(dict( (name, np.array([hdr_exp.get(fitsname)]).astype(coltype)) for (name, coltype, fitsname, _) in coldefs if (fitsname != '') & (hdr_exp.has_key(fitsname))))
 				except TypeError:
-					yield (file, 0, 3, 0)
+					yield (file, 0, 2, 0)
 				else:
-					det_cols['mjd'] = (np.zeros(len(det_cols['ra'])) + hdr_exp['OBSMJD']).astype('f8')
-					det_cols['fid'] = (np.zeros(len(det_cols['ra'])) + hdr_exp['DBFID']).astype('u1')
-#					det_cols['mjd_import'] = (np.zeros(len(det_cols['ra'])) + djm).astype('u2')
-					det_cols['mag_abs'] = (np.zeros(len(det_cols['ra'])) + 32000).astype('u2')
-
-					# if there is Eran's absolute photometry...
-					if exp_cols['apbsrms'] > 0:
-						det_cols['mag_abs'] = np.round((dat.field('MAG_AUTO') + 2.5*np.log10(hdr_exp['AEXPTIME'])+ hdr_exp['APPAR01'] + hdr_exp['APPAR03']*hdr_exp['AIRMASS'] + hdr_exp['APPAR05']*(hdr_exp['OBSJD'] - hdr_exp['APMEDJD']) + hdr_exp['APPAR06']*(hdr_exp['OBSJD'] - hdr_exp['APMEDJD'])**2 + hdr_exp['APPAR07']*(dat.field('X_IMAGE') - 1024.)/2048. + hdr_exp['APPAR08']*(dat.field('Y_IMAGE') - 2048.)/4096. + hdr_exp['APPAR09']*((dat.field('Y_IMAGE') - 2048.)/4096.)**2 + hdr_exp['APPAR10']*((dat.field('Y_IMAGE') - 2048.)/4096.)**3 + hdr_exp['APPAR11']*(dat.field('X_IMAGE') - 1024.)/2048. * (dat.field('Y_IMAGE') - 2048.)/4096.)*1000.).clip(min=5000, max=32000).astype('u2')
-
-						# use bright stars to correct for seeing
-
-			# import header data into exposures table
-			try:
-				coldefs = exp_table_def['schema']['main']['columns'] + exp_table_def['schema']['image_quality']['columns']
-				exp_cols = dict( (name, np.array([hdr_exp.get(fitsname)]).astype(coltype)) for (name, coltype, fitsname, _) in coldefs if fitsname != '')
-				coldefs = exp_table_def['schema']['abs_photo']['columns']
-				exp_cols.update(dict( (name, np.array([0]).astype(coltype)) for (name, coltype, fitsname, _) in coldefs if fitsname != ''))
-				exp_cols.update(dict( (name, np.array([hdr_exp.get(fitsname)]).astype(coltype)) for (name, coltype, fitsname, _) in coldefs if (fitsname != '') & (hdr_exp.has_key(fitsname))))
-			except TypeError:
-				yield (file, 0, 2, 0)
-			else:
-				# find the RA and Dec for the center of this exposure
-				pixcrd = np.array([[1024,2048]], np.float_)
-				sky = wcs.all_pix2sky(pixcrd, 1)
-				exp_cols['ra'] = np.array([sky[0][0]])
-				exp_cols['dec'] = np.array([sky[0][1]])
-				(l, b) = np.degrees(sla_eqgal(*np.radians((exp_cols['ra'].squeeze(), exp_cols['dec'].squeeze()))))
-				exp_cols['l'] = np.array([l])
-				exp_cols['b'] = np.array([b])
-				exp_cols['mjd_import'] = np.array([djm]).astype('u4')
-				exp_cols['mumax_med'] = np.array([-99.99]).astype('f4')
-				exp_cols['mumax_rms'] = np.array([-99.99]).astype('f4')
-				exp_cols['n_bright'] = np.array([0]).astype('i2')
-				# Import sources into detection table
-				coldefs = det_table_def['schema']['main']['columns']
-				try:
-					if (conversion_to_int == 1):
-						det_cols = dict(( (name, np.around(dat.field(fitsname)*factor).astype(coltype[-2:])) for (name, _, coltype, factor, fitsname, _) in coldefs if fitsname != '' and factor > 1))
-						det_cols.update(dict(( (name, (dat.field(fitsname)*factor).astype(coltype[-2:])) for (name, _, coltype, factor, fitsname, _) in coldefs if fitsname != '' and factor == 1)))
+					exp_cols['ra'] = np.array([sky[0][0]])
+					exp_cols['dec'] = np.array([sky[0][1]])
+					(l, b) = np.degrees(sla_eqgal(*np.radians((exp_cols['ra'].squeeze(), exp_cols['dec'].squeeze()))))
+					exp_cols['l'] = np.array([l])
+					exp_cols['b'] = np.array([b])
+					exp_cols['mjd_import'] = np.array([djm]).astype('u4')
+					exp_cols['mumax_med'] = np.array([-99.99]).astype('f4')
+					exp_cols['mumax_rms'] = np.array([-99.99]).astype('f4')
+					exp_cols['n_bright'] = np.array([0]).astype('i2')
+					# Import sources into detection table
+					coldefs = det_table_def['schema']['main']['columns']
+					try:
+						if (conversion_to_int == 1):
+							det_cols = dict(( (name, np.around(dat.field(fitsname)*factor).astype(coltype[-2:])) for (name, _, coltype, factor, fitsname, _) in coldefs if fitsname != '' and factor > 1))
+							det_cols.update(dict(( (name, (dat.field(fitsname)*factor).astype(coltype[-2:])) for (name, _, coltype, factor, fitsname, _) in coldefs if fitsname != '' and factor == 1)))
+						else:
+							det_cols = dict(( (name, dat.field(fitsname).astype(coltype[-2:])) for (name, coltype, _, _, fitsname, _) in coldefs if fitsname != ''))
+					except TypeError:
+						yield (file, 0, 3, 0)
 					else:
-						det_cols = dict(( (name, dat.field(fitsname).astype(coltype[-2:])) for (name, coltype, _, _, fitsname, _) in coldefs if fitsname != ''))
-				except TypeError:
-					yield (file, 0, 3, 0)
-				else:
-					det_cols['mjd'] = (np.zeros(len(det_cols['ra'])) + hdr_exp['OBSMJD']).astype('f8')
-					det_cols['fid'] = (np.zeros(len(det_cols['ra'])) + hdr_exp['DBFID']).astype('u1')
-#					det_cols['mjd_import'] = (np.zeros(len(det_cols['ra'])) + djm).astype('u2')
-					det_cols['mag_abs'] = (np.zeros(len(det_cols['ra'])) + 32000).astype('u2')
+						det_cols['mjd'] = (np.zeros(len(det_cols['ra'])) + hdr_exp['OBSMJD']).astype('f8')
+						det_cols['fid'] = (np.zeros(len(det_cols['ra'])) + hdr_exp['DBFID']).astype('u1')
+#						det_cols['mjd_import'] = (np.zeros(len(det_cols['ra'])) + djm).astype('u2')
+						det_cols['mag_abs'] = (np.zeros(len(det_cols['ra'])) + 32000).astype('u2')
 
-					# if there is Eran's absolute photometry...
-					if exp_cols['apbsrms'] > 0:
-						det_cols['mag_abs'] = np.round((dat.field('MAG_AUTO') + 2.5*np.log10(hdr_exp['AEXPTIME'])+ hdr_exp['APPAR01'] + hdr_exp['APPAR03']*hdr_exp['AIRMASS'] + hdr_exp['APPAR05']*(hdr_exp['OBSJD'] - hdr_exp['APMEDJD']) + hdr_exp['APPAR06']*(hdr_exp['OBSJD'] - hdr_exp['APMEDJD'])**2 + hdr_exp['APPAR07']*(dat.field('X_IMAGE') - 1024.)/2048. + hdr_exp['APPAR08']*(dat.field('Y_IMAGE') - 2048.)/4096. + hdr_exp['APPAR09']*((dat.field('Y_IMAGE') - 2048.)/4096.)**2 + hdr_exp['APPAR10']*((dat.field('Y_IMAGE') - 2048.)/4096.)**3 + hdr_exp['APPAR11']*(dat.field('X_IMAGE') - 1024.)/2048. * (dat.field('Y_IMAGE') - 2048.)/4096.)*1000.).clip(min=5000, max=32000).astype('u2')
+						# if there is Eran's absolute photometry...
+						if exp_cols['apbsrms'] > 0:
+							det_cols['mag_abs'] = np.round((dat.field('MAG_AUTO') + 2.5*np.log10(hdr_exp['AEXPTIME'])+ hdr_exp['APPAR01'] + hdr_exp['APPAR03']*hdr_exp['AIRMASS'] + hdr_exp['APPAR05']*(hdr_exp['OBSJD'] - hdr_exp['APMEDJD']) + hdr_exp['APPAR06']*(hdr_exp['OBSJD'] - hdr_exp['APMEDJD'])**2 + hdr_exp['APPAR07']*(dat.field('X_IMAGE') - 1024.)/2048. + hdr_exp['APPAR08']*(dat.field('Y_IMAGE') - 2048.)/4096. + hdr_exp['APPAR09']*((dat.field('Y_IMAGE') - 2048.)/4096.)**2 + hdr_exp['APPAR10']*((dat.field('Y_IMAGE') - 2048.)/4096.)**3 + hdr_exp['APPAR11']*(dat.field('X_IMAGE') - 1024.)/2048. * (dat.field('Y_IMAGE') - 2048.)/4096.)*1000.).clip(min=5000, max=32000).astype('u2')
 
-						# use bright stars to correct for seeing
-						bright = np.where( (det_cols['mag_abs'] > 14000) & (det_cols['mag_abs'] < 17000) )
-						if len(bright[0]) > 0:
-							sg = dat.field('MU_MAX') - dat.field('MAG_AUTO')
-							mumax_med = np.median(sg[bright])
-							mumax_rms = 0.741*(np.percentile(sg[bright],75) - np.percentile(sg[bright],25))
-							exp_cols['mumax_med'] = np.array([mumax_med]).astype('f4')
-							exp_cols['mumax_rms'] = np.array([mumax_rms]).astype('f4')
-							exp_cols['n_bright'] = np.array([len(bright[0])]).astype('i2')
+							# use bright stars to correct for seeing
+							bright = np.where( (det_cols['mag_abs'] > 14000) & (det_cols['mag_abs'] < 17000) )
+							if len(bright[0]) > 0:
+								sg = dat.field('MU_MAX') - dat.field('MAG_AUTO')
+								mumax_med = np.median(sg[bright])
+								mumax_rms = 0.741*(np.percentile(sg[bright],75) - np.percentile(sg[bright],25))
+								exp_cols['mumax_med'] = np.array([mumax_med]).astype('f4')
+								exp_cols['mumax_rms'] = np.array([mumax_rms]).astype('f4')
+								exp_cols['n_bright'] = np.array([len(bright[0])]).astype('i2')
 
-					(exp_id,) = exp_table.append(exp_cols)
-					det_cols['exp_id'] = (np.zeros(len(det_cols['ra'])) + hdr_exp['DBPID']).astype('u8')
-					det_cols['exp_id'][:] = exp_id
-					ids = det_table.append(det_cols)
-					yield (file, len(ids), 0, exp_id)
-
-
-if __name__ == '__main__':
-	make_object_catalog('ptf_obj', 'ptf_det')
-
+						(exp_id,) = exp_table.append(exp_cols)
+						det_cols['exp_id'] = (np.zeros(len(det_cols['ra'])) + hdr_exp['DBPID']).astype('u8')
+						det_cols['exp_id'][:] = exp_id
+						ids = det_table.append(det_cols)
+						yield (file, len(ids), 0, exp_id)

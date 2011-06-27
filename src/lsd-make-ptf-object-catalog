@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 #
-# Example: time nice -n 10 ./lsd-make-ptf-object-catalog -c ptf_obj ptf_det >output_object 2>errors_object
-# Example: time nice -n 10 ./lsd-make-ptf-object-catalog ptf_obj ptf_det >output_object 2>errors_object
+# Example: time nice -n 10 ./lsd-make-ptf-object-catalog -c --explist=explist.txt test_obj test_det test_exp >output_object 2>errors_object
+# Example: time nice -n 10 ./lsd-make-ptf-object-catalog --explist=explist.txt test_obj test_det test_exp >output_object 2>errors_object
 #
 
 import sys
@@ -10,19 +10,48 @@ import lsd
 import lsd.smf as smf
 from lsd.utils import *
 from lsd.tui import *
-import shutil
-import datetime
-from pyslalib.slalib import sla_caldj
+import os, shutil, subprocess
 
 def usage():
-	print "Usage: %s [-c|--create] <obj_table> <det_table>" % sys.argv[0]
+	print "Usage: %s [-a|--auto] [-c|--create] [-r|--radius=<arcsec>] [-f|--fov-radius=<deg>] [-g|--gen-explist] [-e|--explist=explist.txt] <obj_table> <det_table> <exp_table>" % sys.argv[0]
 
-optlist, (dbdir,), (obj_tabname, det_tabname) = tui_getopt('c', ['create'], 2, usage)
+optlist, (dbdir,), (obj_tabname, det_tabname, exp_tabname) = tui_getopt('cge:r:f:a', ['create', 'gen-explist', 'explist=', 'radius=', 'fov-radius=', 'auto'], 3, usage)
 
 create = False
+gen_explist = False
+explist = None
+fovradius = 1.0
+radius = 1.5
+auto = False
+make_catalog = True
 for (o, a) in optlist:
-	if o == '-c' or o == '--create':
+	if o == '-a' or o == '--auto':
+		auto = True
+	elif o == '-c' or o == '--create':
 		create = True
+	elif o == '-r' or o == '--radius':
+		radius = float(a)
+	elif o == '-f' or o == '--fov-radius':
+		fovradius = float(a)
+	elif o == '-g' or o == '--gen-explist':
+		gen_explist = True
+	elif o == '-e' or o == '--explist':
+		explist = np.fromfile(a, dtype=np.uint64, sep='\n')
+		good = np.where(explist > 0)
+		explist = explist[good]
+
+if gen_explist:
+	assert explist is None
+	assert not auto
+	make_catalog = False
+
+if explist is not None:
+	assert not gen_explist
+	assert not auto
+
+#
+# Actual work
+#
 
 if create:
 	if os.access(dbdir+'/.'+det_tabname+':_'+obj_tabname+'_to_'+det_tabname+'.join', os.F_OK):
@@ -32,22 +61,37 @@ if create:
 	if os.access(dbdir+'/.'+obj_tabname+':'+det_tabname+'.join', os.F_OK):
 		os.remove(dbdir+'/.'+obj_tabname+':'+det_tabname+'.join')
 	if os.access(dbdir+'/'+obj_tabname, os.F_OK):
+		subprocess.check_call(['chmod', '-R', '755', dbdir+'/'+obj_tabname])
 		shutil.rmtree(dbdir+'/'+obj_tabname)
 	if os.access(dbdir+'/_'+obj_tabname+'_to_'+det_tabname, os.F_OK):
+		subprocess.check_call(['chmod', '-R', '755', dbdir+'/_'+obj_tabname+'_to_'+det_tabname])
 		shutil.rmtree(dbdir+'/_'+obj_tabname+'_to_'+det_tabname)
 
-
-#
-# Actual work
-#
-
 db = lsd.DB(dbdir)
-smf.make_object_catalog(db, obj_tabname, det_tabname, create=create, radius=1.5/3600)
 
-# MJD of last build
-now = datetime.datetime.now()
-(djm, j) = sla_caldj(now.year, now.month, now.day)
-djm -= 55682
-f = open(dbdir+'/.'+obj_tabname+'_import_MJD','w')
-f.write('%d\n' % (djm))
-f.close()
+def get_new_exposures(db, obj_tabname, det_tabname):
+	qobj="_EXP from %s, %s" % (obj_tabname, det_tabname)
+	qexp="_ID from %s" % (exp_tabname)
+	return smf.get_new_exposures(db, qobj, qexp)
+
+with db.transaction():
+	if create or auto:
+		smf.create_object_table(db, obj_tabname, det_tabname)
+
+	if gen_explist or auto:
+		print >> sys.stderr, "Scanning what is already in the database..."
+		explist = get_new_exposures(db, obj_tabname, det_tabname)
+
+	if gen_explist or auto or explist is not None:
+		print >>sys.stderr, "%d new exposures (%d total)." % (len(explist), db.table(exp_tabname).nrows())
+
+	if gen_explist:
+		for exp in explist:
+			print exp
+
+	if make_catalog:
+		smf.make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=radius/3600., explist=explist, fovradius=fovradius)
+
+if make_catalog:
+	print "Rows in the object table: %d." % (db.table(obj_tabname).nrows())
+	print "Rows in the detection table: %d." % (db.table(det_tabname).nrows())

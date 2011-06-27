@@ -1,48 +1,34 @@
 #!/usr/bin/env python
 #
-# Initial run: time nice -n 10 ./lsd-build-cache ptf_det ptf_exp >output 2>errors
+# Initial run: time nice -n 10 ./lsd-build-cache ptf_det ptf_exp >output_cache 2>errors_cache
 
 import sys, os
 import getopt
-import lsd
 import lsd.smf as smf
 from lsd.utils import *
 from lsd.tui import *
 import numpy as np
+from lsd import DB
 
 def usage():
-    print "Usage: %s <det_table> <exp_table>" % sys.argv[0]
+	print "Usage: %s <det_table> <exp_table>" % sys.argv[0]
 
 optlist, (dbdir,), (det_tabname, exp_tabname) = tui_getopt('cf:', ['create', 'file=', ], 2, usage, argn_max=2)
 
 #
 # Actual work
 #
-db = lsd.DB(dbdir)
+db = DB(dbdir)
+db.begin_transaction(join=True)
 
-# Old tablet_tree.pkl need to be removed manually from shell before rebuilding!!
-if os.access(dbdir+'/'+det_tabname+'/tablet_tree.pkl', os.F_OK) or os.access(dbdir+'/'+exp_tabname+'/tablet_tree.pkl', os.F_OK):
-	sys.exit("First remove "+dbdir+'/'+det_tabname+'/tablet_tree.pkl and '+dbdir+'/'+exp_tabname+'/tablet_tree.pkl using shell (bash)!')
-else:
-	## Build neighbor caches for detections
-	print >> sys.stderr, "Building neighbor cache (detections): ",
-	db.build_neighbor_cache(det_tabname)
-
-	## Build neighbor caches for images tables
-	print >> sys.stderr, "Building neighbor cache (exposures): ",
-	smf.make_image_cache(db, det_tabname, exp_tabname)
+# Commit the result
+db.commit()
 
 # Sanity check: all queries linking to images must resolve within cell
 print >> sys.stderr, "Consistency check: ",
-q = db.query('det_id, ra, dec, exp_id, equinox FROM "%s", "%s"(outer) WHERE equinox == 0' % (det_tabname, exp_tabname))
+q = db.query('_CELLID, det_id, ra, dec, exp_id, equinox FROM "%s", "%s"(outer) WHERE equinox == 0' % (det_tabname, exp_tabname))
 for row in q.iterate():
-	raise Exception("Inconsistency detected: (det_id, ra, dec, exp_id, equinox) = " + str(row))
-
-# Compute summary stats for both catalogs
-print >> sys.stderr, "Computing summary statistics (detections): ",
-db.compute_summary_stats(det_tabname)
-print >> sys.stderr, "Computing summary statistics (exposures): ",
-db.compute_summary_stats(exp_tabname)
+	raise Exception("Inconsistency detected: (cell_id, det_id, ra, dec, exp_id, equinox) = " + str(row))
 
 # Done
 det_table = db.table(det_tabname)

@@ -1,12 +1,13 @@
 import pool2
 import numpy as np
 import time
+import locking
 
 conversion_to_int = 0
 
 small_table_def = \
 {
-	'filters': { 'complevel': 1, 'complib': 'zlib', 'fletcher32': True }, # Enable compression and checksumming
+		'filters': { 'complevel': 5, 'complib': 'blosc', 'fletcher32': False }, # Enable compression
 	'schema': {
 		#
 		'main': {
@@ -14,7 +15,7 @@ small_table_def = \
 				('small_id',	'u8',	'u8',	1.,		'',			'LSD ID'),
 				('ra',			'f8',	'f8',	1.,		'ra',		'Right ascension'),
 				('dec',			'f8',	'f8',	1.,		'dec',		'Declination'),
-				('objid',		'u4',	'u4',	1.,		'objid',	'object id'),
+				('rowid',		'u4',	'u4',	1.,		'rowid',	'Row id'),
 			],
 			'primary_key' : 'small_id',
 			'spatial_keys': ('ra', 'dec'),
@@ -28,11 +29,12 @@ def import_from_catalogs(db, small_tabname, catalog_files, create=False):
 	    Note: Assumes underlying shared storage for all output table
 	          cells (i.e., any worker is able to write to any cell).
 	"""
-	if create:
-		# Create the new database
-		small_table = db.create_table(small_tabname, small_table_def)
-	else:
-		small_table = db.table(small_tabname)
+	with locking.lock(db.path[0] + "/.__smf-import-lock.lock"):
+		if not db.table_exists(small_tabname) and create:
+			# Create the new table
+			small_table = db.create_table(small_tabname, small_table_def)
+		else:
+			small_table = db.table(small_tabname)
 
 	t0 = time.time()
 	at = 0; ntot = 0
@@ -49,7 +51,7 @@ def import_from_catalogs(db, small_tabname, catalog_files, create=False):
 
 def import_from_catalogs_aux(file, db, tabname):
 	# import an table
-	dat   = np.genfromtxt(file, names='ra, dec, objid', dtype='f8, f8, u4')
+	dat   = np.genfromtxt(file, names='ra, dec, rowid', dtype='f8, f8, u4')
 	table = db.table(tabname)
 
 	# Load the data, cutting on flags
