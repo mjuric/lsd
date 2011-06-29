@@ -70,7 +70,7 @@ def _worker(ident, qcmd, qbroadcast, qin, qout):
 	try:
 		for cmd, args in iter(qcmd.get, 'EXIT'):
 			if cmd == 'MAP':
-				mapper, mapper_args = args
+				mapper, mapper_args = cPickle.loads(args)
 
 				check_bqueue()
 
@@ -368,8 +368,9 @@ class Pool:
 					self.qbroadcast.put( ('STOP', None) )
 
 				# Initialize this map
+				map_args = cPickle.dumps((mapper, mapper_args), -1)
 				for q in self.qcmd:
-					q.put( ('MAP', (mapper, mapper_args)) )
+					q.put( ('MAP', map_args) )
 
 				# Queue the data to operate on
 				i = -1
