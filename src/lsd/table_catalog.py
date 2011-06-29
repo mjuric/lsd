@@ -68,10 +68,26 @@ logger = logging.getLogger('lsd.table_catalog')
 
 END_MARKER=0x7FFFFFFF
 
-def _get_cells_kernel(ij, lev, cc, bounds_xy, bounds_t):
+def _add_bounds(outcells, cell_id, xybounds, tbounds):
+	# cells is a dictionary of cell_id -> dict objects,
+	# where each dict object is another dictionary of xybounds -> tbounds
+	#
+	# This function adds the (xybounds, tbounds) boundaries
+	# to the dictionary, for a given cell_id, correctly merging it
+	# with any bounds that already exist
+
+	if tbounds is None:
+		outcells[cell_id][xybounds] = None		# Cover all times (no temporal bounds)
+	elif xybounds not in outcells[cell_id]:			# New entry
+		outcells[cell_id][xybounds] = tbounds
+	elif outcells[cell_id][xybounds] is not None:		# Merge tbounds with existing entry
+		outcells[cell_id][xybounds] |= tbounds
+
+def _get_cells_kernel(ij, lev, cc, bounds):
 	i, j = ij
-	cells = defaultdict(dict)
-	cc._get_cells_recursive(cells, bounds_xy, bounds_t, i, j, lev, bhpix.pix_size(lev))
+       	cells = defaultdict(dict)
+	for bounds_xy, bounds_t in bounds:
+		cc._get_cells_recursive(cells, bounds_xy, bounds_t, i, j, lev, bhpix.pix_size(lev))
 	yield cells
 
 def _scan_recursive_kernel(xy, lev, cc):
@@ -184,12 +200,7 @@ class TableCatalog:
 				cell_id = (x, y, t)
 
 				# Add to output
-				if tbounds is None:
-					outcells[cell_id][xybounds] = None
-				elif xybounds not in outcells[cell_id]:
-					outcells[cell_id][xybounds] = tbounds
-				elif outcells[cell_id][xybounds] is not None:
-					outcells[cell_id][xybounds] |= tbounds
+				_add_bounds(outcells, cell_id, xybounds, tbounds)
 		else:
 			# Recursively subdivide the four subpixels
 			for (di, dj) in [(0, 0), (0, 1), (1, 0), (1, 1)]:
@@ -228,9 +239,10 @@ class TableCatalog:
 			pool = pool2.Pool()
 			lev = min(4, self._pix.level)
 			ij = np.indices((2**lev,2**lev)).reshape(2, -1).T # List of i,j coordinates
-			for bounds_xy, bounds_t in bounds:
-				for cells_ in pool.imap_unordered(ij, _get_cells_kernel, (lev, self, bounds_xy, bounds_t), progress_callback=pool2.progress_pass):
-					cells.update(cells_)
+			for cells_ in pool.imap_unordered(ij, _get_cells_kernel, (lev, self, bounds), progress_callback=pool2.progress_pass):
+				for cell_id, b in cells_.iteritems():
+					for xyb, tb in b.iteritems():
+						_add_bounds(cells, cell_id, xyb, tb)
 			del pool
 
 		if len(cells):
