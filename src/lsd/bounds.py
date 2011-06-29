@@ -87,7 +87,7 @@ def make_healpix_poly(lon, lat):
 
 	return poly
 
-def beam(lon0, lat0, radius=1., coordsys='equ'):
+def beam(lon0, lat0, radius=1., coordsys='equ', npts=360):
 	"""
 	Return a polygon (in bhpix projection) corresponding to the
 	requested lon/lat/radius beam.
@@ -101,7 +101,7 @@ def beam(lon0, lat0, radius=1., coordsys='equ'):
 		raise Exception('Unknown coordinate system')
 
 	r, _ = lambert_proj(0, 90-radius, 270, 90)		# Obtain beam radius in Lambert coordinates
-	phi  = np.linspace(0, 2*pi, 360, endpoint=False)	# Construct a finely sampled circle
+	phi  = np.linspace(0, 2*pi, npts, endpoint=False)	# Construct the polygon (approximating a circle, when npts is large)
 	x, y = r*cos(phi), r*sin(phi)				#
 	l, b = lambert_deproj(x, y, lon0, lat0)			# Deproject to circle on the sky
 
