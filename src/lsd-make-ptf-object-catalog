@@ -22,9 +22,10 @@ gen_explist = False
 explist = None
 fovradius = 1.0
 radius = 1.5
-auto = True
+auto = False
 make_catalog = True
 oldexps = None
+newexp = None
 for (o, a) in optlist:
 	if o == '-a' or o == '--auto':
 		auto = True
