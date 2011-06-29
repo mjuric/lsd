@@ -727,7 +727,8 @@ def get_cells_with_dets_from_exps(db, explist, exp_tabname, det_tabname, fovradi
 
 		if fovradius is not None:
 			tt = np.floor(t)
-			fov = bounds.beam(lon, lat, fovradius)
+			fov = bounds.beam(lon, lat, fovradius*(2./np.sqrt(3.)), npts=8) # An octagon circumscribing the FoV
+			assert fov.nPoints() == 8
 			try:
 				bb[tt] |= fov
 			except KeyError:
@@ -741,6 +742,7 @@ def get_cells_with_dets_from_exps(db, explist, exp_tabname, det_tabname, fovradi
 		b = []
 		for t0, fov in bb.iteritems():
 			b += [ (fov, intervalset((t0, t0+1.))) ]
+			#print t0, fov.area()*(180./np.pi)**2., fov.nPoints()
 
 	# Fetch all detection table cells that are within this interval
 	det_cells = db.table(det_tabname).get_cells(bounds=b)
@@ -805,7 +807,7 @@ def make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=1./360
 		# Fetch only those cells that can contain data from the given exposure list
 		print >> sys.stderr, "Enumerating cells with new detections: ",
 		det_cells = get_cells_with_dets_from_exps(db, explist, exp_tabname, det_tabname, fovradius)
-	print "%d cells to process." % (len(det_cells))
+	print >>sys.stderr, "%d cells to process." % (len(det_cells))
 	det_cells_grouped = det_table.pix.group_cells_by_spatial(det_cells).items()
 
 	t0 = time.time()
@@ -945,11 +947,22 @@ def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, exp
 	##print "Det cells: ", det_cells
 
 	# Loop, xmatch, and store
+	explist = np.asarray(list(explist), dtype=np.uint64)	# Ensure explist is a ndarray
 	det_query = db.query('_ID, _LON, _LAT, _EXP, _CACHED FROM %s' % det_tabname)
 	for det_cell in sorted(det_cells):
 		# fetch detections in this cell, convert to gnomonic coordinates
 		# keep only detections with _EXP in explist, unless explist is None
 		detections = det_query.fetch_cell(det_cell, include_cached=True)
+
+		# if there are no preexisting static sky objects, and all detections in this cell are cached,
+		# there's no way we'll get a match that will be kept in the end. Just continue to the
+		# next one if this is the case.
+		cachedonly = len(objs) == 0 and detections._CACHED.all()
+		if cachedonly:
+#			print "Skipping cached-only", len(cached)
+			yield (None, None, None, None, None, None) # Yield just to have the progress counter properly incremented
+			continue;
+
 		if explist is not None:
 			keep = np.in1d(detections._EXP, explist)
 			if not np.all(keep):
@@ -959,15 +972,6 @@ def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, exp
 				continue
 		_, ra2, dec2, exposures, cached = detections.as_columns()
 		detections.add_column('xy', np.column_stack(gnomonic(ra2, dec2, clon, clat)))
-
-		# if there are no preexisting static sky objects, and all detections in this cell are cached,
-		# there's no way we'll get a match that will be kept in the end. Just continue to the
-		# next one if this is the case.
-		cachedonly = len(objs) == 0 and cached.all()
-		if cachedonly:
-#			print "Skipping cached-only", len(cached)
-			yield (None, None, None, None, None, None) # Yield just to have the progress counter properly incremented
-			continue;
 
 		# prep join table
 		join  = ColGroup(dtype=o2d_table.dtype_for(['_ID', '_M1', '_M2', '_DIST', '_LON', '_LAT']))
