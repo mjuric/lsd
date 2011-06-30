@@ -727,8 +727,9 @@ def get_cells_with_dets_from_exps(db, explist, exp_tabname, det_tabname, fovradi
 
 		if fovradius is not None:
 			tt = np.floor(t)
-			fov = bounds.beam(lon, lat, fovradius*(2./np.sqrt(3.)), npts=8) # An octagon circumscribing the FoV
-			assert fov.nPoints() == 8
+			#fov = bounds.beam(lon, lat, fovradius*(2./np.sqrt(3.)), npts=8) # An octagon circumscribing the FoV
+			#assert fov.nPoints() == 8
+			fov = bounds.beam(lon, lat, fovradius)
 			try:
 				bb[tt] |= fov
 			except KeyError:
