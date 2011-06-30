@@ -1153,6 +1153,7 @@ class IntoWriter(object):
 
 				if 'spatial_keys' in into_args:
 					schema['spatial_keys'] = into_args['spatial_keys']
+					schema['commit_hooks'] = [] if 'no_neighbor_cache' in into_args else table._default_commit_hooks # Default commit hook rebuilds the neighbor cache
 				if 'temporal_key' in into_args:
 					schema['temporal_key'] = into_args['temporal_key']
 
@@ -1184,7 +1185,7 @@ class IntoWriter(object):
 				collist = [ c[0] for c in schema['columns'] ]
 				assert spatial_keys[0] in collist, (spatial_keys, collist) 
 				assert spatial_keys[1] in collist, (spatial_keys, collist) 
-				table.define_commit_hooks(table._default_commit_hooks) # Default commit hook rebuilds the neighbor cache
+				table.define_commit_hooks(schema['commit_hooks'])
 
 			if 'temporal_key' in schema:
 				temporal_key = table.get_temporal_key()

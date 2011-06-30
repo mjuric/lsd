@@ -4,7 +4,7 @@ import StringIO
 import tokenize
 
 valid_keys_from = frozenset(['nmax', 'dmax', 'inner', 'outer', 'xmatch', 'matchedto'])
-valid_keys_into = frozenset(['spatial_keys', 'temporal_key', 'dtype'])
+valid_keys_into = frozenset(['spatial_keys', 'temporal_key', 'dtype', 'no_neighbor_cache'])
 
 def unquote(s):
 	# Unquote if quoted
