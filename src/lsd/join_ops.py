@@ -1678,10 +1678,10 @@ class DB(object):
 				for t in tables:
 					t.commit1()
 
-				self._transaction = False
 				print >>sys.stderr, "----------- success %s [%s] ---------\n" % (self.snapid, ', '.join(t.name for t in tables))
 
 			# Remove the transaction marker
+			self._transaction = False
 			transfile = self.path[0] + '/.__transaction'
 			os.unlink(transfile)
 

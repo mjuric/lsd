@@ -124,7 +124,10 @@ class Table:
 			print >> sys.stderr, "[%s] Updating tablet catalog:" % (self.name),
  			self.rebuild_catalog(rebuild_pre_v050_snap=True)
 		else:
-			raise Exception("Table data catalog corruption detected")
+		        # A new table, opened on an uncommitted snapshot, has no saved catalog
+		        # Create an empty one.
+		        assert self._snapshots[0] == 0 and len(self._snapshots) == 1
+		        self.catalog = TableCatalog(pix=self.pix)
 
 	def get_cells_in_snapshot(self, snapid, include_cached=True):
 		return self.catalog.get_cells_in_snapshot(snapid, include_cached=include_cached)
@@ -1221,7 +1224,7 @@ class Table:
 				else:
 					# Construct a compatible numpy array, that will leave
 					# unspecified columns set to zero
-					nnew = len(colsT)
+					nnew = np.sum(incell)
 					rows = np.zeros(nnew, dtype=np.dtype(schema['columns']))
 					idx = slice(None)
 
