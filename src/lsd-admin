@@ -1,0 +1,200 @@
+#!/usr/bin/env python
+#
+# Example: lsd-check object-table
+#
+
+import os
+import lsd
+import numpy as np
+from collections import OrderedDict
+from lsd.tui import *
+
+################
+#
+# Actual work
+#
+
+class InvalidArgumentError(Exception):
+	pass
+
+def do_create_table(args):
+	# Check argument validity
+	if args.schema_module is None and args.schema is None and len(args.column_def) == 0:
+		raise InvalidArgumentError("Table schema not specified. Please specify the schema via column_def arguments, or --schema-module parameter")
+
+	if args.schema is not None:
+		# Load the schema from YAML file
+		import lsd.yaml_ex as yaml
+		schema = yaml.safe_load(file(args.schema))
+	elif args.schema_module is not None:
+		# Load the schema from module
+		import importlib
+		schema = importlib.import_module(args.schema_module).schema
+	else:
+		# Load the schema from the command line
+		schema = OrderedDict()
+
+		# Set up compression
+		if args.comp != 'none':
+			filters = { 'complib': args.comp, 'complevel': args.comp_level }
+
+		# Construct the list of columns
+		columns = OrderedDict()
+		for column_def in args.column_def:
+			(name, type) = (column_def.split(':') + ['f8'])[:2]	# Default datatype is f8
+			try:
+				_ = np.dtype(type)
+			except TypeError:
+				raise TypeError("Data type '%s' not understood for column %s" % (type, name))
+
+			if name[0] == '_':
+				raise Exception("Column names beginning with _ are not permitted.")
+
+			columns[name] = { 'type': type, 'cgroup': 'default' }
+
+		# Group the columns into column groups
+		cgroups = OrderedDict()
+		for cgroup_def in args.group:
+			cgroup_name, cols = cgroup_def.split(':')	# Split colum group name from the list of columns
+			cols = cols.split(',')				# Split the list of columns
+
+			# Define the column group
+			cgroups[cgroup_name] = { 'columns': [] }
+			ccols = cgroups[cgroup_name]['columns']
+			for colname in cols:
+				ccols.append((colname, columns[colname]['type']))
+				columns[colname]['cgroup'] = cgroup_name
+
+		# Collect any remaining ungrouped columns and pack them into one named 'default'
+		default_cgroup = [ (name, default['type']) for (name, default) in columns.iteritems() if default['cgroup'] == 'default' ]
+		if len(default_cgroup):
+			cgroups['default'] = { 'columns': default_cgroup }
+
+		# Add primary key information
+		prim_cgroup_name, prim_cgroup = next(cgroups.iteritems())
+		if getattr(args, 'primary_key', None) is None:
+			raise Exception("Must specify the primary key")
+			columns['_id'] = { 'type': 'u8', 'cgroup': prim_cgroup_name }
+			prim_cgroup['columns'].insert(0, ('_id', 'u8'))
+			args.primary_key = '_id'
+		assert prim_cgroup_name == columns[args.primary_key]['cgroup'] # Must be in the primary cgroup
+		assert np.dtype(columns[args.primary_key]['type']) == np.uint64 # Primary key must be an unsigned 64-bit integer
+		prim_cgroup['primary_key'] = args.primary_key
+
+		# Add temporal key information
+		if getattr(args, 'temporal_key', None) is not None:
+			assert prim_cgroup_name == columns[args.temporal_key]['cgroup'] # Must be in the primary cgroup
+			cgroups[ columns[args.temporal_key]['cgroup'] ]['temporal_key'] = args.temporal_key
+
+		# Add exposure key information
+		if getattr(args, 'exposure_key', None) is not None:
+			cgroups[ columns[args.exposure_key]['cgroup'] ]['exposure_key'] = args.exposure_key
+
+		# Add spatial keys information
+		commit_hooks = []
+		if getattr(args, 'spatial_keys', None) is not None:
+			lon, lat = args.spatial_keys.split(',')
+			assert prim_cgroup_name == columns[lon]['cgroup'] # Must be in the primary cgroup
+			assert prim_cgroup_name == columns[lat]['cgroup'] # Must be in the primary cgroup
+			prim_cgroup['spatial_keys'] = [lon, lat]
+
+			if not args.no_neighbor_cache:
+				commit_hooks = lsd.table.Table._default_commit_hooks
+		else:
+			raise Exception("Spatial keys must be specified")
+
+		# Put it all together
+		schema["filters"] = filters
+		schema["schema"] = cgroups
+		schema["commit_hooks"] = commit_hooks
+
+	# Drop if exists
+	if args.drop_existing and os.path.isdir(os.path.join(args.db, args.table)):
+		drop_table(args.db, args.table)
+
+	# Now create the table
+	db = lsd.DB(args.db)
+	with db.transaction():
+		db.create_table(args.table, schema)
+
+	print "Table '%s' created." % args.table
+
+def do_desc_table(args):
+	db = lsd.DB(args.db)
+	table = db.table(args.table)
+	print table
+
+def drop_table(dbpath, table):
+	path = os.path.join(dbpath, table)
+	if not os.path.isdir(path):
+		raise Exception("Table %s does not exist at %s" % (table, path))
+
+	# Recursive chmod
+	from pipes import quote
+	os.system('chmod -R +w %s' % quote(path))
+
+	from shutil import rmtree
+	rmtree(path)
+
+	print "Table '%s' dropped." % table
+
+def do_drop_table(args):
+	for table in args.table:
+		drop_table(args.db, table)
+
+################
+
+import argparse
+parser = argparse.ArgumentParser(description='Administer an LSD databases',
+	formatter_class=argparse.RawDescriptionHelpFormatter,
+	epilog="""Examples:
+	lsd-admin create table ....
+.
+""")
+parser.add_argument('--db', default=os.getenv('LSD_DB', '').split(':')[0], type=str, help='Path to LSD database')
+subparsers = parser.add_subparsers()
+
+# CREATE
+parser_create = subparsers.add_parser('create', help='Create objects in the database')
+subparsers2 = parser_create.add_subparsers()
+
+# CREATE TABLE
+parser_create_table = subparsers2.add_parser('table', help='Create a table')
+parser_create_table.add_argument('table', type=str, help='Name of the table to create')
+parser_create_table.add_argument('column_def', type=str, help="A column definition, in the form of NAME:TYPE, where TYPE is a string that will be passed to np.dtype", nargs='*')
+parser_create_table.add_argument('--primary-key', type=str, help='Primary key')
+parser_create_table.add_argument('--spatial-keys', type=str, help='Spatial keys')
+parser_create_table.add_argument('--temporal-key', type=str, help='Temporal key')
+parser_create_table.add_argument('--exposure-key', type=str, help='Exposure key')
+parser_create_table.add_argument('--no-neighbor-cache', type=bool, default=False, help="No neighbor caches will be built for this table (note: use only if you _really_ know what you're doing")
+parser_create_table.add_argument('--schema-module', type=str, help='The module defining the table schema, in top-level variable named "schema"')
+parser_create_table.add_argument('--schema', type=str, help='A file containing the table schema in YAML format')
+parser_create_table.add_argument('--comp', type=str, default='blosc', help='Compression type', choices=['blosc', 'zlib', 'none'])
+parser_create_table.add_argument('--comp-level', type=int, default=5, help='Compression level. Higher levels result in better compression ratios, at the expense of increased CPU usage')
+parser_create_table.add_argument('--group', type=str, default=[], action='append', help='cgroup:col1,col2,col3,... The column group name, followed by the list of columns to be located in this column group')
+parser_create_table.add_argument('--drop-existing', help='Drop the table if it already exists', default=False, action='store_true')
+parser_create_table.set_defaults(func=do_create_table)
+
+# DESC
+parser_desc = subparsers.add_parser('desc', help='Show info about tables and other objects in the database')
+subparsers2 = parser_desc.add_subparsers()
+
+# DESC TABLE
+parser_desc_table = subparsers2.add_parser('table', help='Show a table schema')
+parser_desc_table.add_argument('table', type=str, help='Name of the table')
+parser_desc_table.set_defaults(func=do_desc_table)
+
+# DROP
+parser_drop = subparsers.add_parser('drop', help='Delete database tables and objects')
+subparsers2 = parser_drop.add_subparsers()
+
+# DROP TABLE
+parser_drop_table = subparsers2.add_parser('table', help='Delete a table')
+parser_drop_table.add_argument('table', type=str, help='Name of the table to delete', nargs='+')
+parser_drop_table.set_defaults(func=do_drop_table)
+
+try:
+	args = parser.parse_args()
+	args.func(args)
+except InvalidArgumentError as err:
+	print err
