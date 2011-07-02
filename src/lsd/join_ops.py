@@ -1622,6 +1622,8 @@ class DB(object):
 					raise Exception('Another transaction is already ongoing')
 				self.snapid = snapid
 			except IOError:
+				# New transaction
+				self.snapid = self._tsnap_to_snapid(time.time())
 				with open(transfile, 'w') as fp:
 					fp.write(self.snapid + '\n')
 
@@ -1921,7 +1923,7 @@ class DB(object):
 		except IOError:
 			return False
 
-	def table(self, tabname, create=False, snapid=None):
+	def table(self, tabname, create=False):
 		"""
 		Returns a Table instance for a given table name.
 
@@ -1932,8 +1934,7 @@ class DB(object):
 		      directly, though a Table instance (use queries for
 		      that).
 		"""
-		if snapid is None:
-			snapid = self.snapid
+		snapid = self.snapid
 
 		try:
 			t = self.tables[tabname]
@@ -1943,7 +1944,7 @@ class DB(object):
 			if create:
 				self._check_transaction()
 				path = '%s/%s' % (self.path[0], tabname)
-				self.tables[tabname] = Table(path, name=tabname, mode='c', snapid=snapid)
+				self.tables[tabname] = Table(path, name=tabname, mode='c', snapid=snapid, open_transaction=True)
 			else:
 				# Find the table. Allow the database to be specified
 				# using db.tablename syntax
@@ -1957,14 +1958,10 @@ class DB(object):
 						dbpath = '/'.join(dbpath.split('/')[:-1] + [ dbdir ])
 					path = '%s/%s' % (dbpath, tn)
 					if os.path.isdir(path):
-						self.tables[tabname] = Table(path, snapid=snapid)
+						self.tables[tabname] = Table(path, snapid=snapid, open_transaction=self.in_transaction())
 						break
 				else:
 					raise IOError("Table %s not found in %s" % (tabname, ':'.join(self.path)))
-
-			# Begin transaction on this table, if the database has one opened
-			if self._transaction:
-				self.tables[tabname].begin_transaction(self.snapid)
 
 		return self.tables[tabname]
 
@@ -1998,7 +1995,6 @@ class DB(object):
 				e.relation = create_join(self, None, jargs, entry.table, e.table, jclass=CrossmatchJoin)
 				##e.relation = create_join(self, "/n/pan/mjuric/db/.galex_gr5:sdss.join", jargs, entry.table, e.table)
 				entry.joins.append(e)
-				print "Matched to", entry.table.name
 
 		for tabname, (e, jargs) in tablist:
 			# Find tables that can be joined onto this one (where this one is on the left hand side of the relation)
