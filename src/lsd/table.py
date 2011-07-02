@@ -1306,18 +1306,29 @@ class Table:
 		""" Return some basic (human readable) information about the
 		    table.
 		"""
-		i =     'Path:          %s\n' % self.path
-		i = i + 'Partitioning:  level=%d\n' % (self.pix.level)
-		i = i + '(t0, dt):      %f, %f \n' % (self.pix.t0, self.pix.dt)
-		i = i + 'Objects:       %d\n' % (self.nrows())
-		i = i + 'Column groups: %s' % str(self._cgroups.keys())
-		i = i + '\n'
+		i =  'Path:          %s\n' % self.path
+		i += 'Partitioning:  level=%d\n' % (self.pix.level)
+		i += '(t0, dt):      %f, %f \n' % (self.pix.t0, self.pix.dt)
+		i += 'Rows:          %d\n' % (self.nrows())
+		i += 'Columns:       %d\n' % (len(self.columns) - len(self._cgroups['_PSEUDOCOLS']['columns']))
+		i += 'Primary key:   %s\n' % self.get_primary_key()
+		if self.spatial_keys:
+			i += 'Spatial keys:  (%s, %s)\n' % tuple([ self.spatial_keys[i].name for i in xrange(2) ])
+		if self.temporal_key:
+			i += 'Temporal key:  %s\n' % self.get_temporal_key()
+		ek = self.resolve_alias('_EXP')
+		if ek != '_EXP':
+			i += 'Exposure key:  %s\n' % ek
+		i += 'Aliases:       %s\n' % str(self._aliases.items())
+		i += 'Column groups: %s\n' % str([key for key in self._cgroups.iterkeys() if key[0] != '_'])
 		s = ''
-		for cgroup, schema in dict(self._cgroups).iteritems():
-			s = s + '-'*31 + '\n'
-			s = s + 'Column group \'' + cgroup + '\':\n'
-			s = s + "%20s %10s\n" % ('Column', 'Type')
-			s = s + '-'*31 + '\n'
+		for cgroup, schema in self._cgroups.iteritems():
+			if cgroup[0] == '_': # Skip pseudo-tablets
+				continue
+			s += '-'*31 + '\n'
+			s += 'Column group \'' + cgroup + '\':\n'
+			s += "%20s %10s\n" % ('Column', 'Type')
+			s += '-'*31 + '\n'
 			for col in schema["columns"]:
 				s = s + "%20s %10s\n" % (col[0], col[1])
 			s = s + '-'*31 + '\n'
