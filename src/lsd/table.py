@@ -91,9 +91,9 @@ class Table:
 
 	### Transaction/Snapshotting support
 	def set_snapshot(self, snapid):
-		#### NOTE: This may get called even before the schema is loaded
-		####
-
+	        """ Load the list of committed snapshots <= than snapid
+                    NOTE: This may get called even before the schema is loaded
+		"""
 		# Snapshot ID
 		self.snapid = snapid
 
@@ -105,12 +105,6 @@ class Table:
 				self._snapshots.append(s)
 		# Sorted list of snapshots, newest first
 		self._snapshots.sort(reverse=True)
-
-		# Check if this table is participating in an open transaction.
-		if self.snapid != self._snapshots[0]:
-			path = self._snapshot_path(self.snapid)
-			assert not os.path.isdir(path) or not os.path.isfile('%s/.committed' % path)
-			self.transaction = True
 
         def _load_catalog(self):
 		# Load the tablet cache.
@@ -124,7 +118,10 @@ class Table:
 			print >> sys.stderr, "[%s] Updating tablet catalog:" % (self.name),
  			self.rebuild_catalog(rebuild_pre_v050_snap=True)
 		else:
-			raise Exception("Table data catalog corruption detected")
+		        # A new table, opened on an uncommitted snapshot, has no saved catalog
+		        # Create an empty one.
+		        assert self._snapshots[0] == 0 and len(self._snapshots) == 1
+		        self.catalog = TableCatalog(pix=self.pix)
 
 	def get_cells_in_snapshot(self, snapid, include_cached=True):
 		return self.catalog.get_cells_in_snapshot(snapid, include_cached=include_cached)
@@ -151,18 +148,22 @@ class Table:
 		if not self.transaction:
 			raise Exception("Trying to modify a table without starting a transaction")
 
-	def begin_transaction(self, snapid):
+	def begin_transaction(self, snapid, load_state=True):
+		assert not self.transaction
+		
+
 		# Begin a new transaction
-		path = self._snapshot_path(self.snapid)
+		path = self._snapshot_path(snapid)
 		if os.path.isfile('%s/.committed' % path):
 			raise Exception("Trying to reopen an already committed transaction")
 
-		if self.snapid != snapid:
-			self.set_snapshot(snapid)
-			self._load_schema()
-			self._load_catalog()
-
 		self.transaction = True
+
+		if load_state:
+        		# Reload state
+        		self.set_snapshot(snapid)
+        		self._load_schema()
+        		self._load_catalog()
 
 	def commit0(self, db, pri):
 		""" Do post-transaction housekeeping """
@@ -212,6 +213,8 @@ class Table:
 
 	def commit1(self):
 		""" Do the actual commit """
+		self._check_transaction()
+
 		# Set commit marker
 		path = self._snapshot_path(self.snapid)
 		commit_marker = '%s/.committed' % path
@@ -222,11 +225,18 @@ class Table:
 
 		self.transaction = False
 
+		# Reload state
+		self.set_snapshot(self.snapid)
+		self._load_schema()
+		self._load_catalog()
+
 	def rollback(self):
 		""" Abort the transaction """
+		self._check_transaction()
+
 		self.transaction = False
 
-		# Reload pristine state
+		# Reload state
 		self.set_snapshot(self.snapid)
 		self._load_schema()
 		self._load_catalog()
@@ -513,6 +523,7 @@ class Table:
 		the internal representation of the table (the self.columns
 		dict).
 		"""
+
 		schemacfg = self._find_metadata_path('schema.cfg')
 		data = json.loads(file(schemacfg).read(), object_pairs_hook=OrderedDict)
 		self._unicode_to_str(data)
@@ -554,12 +565,14 @@ class Table:
 
 		self._rebuild_internal_schema()
 
-	def _store_schema(self, force=False):
+	def _store_schema(self):
 		"""
 		Store the table schema.
 
 		Store the table schema to schema.cfg, in JSON format.
 		"""
+		self._check_transaction()
+
 		data = dict()
 		data["level"], data["t0"], data["dt"] = self.pix.level, self.pix.t0, self.pix.dt
 		data["nrows"] = self._nrows
@@ -570,8 +583,6 @@ class Table:
 		data["aliases"] = self._aliases
 		data["commit_hooks"] = self._commit_hooks
 
-		if not force:
-			self._check_transaction()
 		fn = self._snapshot_path(self.snapid, create=True) + '/schema.cfg'
 		f = open(fn, 'w')
 		f.write(json.dumps(data, indent=4, sort_keys=True))
@@ -821,6 +832,8 @@ class Table:
 		
 		Create a tablet in file <fn>, for column group <cgroup>.
 		"""
+		self._check_transaction()
+
 		# Create a tablet at a given path, for cgroup 'cgroup'
 		assert os.access(fn, os.R_OK) == False
 
@@ -889,36 +902,35 @@ class Table:
 		return fp
 
 	### Public methods
-	def __init__(self, path, snapid, mode='r', name=None, level=None, t0=None, dt=None):
+	def __init__(self, path, snapid, open_transaction, mode='r', name=None):
 		"""
 		Constructor.
 		
 		Never use directly. Use DB.table() to obtain an instance of
 		this class.
 		"""
-		self.pix = Pixelization(level=int(os.getenv("PIXLEVEL", 6)), t0=54335, dt=1)
+		if mode == 'r' and not os.path.isdir(self.path):
+			raise IOError('Cannot access table: "%s" is inexistent or unreadable.' % (path))
+
+		self.path = path
+		self.set_snapshot(snapid)
+
+		if open_transaction:
+			self.begin_transaction(snapid, load_state=False)
+
 		if mode == 'c':
-			self._create(snapid, name, path, level, t0, dt)
-		else:
-			self.path = path
-			if not os.path.isdir(self.path):
-				raise IOError('Cannot access table: "%s" is inexistant or not readable.' % (path))
+			self._create(snapid, name, path)
 
-        		# Load the table from the requested snapshot
-        		self.set_snapshot(snapid)
-        		self._load_schema()
-        		self._load_catalog()
+		# Load the state
+		self._load_schema()
+		self._load_catalog()
 
-	def _create(self, snapid, name, path, level, t0, dt):
+	def _create(self, snapid, name, path):
 		"""
 		Create an empty table and store its schema.
-		
-		Note: You must call _load_schema() after this for the table to actually be loaded.
 		"""
 		assert name is not None
-
-		self.transaction = True
-		self.path = path
+		self._check_transaction()
 
 		for path in glob.iglob('%s/snapshots/*/.committed' % (self.path)):
 			raise Exception("Creating a new table in '%s' would overwrite an existing one." % self.path)
@@ -933,20 +945,14 @@ class Table:
 		self.columns = OrderedDict()
 		self.name = name
 
-		if level is None: level = self.pix.level
-		if    t0 is None: t0 = self.pix.t0
-		if    dt is None: dt = self.pix.dt
-		self.pix = Pixelization(level, t0, dt)
+		# Pixelization
+		self.pix = Pixelization(level=int(os.getenv("PIXLEVEL", 6)), t0=54335, dt=1)
 
 		# Empty table catalog
 		self.catalog = TableCatalog(pix=self.pix)
 
-		# Save table definition into the snapshot
-		self.set_snapshot(snapid)
+		# Save the newly constructed schema
 		self._store_schema()
-		self._load_schema()	# To construct internal state
-
-		#self.rebuild_catalog(snapid, quiet=True)
 
 	def define_alias(self, alias, colname):
 		"""
@@ -1221,7 +1227,7 @@ class Table:
 				else:
 					# Construct a compatible numpy array, that will leave
 					# unspecified columns set to zero
-					nnew = len(colsT)
+					nnew = np.sum(incell)
 					rows = np.zeros(nnew, dtype=np.dtype(schema['columns']))
 					idx = slice(None)
 
@@ -1300,18 +1306,29 @@ class Table:
 		""" Return some basic (human readable) information about the
 		    table.
 		"""
-		i =     'Path:          %s\n' % self.path
-		i = i + 'Partitioning:  level=%d\n' % (self.pix.level)
-		i = i + '(t0, dt):      %f, %f \n' % (self.pix.t0, self.pix.dt)
-		i = i + 'Objects:       %d\n' % (self.nrows())
-		i = i + 'Column groups: %s' % str(self._cgroups.keys())
-		i = i + '\n'
+		i =  'Path:          %s\n' % self.path
+		i += 'Partitioning:  level=%d\n' % (self.pix.level)
+		i += '(t0, dt):      %f, %f \n' % (self.pix.t0, self.pix.dt)
+		i += 'Rows:          %d\n' % (self.nrows())
+		i += 'Columns:       %d\n' % (len(self.columns) - len(self._cgroups['_PSEUDOCOLS']['columns']))
+		i += 'Primary key:   %s\n' % self.get_primary_key()
+		if self.spatial_keys:
+			i += 'Spatial keys:  (%s, %s)\n' % tuple([ self.spatial_keys[i].name for i in xrange(2) ])
+		if self.temporal_key:
+			i += 'Temporal key:  %s\n' % self.get_temporal_key()
+		ek = self.resolve_alias('_EXP')
+		if ek != '_EXP':
+			i += 'Exposure key:  %s\n' % ek
+		i += 'Aliases:       %s\n' % str(self._aliases.items())
+		i += 'Column groups: %s\n' % str([key for key in self._cgroups.iterkeys() if key[0] != '_'])
 		s = ''
-		for cgroup, schema in dict(self._cgroups).iteritems():
-			s = s + '-'*31 + '\n'
-			s = s + 'Column group \'' + cgroup + '\':\n'
-			s = s + "%20s %10s\n" % ('Column', 'Type')
-			s = s + '-'*31 + '\n'
+		for cgroup, schema in self._cgroups.iteritems():
+			if cgroup[0] == '_': # Skip pseudo-tablets
+				continue
+			s += '-'*31 + '\n'
+			s += 'Column group \'' + cgroup + '\':\n'
+			s += "%20s %10s\n" % ('Column', 'Type')
+			s += '-'*31 + '\n'
 			for col in schema["columns"]:
 				s = s + "%20s %10s\n" % (col[0], col[1])
 			s = s + '-'*31 + '\n'

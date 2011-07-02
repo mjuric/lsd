@@ -1,0 +1,88 @@
+#!/usr/bin/env python
+#
+
+import os
+import time
+import lsd
+import lsd.pool2 as pool2
+import lsd.utils as utils
+import lsd.importers
+import pkgutil, importlib
+from lsd.tui import *
+
+##################
+def import_from_chunks_aux(chunk, db, importer):
+	""" Import from a "chunk" (most commonly a file). Designed to be used with import_from_chunks
+	"""
+	importer, importer_args = utils.unpack_callable(importer)
+
+	# Import
+	ret = importer(db, chunk, *importer_args)
+
+	yield (chunk,) + ret
+
+def import_from_chunks(db, importer, chunks):
+	""" Import a catalog given a list of chunks (chunks are most commonly filenames)
+	"""
+	t0 = time.time()
+	at = 0; ntot = 0
+	pool = pool2.Pool()
+	for (chunk, nloaded, nin) in pool.imap_unordered(chunks, import_from_chunks_aux, (db, importer,), progress_callback=pool2.progress_pass):
+		at = at + 1
+		ntot = ntot + nloaded
+		t1 = time.time()
+		time_pass = (t1 - t0) / 60
+		time_tot = time_pass / at * len(chunks)
+
+		schunk = str(chunk)
+		if len(schunk) > 70:
+			schunk = "..." + schunk[-67:]
+
+		print('  ===> Imported %-70s [%d/%d, %5.2f%%] +% 7d/%-7d %9d (%.0f/%.0f min.)' % (schunk, at, len(chunks), 100 * float(at) / len(chunks), nloaded, nin, ntot, time_pass, time_tot))
+	del pool
+
+def chunk_importer(args):
+	db = lsd.DB(args.db)
+
+	with db.transaction():
+		# Create the importer and return the list of chunks
+		importer, chunks = args.get_importer(db, args)
+
+		# Import pieces
+		print "Importing from %d pieces:" % (len(chunks))
+		import_from_chunks(db, importer, chunks)
+		print "done"
+####################################################
+
+import argparse
+parser = argparse.ArgumentParser(description='Import a dataset into LSD',
+	formatter_class=argparse.RawDescriptionHelpFormatter,
+	epilog="""Examples:
+	lsd-import text --force -d , galex_gr5 /n/pan/catalogs/GALEX/AIS/GR5_58_57N.csv.gz
+	lsd-import text --cols ra,dec,id:u8 field field.txt
+.
+""")
+parser.add_argument('--db', default=os.getenv('LSD_DB', None), type=str, help='Path to LSD database')
+parser.set_defaults(func=chunk_importer)
+
+subparsers = parser.add_subparsers()
+
+# Enumerate all importers
+pkgutil.iter_modules(lsd.importers.__path__)
+for _, modname, ispkg in pkgutil.iter_modules(lsd.importers.__path__):
+	if ispkg:
+		continue
+
+	module = importlib.import_module('lsd.importers.' + modname)
+
+	try:
+		module.add_arg_parsers(subparsers)
+	except AttributeError:
+		parser = subparsers.add_parser(modname, help=module.__doc__)
+		parser.set_defaults(get_importer=module.get_importer)
+		parser.add_argument('args', 'Importer-specific arguments', type=str, nargs='+')
+		pass
+
+# Parse command line args
+args = parser.parse_args()
+args.func(args)
