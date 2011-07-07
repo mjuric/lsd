@@ -56,6 +56,7 @@ with db.transaction():
 	if create or auto:
 		smf.create_object_table(db, obj_tabname, det_tabname)
 
+	newexp = None
 	if gen_explist or auto:
 		print >> sys.stderr, "Scanning what is already in the database..."
 		newexp, oldexps = smf.get_new_exposures(db, obj_tabname, det_tabname, exp_tabname)

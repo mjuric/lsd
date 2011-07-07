@@ -42,7 +42,7 @@ class TextImporter:
 
 	def __init__(self, db, tabname, force, delimiter, usecols, dtype, skip_header=0, dms=[], hms=[], setcols={}):
 		self.tabname = tabname
-		self.delimiter = delimiter.decode('string_escape')
+		self.delimiter = delimiter.decode('string_escape') if delimiter is not None else None
 		self.dtype   = dtype
 		self.usecols = usecols
 		self.force = force

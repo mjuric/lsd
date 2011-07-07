@@ -948,7 +948,8 @@ def _obj_det_match(cells, db, obj_tabname, det_tabname, o2d_tabname, radius, exp
 	##print "Det cells: ", det_cells
 
 	# Loop, xmatch, and store
-	explist = np.asarray(list(explist), dtype=np.uint64)	# Ensure explist is a ndarray
+	if explist is not None:
+		explist = np.asarray(list(explist), dtype=np.uint64)	# Ensure explist is a ndarray
 	det_query = db.query('_ID, _LON, _LAT, _EXP, _CACHED FROM %s' % det_tabname)
 	for det_cell in sorted(det_cells):
 		# fetch detections in this cell, convert to gnomonic coordinates
@@ -1173,9 +1174,12 @@ def _sanity_check_object_table_reducer(kv, db, det_tabname, explist):
 	if explist is not None:
 		det_rows = det_rows[np.in1d(det_rows.exp_id, explist)]
 	det_rows.sort(["det_id"])
-	assert np.all(np.unique(rows.det_id) == det_rows.det_id), "Not all detections were linked to objects (need to rerun make-object-catalog?): nlinked=%d ntotal=%d cell_id=%s" % (len(rows.det_id), len(det_rows), cell_id)
+	
+	ok = np.all(np.unique(rows.det_id) == det_rows.det_id)
+	if not ok:
+		print "ERROR -- Not all detections were linked to objects (need to rerun make-object-catalog?): nlinked=%d ntotal=%d cell_id=%s" % (len(rows.det_id), len(det_rows), cell_id)
 
-	yield True
+	yield ok
 
 def sanity_check_object_table(db, obj_tabname, det_tabname, radius, explist=None):
 	"""
