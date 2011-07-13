@@ -115,6 +115,13 @@ def get_importer(db, args):
 		dtype = table.dtype.fields[name][0]
 		setcols[name] = (dtype, dtype.type(val))
 
+	# Slurp the columns from file
+	if args.cols_file is not None:
+		if args.cols is not None:
+			raise Exception("Cannot specify both --cols and --cols-file")
+		with open(args.cols_file) as fp:
+			args.cols = ','.join(':'.join(s.split()) for s in fp.xreadlines())
+
 	# List of columns to use
 	if args.cols is None:
 		# Get the list of columns from the table, except for those
@@ -163,6 +170,7 @@ def add_arg_parsers(subparsers):
 	parser.add_argument('file', help='One or more text files. If ending in .gz or .bz2, they are assumed to be compressed.', type=str, nargs='+')
 	parser.add_argument('-d', '--delimiter', help='The string used to separate values. By default, any consecutive whitespaces will act as delimiter', type=str)
 	parser.add_argument('-c', '--cols', help='Comma separated list of <colname>:<file_column>, where <file_column> is a 1-based index of the column in the file that is to be loaded into <colname>', type=str)
+	parser.add_argument('--cols-file', help='A file with two, whitespace delimited columns, <colname> <file_column>, having the same meaning as arguments to --cols', type=str)
 	parser.add_argument('-f', '--force', help='Ignore any errors found in input data files', default=False, action='store_true')
 	parser.add_argument('--import-primary-key', help='The input files contain the primary key values. Load these instead of automatically asigning new ones.', default=False, action='store_true')
 	parser.add_argument('--skip-header', help='Number of lines to skip at the beginning of each input file', default=0, type=int)
