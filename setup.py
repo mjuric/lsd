@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import os, os.path, sys
+import os, os.path, sys, glob
 
 try:
         import numpy
@@ -46,7 +46,10 @@ args = {
 	'packages'	: ['lsd', 'lsd.importers', 'surveys', 'surveys.ps1', 'mr'],
 	'package_dir'	: {'': 'src'},
 	'ext_modules'	: [Extension('lsd.native', ['src/native/main.cpp'], include_dirs=inc)],
-	'data_files'    : [('share/lsd/examples', ['src/examples/latitude_histogram.py', 'src/examples/count_rows.py'])]
+	'data_files'    : [
+				('share/lsd/examples', ['src/examples/latitude_histogram.py', 'src/examples/count_rows.py']),
+				('share/lsd/schemas', glob.glob('src/schemas/*.yaml') + glob.glob('src/schemas/*.map'))
+			]
 }
 
 setup(**args)

@@ -1,0 +1,26 @@
+# Schema for USNO-B table
+filters: {complevel: 5, complib: blosc}
+schema:
+  common:
+    primary_key: usnob_id
+    spatial_keys: [ra, dec]
+    columns:
+    - [usnob_id, u8]
+    - [ra, f8]
+    - [dec, f8]
+    - [sra, i2]
+    - [sde, i2]
+    - [epoch, f4]
+    - [muRa, i2]
+    - [muDec, i2]
+    - [muprob, u1]
+    - [muflag, u1]
+    - [smura, i2]
+    - [smude, i2]
+    - [sfitra, i2]
+    - [sfitde, i2]
+    - [nfitpt, u1]
+    - [mag, 5f4]
+    - [fldid, 5i2]
+    - [sg, 5u1]
+    - [fldepoch, 5f4]
