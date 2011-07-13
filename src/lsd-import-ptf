@@ -57,8 +57,8 @@ else:
 		files = []
 		for row in dat:
 			files.append(row[0])
-		else:
-			SQL = "select p.pid, a.filename from ancilfiles a, procimages p, exposures e where a.pid=p.pid and p.expid=e.expid and a.anciltype=\'sexcat\' and p.ppid = 5 and p.vbest > 0 and p.status > 0 and p.svid > 41 and a.archivestatus = 1 order by p.pid"
+	else:
+		SQL = "select p.pid, a.filename from ancilfiles a, procimages p, exposures e where a.pid=p.pid and p.expid=e.expid and a.anciltype=\'sexcat\' and p.ppid = 5 and p.vbest > 0 and p.status > 0 and p.svid > 41 and a.archivestatus = 1 order by p.pid"
 		cur.execute(SQL)
 		# find all PIDs in the IPAC database
 		dat = cur.fetchall()
@@ -80,16 +80,18 @@ else:
 		# find new filenames
 		files = np.asarray(files_all)[new_pids]
 		# split the list
-		files0 = files[0:np.floor(files.size/2.)]
-		files1 = files[np.floor(files.size/2.):]
-		f = open('files.0', 'w')
-		for row in files0:
-			f.write('%s\n' % row)
-		f.close()
-		f = open('files.1', 'w')
-		for row in files1:
-			f.write('%s\n' % row)
-		f.close()
+#		files0 = files[0:np.floor(files.size/2.)]
+#		files1 = files[np.floor(files.size/2.):]
+#		f = open('files.0', 'w')
+#		for row in files0:
+#			f.write('%s\n' % row)
+#		f.close()
+#		f = open('files.1', 'w')
+#		for row in files1:
+#			f.write('%s\n' % row)
+#		f.close()
+#		del files0, files1
+		del pids_current, dat, pids_all, files_all, new_pids
 
 print "Importing SExtractor catalog files:"
 with db.transaction():
