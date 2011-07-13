@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 #
-# Example: time nice -n 10 ./lsd-make-ptf-object-catalog -c --explist=explist.txt test_obj test_det test_exp >output_object 2>errors_object
-# Example: time nice -n 10 ./lsd-make-ptf-object-catalog --explist=explist.txt test_obj test_det test_exp >output_object 2>errors_object
+# Example: time nice -n 10 ./lsd-make-ptf-object-catalog -c ptf_obj ptf_det ptf_exp >output_object 2>errors_object
+# Example: time nice -n 10 ./lsd-make-ptf-object-catalog --explist=explist.txt ptf_obj ptf_det ptf_exp >output_object 2>errors_object
 #
 
 import sys
@@ -82,6 +82,7 @@ with db.transaction():
 
 	if explist is not None:
 		print >>sys.stderr, "%d new exposures (%d total)." % (len(explist), db.table(exp_tabname).nrows())
+		newexp = explist
 
 	if gen_explist:
 		for exp in newexp:
