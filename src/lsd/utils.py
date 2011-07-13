@@ -216,3 +216,15 @@ def xhistogram(data, bin_edges):
 	hist, _ = np.histogram(data, bins)
 	return hist
 
+## YAML related utils
+
+if __name__ == "__main__":
+	import smf, yaml_ex as yaml, json
+	import surveys.galex
+	schema = surveys.galex.schema
+	text = yaml.safe_dump(schema)
+	schema2 = yaml.load(text)
+	print schema2
+	print yaml.safe_dump(schema2)
+	#v = tuples_to_lists(schema)
+	#print yaml.dump(v)

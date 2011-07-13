@@ -1,0 +1,70 @@
+# Schema for GALEX GR5 table
+filters: {complevel: 5, complib: blosc}
+schema:
+  common:
+    primary_key: galex_id
+    spatial_keys: [ra, dec]
+    columns:
+    - [galex_id, u8]
+    - [objid, u8]
+    - [ra, f8]
+    - [dec, f8]
+    - [glon, f8]
+    - [glat, f8]
+    - [fov_radius, f4]
+    - [objtype, i2]
+    - [e_bv, f4]
+    - [fuv_mag, f4]
+    - [fuv_magerr, f4]
+    - [nuv_mag, f4]
+    - [nuv_magerr, f4]
+    - [photoextractid, u8]
+  astrometry:
+    columns:
+    - [fuv_x_image, f4]
+    - [fuv_y_image, f4]
+    - [nuv_x_image, f4]
+    - [nuv_y_image, f4]
+    - [fuv_fwhm_image, f4]
+    - [nuv_fwhm_image, f4]
+    - [fuv_fwhm_world, f4]
+    - [nuv_fwhm_world, f4]
+  photoextra:
+    columns:
+    - [fuv_mag_best, f4]
+    - [fuv_magerr_best, f4]
+    - [nuv_mag_best, f4]
+    - [nuv_magerr_best, f4]
+    - [fuv_mag_auto, f4]
+    - [fuv_magerr_auto, f4]
+    - [nuv_mag_auto, f4]
+    - [nuv_magerr_auto, f4]
+    - [fuv_mag_aper_4, f4]
+    - [fuv_magerr_aper_4, f4]
+    - [nuv_mag_aper_4, f4]
+    - [nuv_magerr_aper_4, f4]
+    - [fuv_mag_aper_6, f4]
+    - [fuv_magerr_aper_6, f4]
+    - [nuv_mag_aper_6, f4]
+    - [nuv_magerr_aper_6, f4]
+    - [fuv_artifact, f4]
+    - [nuv_artifact, f4]
+    - [fuv_flags, f4]
+    - [nuv_flags, f4]
+    - [fuv_flux, f4]
+    - [fuv_fluxerr, f4]
+    - [nuv_flux, f4]
+    - [nuv_fluxerr, f4]
+  survey:
+    exposure_key: img
+    columns:
+    - [tilenum, i4]
+    - [img, i4]
+    - [subvisit, i2]
+    - [type, i4]
+    - [band, i4]
+    - [istherespectrum, bool]
+    - [quality, u4]
+    - [mpstype, a3]
+    - [avaspra, f8]
+    - [avaspdec, f8]

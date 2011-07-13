@@ -124,6 +124,81 @@ def do_desc_table(args):
 	table = db.table(args.table)
 	print table
 
+def get_snapshots_info(dbpath, table_name):
+	db = lsd.DB(dbpath)
+	# See if the database has a transaction opened
+	tfile = '%s/.__transaction' % (dbpath)
+	try:
+		with open(tfile) as fp:
+			cur_snapid = fp.read().strip()
+	except:
+		cur_snapid = None
+
+	snaps = {}
+
+	try:
+		table = db.table(table_name)
+		import glob
+		for snap_path in glob.iglob('%s/snapshots/*' % table.path):
+			snapid = snap_path.split('/')[-1]
+			committed = os.path.isfile(os.path.join(snap_path, '.committed'))
+
+			if not committed:
+				status = "FAILED" if cur_snapid != snapid else "OPEN"
+			else:
+				status = "COMMITTED"
+
+			snaps[snapid] = { 'status': status, 'path': snap_path }
+	except:
+		import sys
+		print >>sys.stderr, "Problem reading table %s" % table_name
+
+	return snaps
+
+def do_desc_snapshots(args):
+	if not args.table:
+		# Enumerate all tables
+		args.table = [ table for table in os.listdir(args.db) if os.path.isdir('%s/%s' % (args.db, table)) ]
+
+	for table in args.table:
+		snaps = get_snapshots_info(args.db, table)
+
+		print "%33s" % table
+		print "%20s %12s" % ("Snapshot ID", "State")
+		print "-"*33
+
+		for snapid in sorted(snaps.keys()):
+			status = snaps[snapid]['status']
+
+			print "%20s %11s" % (snapid, status)
+		print ''
+
+def do_vacuum_table(args):
+	from pipes import quote
+	from shutil import rmtree
+	import sys
+
+	if not args.table:
+		# Enumerate all tables
+		args.table = [ table for table in os.listdir(args.db) if os.path.isdir('%s/%s' % (args.db, table)) ]
+
+	for table in args.table:
+		snaps = { snapid:v for snapid, v in get_snapshots_info(args.db, table).iteritems() if v['status'] == 'FAILED' }
+
+		for snapid in sorted(snaps.keys()):
+			status = snaps[snapid]['status']
+			path = snaps[snapid]['path']
+
+			print "Deleting %s:%s ..." % (table, snapid),
+			sys.stdout.flush()
+			
+			if not args.dry_run:
+				os.system('chmod -R +w %s' % quote(path))
+				rmtree(path)
+
+			print "done."
+	print "Vacuuming completed."
+
 def drop_table(dbpath, table):
 	path = os.path.join(dbpath, table)
 	if not os.path.isdir(path):
@@ -184,14 +259,29 @@ parser_desc_table = subparsers2.add_parser('table', help='Show a table schema')
 parser_desc_table.add_argument('table', type=str, help='Name of the table')
 parser_desc_table.set_defaults(func=do_desc_table)
 
+# DESC SNAPSHOTS
+parser_desc_snapshots = subparsers2.add_parser('snapshots', help="Show information on a table's snapshots")
+parser_desc_snapshots.add_argument('table', type=str, help='Zero or more tables to describe. If left unspecified, all tables will be described', nargs='*')
+parser_desc_snapshots.set_defaults(func=do_desc_snapshots)
+
 # DROP
 parser_drop = subparsers.add_parser('drop', help='Delete database tables and objects')
 subparsers2 = parser_drop.add_subparsers()
 
 # DROP TABLE
 parser_drop_table = subparsers2.add_parser('table', help='Delete a table')
-parser_drop_table.add_argument('table', type=str, help='Name of the table to delete', nargs='+')
+parser_drop_table.add_argument('table', type=str, help='One or more tables to delete', nargs='+')
 parser_drop_table.set_defaults(func=do_drop_table)
+
+# VACUUM
+parser_vacuum = subparsers.add_parser('vacuum', help='Reclaim unused/wasted database space')
+subparsers2 = parser_vacuum.add_subparsers()
+
+# VACUUM TABLE
+parser_vacuum_table = subparsers2.add_parser('table', help='Reclaim space by deleting failed snapshots')
+parser_vacuum_table.add_argument('table', type=str, help='Zero or more tables to vacuum. If left unspecified, all tables will be vacuumed', nargs='*')
+parser_vacuum_table.add_argument('-n', '--dry-run', help="Don't actually vacuum, just show what would have been vacuumed", default=False, action='store_true')
+parser_vacuum_table.set_defaults(func=do_vacuum_table)
 
 try:
 	args = parser.parse_args()
