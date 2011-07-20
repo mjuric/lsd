@@ -12,6 +12,7 @@ module load hpc/python-2.7_modules
 
 module load math/hdf5-1.8.5_gnu
 module load hpc/git-1.6.4
+module load hpc/gsl-gnu
 
 # Test if we have extra modules in PYTHONPATH
 EXTRAMOD=/n/home06/mjuric/lfs/lib/python2.7/site-packages

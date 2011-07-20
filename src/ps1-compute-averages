@@ -27,18 +27,18 @@ def get_zp(mjd):
 
 	# Find the ZP for each MJD. If it does not exist,
 	# return +inf
-	idx = np.searchsorted(zps.mjd, mjd)
+	idx = np.searchsorted(zps['mjd'], mjd)
 	idx[idx == len(zps)] = 0
-	found = zps.mjd[idx] == mjd
+	found = zps['mjd'][idx] == mjd
 #	print "Found:", sum(found)
 
 	# Join the ZPs
 	zp = np.zeros(len(idx), dtype='f4')
-	zp[:] = zps.ZP[idx]
+	zp[:] = zps['ZP'][idx]
 
 	# Correct the ZP from nominal exposures to true exposures
-	filterid = zps.filterid[idx]
-	exptime = zps.exptime[idx]
+	filterid = zps['filterid'][idx]
+	exptime = zps['exptime'][idx]
 	delta_mag = np.empty(len(exptime))
 	for fid, et in nominal_exptimes.iteritems():
 		ii = filterid == fid
@@ -47,14 +47,14 @@ def get_zp(mjd):
 
 	# Remove those that are flagged bad
 	bad = ~found
-	bad |= (zps.time_to_bad[idx] < 10. / (24*60)) & ~zps.overlaps_sdss[idx]
+	bad |= (zps['time_to_bad'][idx] < 10. / (24*60)) & ~zps['overlaps_sdss'][idx]
 	zp[bad] = np.nan
 
 #	print "OK/Not OK:", sum(~bad), sum(bad)
 
 	return zp
 
-def calc_objmag(qresult, qwriter):
+def calc_objmag(qresult, db, tabname):
 	"""
 	Compute object magnitude from detections.
 
@@ -65,10 +65,25 @@ def calc_objmag(qresult, qwriter):
 		logging.warning("Encountered the cell at the south pole. Dropping it.")
 		return
 
-	all_rows = colgroup.fromiter(qresult, blocks=True)
-	if not len(all_rows):
-		return
+	if True:
+		ids = []
+		for all_rows in colgroup.partitioned_fromiter(qresult, "_ID", 20*1000*1000, blocks=True):
+			ids.append(calc_objmag_aux(all_rows, db, tabname))
+			all_rows = None
+		ids = np.concatenate(ids)
+	else:
+		all_rows = colgroup.fromiter(qresult, blocks=True)
+		ids = calc_objmag_aux(all_rows, db, tabname)
+		all_rows = None
 
+	assert np.all(np.sort(ids) == np.unique(ids))
+
+	import hashlib
+	print qresult.static_cell, hashlib.md5(np.sort(ids)).hexdigest(), len(ids)
+
+	yield len(ids)
+
+def calc_objmag_aux(all_rows, db, tabname):
 	# Sort
 	all_rows.sort(["filterid", "_ID", "mag"])
 
@@ -77,22 +92,26 @@ def calc_objmag(qresult, qwriter):
 	all_rows.mag += offs
 
 	# Prepare the output array
-	objs = np.unique(all_rows['_ID'])
+	objs, idx = np.unique(all_rows['_ID'], return_index=True)
 	out = colgroup.ColGroup(
 		dtype=[
 			('obj_id', 'u8'),
-			('ndet', 'i2'), ('ndet_ok', 'i2'),
+			('ra', 'f8'), ('dec', 'f8'),
 			('nmag', '5i2'), ('nmag_ok', '5i2'),
 			('mean', '5f4'), ('stdev', '5f4'), ('err', '5f4'),
-			('median', '5f4'), ('q25', '5f4'), ('q75', '5f4')
+			('median', '5f4'), ('q25', '5f4'), ('q75', '5f4'),
+			# Lightcurve samples
+			('mag', '(5,10)f4'), ('magErr', '(5,10)f4'), ('mjd', '(5,10)f8')
 		      ],
 		      size=len(objs)
 	      )
 	out['obj_id'][:] = objs
+	out['ra'][:]  = all_rows['ra'][idx]
+	out['dec'][:] = all_rows['dec'][idx]
 
 	# Pull out the arrays we'll be using
-	(id_out, ndet, ndet_ok, nmag, nmag_ok, mean, stdev, merr, median, q25, q75) = out.as_columns()
-	id_in, mags, errs, filterid, flags, psf_qf = all_rows['_ID'], all_rows['mag'], all_rows['err'], all_rows['filterid'], all_rows['flags'], all_rows['psf_qf']
+	(id_out, ra, dec, nmag, nmag_ok, mean, stdev, merr, median, q25, q75, lc_mag, lc_magErr, lc_mjd) = out.as_columns()
+	id_in, mags, errs, filterid, flags, psf_qf, mjd_obs = ( getattr(all_rows, attr) for attr in ['_ID', 'mag', 'err', 'filterid', 'flags', 'psf_qf', 'mjd_obs'] )
 
 	# Join the zero-point information
 	zp = get_zp(all_rows.mjd_obs)
@@ -104,7 +123,7 @@ def calc_objmag(qresult, qwriter):
 
 	code = \
 	"""
-	#line 93 "objdata_weave.py"
+	#line 108 "objdata_weave.py"
 
 	assert(Sid_out[0] == sizeof(*id_out));	// Make sure we've got a contiguous array
 
@@ -118,25 +137,28 @@ def calc_objmag(qresult, qwriter):
 
 	// stream through the input arrays
 	int size = Nmags[0];
-	std::vector<double> mags1, wt;
+	std::vector<double> mags1, wt, mjds;
 	for(int i = 0, j = 0; i != size; i = j)
 	{
 		j = i;
-		mags1.clear(); wt.clear();
+		mags1.clear(); wt.clear(); mjds.clear();
 		while(j != size && id_in[i] == id_in[j] && band[i] == band[j])
 		{
 			float mag = MAGS1(j);
 			float err = ERRS1(j);
 			float psf_qf = PSF_QF1(j);
 			float zp = ZP1(j);
+			double mjd = MJD_OBS1(j);
 			uint32_t flag = FLAGS1(j);
-			//if(std::isfinite(mag) && (flag & PM_SOURCE_MODE_FITTED))
 
 			if(std::isfinite(mag) && std::isfinite(zp) && ((flag & bad) == 0) && (psf_qf > 0.85))
 			{
+				mjds.push_back(mjd);
 				mag += zp;
 				mags1.push_back(mag);
-				wt.push_back(1. / (err*err + 0.01*0.01)); // add 0.01 in quadrature to compensate for unrealistically small quoted errors
+				// add 0.01 in quadrature to compensate for unrealistically small quoted errors
+				double wtt = 1. / (err*err + 0.01*0.01);
+				wt.push_back(wtt);
 			}
 			j++;
 		}
@@ -148,7 +170,7 @@ def calc_objmag(qresult, qwriter):
 		assert(0 <= row && row < Nid_out[0]);
 		assert(0 <= col && col < 5);
 
-		// store number of elements (all and finite)
+		// store number of magnitudes
 		   NMAG2(row, col) = j - i;
 		NMAG_OK2(row, col) = mags1.size();
 
@@ -165,27 +187,31 @@ def calc_objmag(qresult, qwriter):
 
 			// mean error computed as 1./sum(wts)
 			double w = 0.;
-			for(int i = 0; i != wt.size(); i++) { w += wt[i]; }
+			for(unsigned i = 0; i != wt.size(); i++) { w += wt[i]; }
 			MERR2(row, col) = 1. / sqrt(w);
+		}
+		
+		// store the light curves
+		for(unsigned i = 0; i != std::min(mags1.size(), (size_t)10); i++)
+		{
+			LC_MAG3(row, col, i) = mags1[i];
+			LC_MAGERR3(row, col, i) = sqrt(1. / wt[i]);
+			LC_MJD3(row, col, i) = mjds[i];
 		}
 	}
 	"""
 	inline(code,
-		['id_out', 'ndet', 'ndet_ok', 'nmag', 'nmag_ok', 'mean', 'stdev', 'merr', 'median', 'q25', 'q75', 'id_in', 'mags', 'errs', 'band', 'flags', 'zp', 'psf_qf'],
-		headers=['"pmSourceMasks.h"', '<cmath>', '<iostream>', '<vector>', '<gsl/gsl_statistics.h>', '<cassert>', '<algorithm>'],
+		['id_out', 'nmag', 'nmag_ok', 'mean', 'stdev', 'merr', 'median', 'q25', 'q75', 'id_in', 'mags', 'errs', 'band', 'flags', 'zp', 'psf_qf', 'mjd_obs', 'lc_mag', 'lc_magErr', 'lc_mjd'],
+		headers=['"pmSourceMasks.h"', '<cmath>', '<iostream>', '<algorithm>', '<vector>', '<gsl/gsl_statistics.h>', '<cassert>', '<algorithm>'],
 		libraries=['gsl', 'gslcblas'],
 		include_dirs=['.'],
+		verbose=0,
 		undef_macros=['NDEBUG'])
 
-	# Compute ndet
-	out['ndet'][:] = np.sum(out['nmag'], axis=1)
-	assert np.all(out['ndet'])
-	out['ndet_ok'][:] = np.sum(out['nmag_ok'], axis=1)
-
 	# Write out the result
-	result = qwriter.write(qresult.static_cell, out)
-	yield result
-
+	ids = db.table(tabname).append(out, _update=True)
+	assert np.all(ids == out.obj_id)
+	return ids
 
 db = lsd.DB("pdb")
 bounds = None
@@ -197,11 +223,16 @@ bounds = None
 #writer = IntoWriter(db, "cal_mags WHERE obj_id |= obj_id")
 #q = db.query("SELECT _ID, psf_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
 #writer = IntoWriter(db, "recalib_mags_ap WHERE obj_id |= obj_id")
-q = db.query("SELECT _ID, psf_inst_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
-writer = IntoWriter(db, "recalib_mags6 WHERE obj_id |= obj_id")
+q = db.query("SELECT _ID, ra, dec, psf_inst_mag as mag, psf_inst_mag_sig as err, filterid, flags, mjd_obs, chip_id, x_psf, y_psf, psf_qf FROM ps1_obj, ps1_det")
 
 #q = db.query("select _ID, cal_psf_mag, filterid, u, g, r, i, z from ps1_obj, ps1_det, sdss where _ROWNUM==1")
 nrows = 0
-for cell_id, rows in q.execute([(calc_objmag, writer)], group_by_static_cell=True, bounds=bounds):
-	nrows += len(rows)
-print nrows
+#kk = 0
+with db.transaction():
+	for rows_added in q.execute([(calc_objmag, db, 'averages')], group_by_static_cell=True, bounds=bounds):
+		nrows += rows_added
+		#kk += 1
+		#import sys
+		#print >>sys.stderr, "At", kk, nrows
+		#if kk > 10: break
+print "Total objects:", nrows

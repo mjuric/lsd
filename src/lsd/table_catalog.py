@@ -270,7 +270,7 @@ class TableCatalog:
 		try:
 			return self._cell_to_snapshot[cell_id]
 		except KeyError:
-			return 0
+			raise LookupError()
 
 	#################
 
@@ -430,13 +430,8 @@ class TableCatalog:
 		return bmaps
 
 	def _rebuild_internal_state(self):
-		try:
-			self._cell_to_snapshot = dict(v for v in izip(self._leaves['cell_id'][2:], self._leaves['snapid'][2:]))
-			assert len(self._cell_to_snapshot) == len(self._leaves)-2, (len(self._cell_to_snapshot), len(self._leaves))
-		except KeyError:
-			# Backwards compatibility, for old catalogs that don't have snapid
-			self._cell_to_snapshot = dict()
-			pass
+		self._cell_to_snapshot = dict(v for v in izip(self._leaves['cell_id'][2:], self._leaves['snapid'][2:]))
+		assert len(self._cell_to_snapshot) == len(self._leaves)-2, (len(self._cell_to_snapshot), len(self._leaves))
 
 	def update(self, table_path, pattern, snapid):
 		self.__pattern = pattern

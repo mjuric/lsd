@@ -422,8 +422,8 @@ class IndirectJoin(JoinRelation):
 
 		cg = ColGroup()
 
-		if    not table1.tablet_exists(cell_id_from) \
-		   or not table2.tablet_exists(cell_id_to):
+		if    not table1.cell_exists(cell_id_from) \
+		   or not table2.cell_exists(cell_id_to):
 		   	cg.m1 = np.empty(0, dtype=np.uint64)
 		   	cg.m2 = np.empty(0, dtype=np.uint64)
 		   	return cg
@@ -1711,17 +1711,6 @@ class DB(object):
 		lockfile = self.path[0] + '/.__dblock.lock'
 
 		return locking.lock(lockfile, timeout)
-
-	### URI (Uniform Resource Identifier) management routines
-	def resolve_uri(self, uri):
-		""" Resolve the given URI into something that can be
-		    passed on to file() for loading.
-		"""
-		if uri[:4] != 'lsd:':
-			return uri
-
-		_, tabname, _ = uri.split(':', 2)
-		return self.table(tabname).resolve_uri(uri)
 
 	@contextmanager
 	def open_uri(self, uri, mode='r'):

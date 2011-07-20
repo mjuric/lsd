@@ -97,14 +97,44 @@ class Table:
 		# Snapshot ID
 		self.snapid = snapid
 
-		# Load the list of committed snapshots that are older than this one
-		self._snapshots = [ 0 ]
-		for path in glob.iglob('%s/snapshots/*/.committed' % (self.path)):
-			s = path.split('/')[-2]
-			if s <= snapid:
-				self._snapshots.append(s)
+		# Check if we have a .remote set; if yes, pull all the metadata from
+		# the remote
+		dot_remote = '%s/.remote' % self.path
+		if os.path.exists(dot_remote):
+			self.remote = open(dot_remote).read().strip()
+
+			# Fetch/update the list of snapshots
+			snapshot_cat_fn = '%s/snapshots/.listing' % self.path
+			self.fetch_from_remote(snapshot_cat_fn)
+
+			# Fetch the catalogs+schemas for all snapshots
+			# NOTE: we can change this to fetch the catalog only for the requested snapshot
+			# once the code below that enumerates snapshots is changed to read from
+			# the .listing file
+			snapids = [ s.strip() for s in open(snapshot_cat_fn).xreadlines() if s.strip() != '' ]
+			for snapid in snapids:
+				local = self._snapshot_path(snapid) + '/'
+				utils.mkdir_p(local)
+				for fn in ['catalog.pkl', 'schema.cfg', '.committed']:
+					if str(snapid) == "0" and fn == '.committed':	# Backwards compatibility
+						continue
+					local_fn = local + fn
+					if not os.path.exists(local_fn):
+						self.fetch_from_remote(local_fn)
+
+		self._snapshots = self.list_snapshots(snapid)
 		# Sorted list of snapshots, newest first
 		self._snapshots.sort(reverse=True)
+
+	def list_snapshots(self, snapid=None):
+		# Load the list of committed snapshots that are older than snapid
+		snaps = [ 0 ] if os.path.exists('%s/schema.cfg' % self.path) else []
+		for path in glob.iglob('%s/snapshots/*/.committed' % (self.path)):
+			s = path.split('/')[-2]
+			if snapid is None or s <= snapid:
+				snaps.append(s)
+
+		return snaps
 
         def _load_catalog(self):
 		# Load the tablet cache.
@@ -120,7 +150,7 @@ class Table:
 		else:
 		        # A new table, opened on an uncommitted snapshot, has no saved catalog
 		        # Create an empty one.
-		        assert self._snapshots[0] == 0 and len(self._snapshots) == 1
+		        assert len(self._snapshots) == 0
 		        self.catalog = TableCatalog(pix=self.pix)
 
 	def get_cells_in_snapshot(self, snapid, include_cached=True):
@@ -150,7 +180,9 @@ class Table:
 
 	def begin_transaction(self, snapid, load_state=True):
 		assert not self.transaction
-		
+
+		if os.path.exists(os.path.join(self.path, '.remote')):
+			raise Exception("Tables that mirror remote tables cannot be written to (remove the .remote file first)")
 
 		# Begin a new transaction
 		path = self._snapshot_path(snapid)
@@ -264,6 +296,12 @@ class Table:
 				path = '%s/%s' % (self._snapshot_path(snapid), subpath)
 				if os.path.exists(path):
 					break
+				if self.remote is not None:
+					try:
+						self.fetch_from_remote(path)
+						break
+					except IOError:
+						pass
 			else:
 				raise IOError((errno.ENOENT, "No file for URI", uri))
 		elif mode == 'w':
@@ -313,7 +351,7 @@ class Table:
 
 	def _snapshot_path(self, snapid, create=False):
 		""" Return full path to given snapshot """
-		if snapid != 0:
+		if str(snapid) != "0":
 			path = "%s/snapshots/%s" % (self.path, snapid)
 		else:
 			path = self.path
@@ -346,7 +384,30 @@ class Table:
 		path = self._cell_path(cell_id, mode)
 		return '%s/%s' % (path, self._tablet_filename(cgroup))
 
-	def tablet_exists(self, cell_id, cgroup=None):
+        def cell_exists(self, cell_id):
+        	try:
+	        	self.catalog.snapshot_of_cell(cell_id)
+	        	return True
+		except LookupError:
+			return False
+
+	def fetch_from_remote(self, local):
+		# Fetch the given local file from a remote repository
+		# Raise IOError if anything goes wrong
+		remote = local[len(self.path)+1:]
+#		print "FETCHING:", remote
+
+		utils.mkdir_p(os.path.dirname(local))
+
+		try:
+			g = self._fetcher
+		except AttributeError:
+			from fetcher import Fetcher
+			g = self._fetcher = Fetcher(self.remote)
+
+		g.fetch_to_file(remote, local)
+
+	def tablet_exists(self, cell_id, cgroup):
 		"""
 		Check if a tablet exists.
 
@@ -359,8 +420,23 @@ class Table:
 
 		assert cgroup in self._cgroups
 
-		fn = self._tablet_file(cell_id, cgroup)
-		return os.access(fn, os.R_OK)
+		try:
+			fn = self._tablet_file(cell_id, cgroup)
+		except LookupError:
+			return False
+
+		if os.access(fn, os.R_OK):
+			return True
+		if self.remote is None:
+			return False
+
+	        # If the tablet does not exist, try fetching it from a
+	        # remote database
+		try:
+			self.fetch_from_remote(fn)
+			return True
+		except IOError:
+			return False
 
 	#############
 
@@ -407,7 +483,7 @@ class Table:
 		if not self.pix.is_temporal_cell(cell_id):
 			return cell_id
 
-		if self.tablet_exists(cell_id):
+		if self.cell_exists(cell_id):
 			##print "Temporal cell found!", self._cell_prefix(cell_id)
 			return cell_id
 
@@ -513,7 +589,11 @@ class Table:
 			if os.path.isfile(path):
 				return path
 
-		return os.path.join(self._snapshot_path(self._snapshots[0]), fn)
+		if self._snapshots:
+			return os.path.join(self._snapshot_path(self._snapshots[0]), fn)
+		else:
+			# Completely empty table -- return dummy metadata path
+			return os.path.join(self._snapshot_path(0), fn)
 
 	def _load_schema(self):
 		"""
@@ -864,30 +944,27 @@ class Table:
 
 		Employs no locking of any kind.
 		"""
-		fn_r = self._tablet_file(cell_id, cgroup)
 
-		logger.debug("Opening tablet %s (mode='%s')" % (fn_r, mode))
 		if mode == 'r':
+			fn_r = self._tablet_file(cell_id, cgroup)
 		        # --- hack: preload the entire file to have it appear in filesystem cache
 		        #     this will speed up subsequent random reads within the file
 			with open(fn_r) as f:
 				f.read()
 			# ---
 			fp = tables.openFile(fn_r)
-#			print "OPEN(r):", fn_r
 		elif mode == 'r+':
 			self._check_transaction()
 			fn_w = self._tablet_file(cell_id, cgroup, mode='w')
 			if os.path.isfile(fn_w):
 				fp = tables.openFile(fn_w, mode='a')
-#				print "OPEN(a):", fn_w
-			elif os.path.isfile(fn_r):
+			elif self.tablet_exists(cell_id, cgroup): 	# Note: this will download the tablet from remote, if needed
 				# A file exists in an older snapshot. Copy it over here.
+				fn_r = self._tablet_file(cell_id, cgroup)
 				assert fn_r != fn_w, (fn_r, fn_w)
 				shutil.copy(fn_r, fn_w)
 				os.chmod(fn_w, 0664)	# Ensure it's writable
 				fp = tables.openFile(fn_w, mode='a')
-#				print "OPEN(a):", fn_w
 			else:
 				# No file exists
 				fp = self._create_tablet(fn_w, cgroup)
@@ -895,7 +972,6 @@ class Table:
 			self._check_transaction()
 			fn_w = self._tablet_file(cell_id, cgroup, mode='w')
 			fp = self._create_tablet(fn_w, cgroup)
-#			print "OPEN(w):", fn_w
 		else:
 			raise Exception("Mode must be one of 'r', 'r+', or 'w'")
 
@@ -1518,7 +1594,7 @@ class Table:
 		if self._is_pseudotablet(cgroup):
 			return self._fetch_pseudotablet(cell_id, cgroup, include_cached)
 
-		if self.tablet_exists(cell_id, cgroup):
+		if self.tablet_exists(cell_id, cgroup):	# Note: this will download the tablet from remote, if needed
 			with self.lock_cell(cell_id) as cell:
 				with cell.open(cgroup) as fp:
 					rows = fp.root.main.table.read()
@@ -1555,7 +1631,7 @@ class Table:
 
 		# Find out how many rows are there in this cell
 		nrows1 = nrows2 = 0
-		if self.tablet_exists(cell_id, self.primary_cgroup):
+		if self.cell_exists(cell_id):
 			with self.lock_cell(cell_id) as cell:
 				with cell.open(self.primary_cgroup) as fp:
 					nrows1 = len(fp.root.main.table)

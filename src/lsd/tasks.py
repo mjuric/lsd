@@ -92,7 +92,7 @@ def ls_mapper(cell_id, db, tabname):
 		with db.table(tabname).lock_cell(cell_id) as cell:
 			with cell.open() as fp:
 				n = fp.root.main.table.nrows
-	except IOError:
+	except LookupError:
 		# This can occur when counting from cells in previous snapshots,
 		# and the cell in question was not populated there
 		return
