@@ -555,11 +555,15 @@ def import_from_smf_aux(file, det_table, exp_table, det_c2f, exp_c2f, survey):
 #    cells.
 # 3) store the copies into the cache of each cell.
 
-def make_image_cache(db, det_tabname, exp_tabname, snapid):
+def make_image_cache(db, det_tabname, exp_tabname, snapid, read_all_dets):
 	# Entry point for creation of image cache
 
-	# Only get the cells that were modified in snapshot 'snapid'
-	cells = db.table(det_tabname).get_cells_in_snapshot(snapid)
+	if read_all_dets:
+		cells = db.table(det_tabname).get_cells()
+	else:
+		# Only get the cells that were modified in snapshot 'snapid'
+		cells = db.table(det_tabname).get_cells_in_snapshot(snapid)
+
 	if len(cells) == 0:
 		print >>sys.stderr, "Already up to date."
 		return
@@ -574,9 +578,9 @@ def make_image_cache(db, det_tabname, exp_tabname, snapid):
 				      include_cached=True):
 		pass;
 
-def commit_hook__make_image_cache(db, table, det_tabname):
+def commit_hook__make_image_cache(db, table, det_tabname, read_all_dets=False):
 	# Commit hook
-	make_image_cache(db, det_tabname, table.name, db.snapid)
+	make_image_cache(db, det_tabname, table.name, db.snapid, read_all_dets)
 	print >> sys.stderr, "[%s] Updating tablet catalog:" % (table.name),
 	table.rebuild_catalog()
 
