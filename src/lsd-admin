@@ -6,8 +6,12 @@
 import os
 import lsd
 import numpy as np
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from lsd.tui import *
+from lsd.fetcher import Fetcher
+from lsd.utils import mkdir_p
+import fnmatch, glob
+import sys
 
 ################
 #
@@ -124,6 +128,217 @@ def do_desc_table(args):
 	table = db.table(args.table)
 	print table
 
+def do_remote_publish_table(args):
+	db = lsd.DB(args.db)
+
+	if args.update:
+		if len(args.table):
+			raise Exception('Tables cannot be gvien explicitly when --update is active')
+
+		# Load the already published tables
+		args.table = [ s.strip() for s in open(os.path.join(args.db, '.listing')).xreadlines() if os.path.isdir(os.path.join(args.db, s.strip())) and db.table_exists(s.strip()) ]
+	else:
+		if not len(args.table):
+			raise Exception('At least one table must be given.')
+
+	for table in args.table:
+		t = db.table(table)
+		snaps = t.list_snapshots()
+		if len(snaps) == 1 and snaps[0] == 0:
+			mkdir_p('%s/snapshots' % t.path)
+
+		# Publish the snapshots within the table
+		# NOTE: ignore_missing=True is set to support <v0.5.0 tables, those that have the implicit snapid=0
+		publish_objects(os.path.join(t.path, 'snapshots'), snaps, overwrite=True, ignore_missing=True)
+		print 'Table %s: %s snapshots published.' % (table, len(snaps))
+
+	# Publish the tables
+	publish_objects(args.db, args.table)
+	print "Published tables %s." % (', '.join(args.table))
+
+def do_remote_unpublish_table(args):
+	unpublish_objects(args.db, args.table)
+	for table in args.table:
+		print "Unpublished %s" % table
+
+def do_remote_unpublish_join(args):
+	# Load existing
+	exjoins = set(s.strip() for s in open(os.path.join(args.db, '.listing')).xreadlines() if s.strip().endswith('.join'))
+
+	joins = set()
+	for pat in args.join:
+		# Interpret as pattern and add all existing joins that match it.
+		joins.update(join for join in exjoins if fnmatch.fnmatch(join, pat))
+
+		# Also allow patterns for just the join name, w/o the leading dot and trailing .join
+		pat = '.%s.join' % pat
+		joins.update(join for join in exjoins if fnmatch.fnmatch(join, pat))
+
+	unpublish_objects(args.db, joins)
+	for join in joins:
+		print "Unpublished %s" % join[1:-5]
+
+def do_remote_list(args):
+	fetcher = Fetcher(args.remote)
+
+	lst = defaultdict(list)
+	for obj in fetcher.listdir(''):
+		if obj.endswith('.join'):
+			typ = 'JOIN'
+			obj = obj[1:-5]
+		else:
+			typ = 'TABLE'
+
+		lst[typ].append(obj)
+
+	for typ, l in lst.iteritems():
+		for obj in l:
+			print "%10s %s" % (typ, obj)
+
+def _safe_write_replace(fn, lst):
+	# Save (save-to-temp-and-rename idiom)
+	tmp = fn + '.part'
+	with open(tmp, 'w') as fp:
+		for obj in lst:
+			fp.write('%s\n' % obj)
+	os.rename(tmp, fn)
+
+def unpublish_objects(dir, objects):
+	""" Unpublish the given list of objects """
+	lfn = os.path.join(dir, '.listing')
+
+	exobjs = set(s.strip() for s in open(lfn).xreadlines())
+	exobjs -= set(objects)
+
+	_safe_write_replace(lfn, exobjs)
+
+def publish_objects(dir, objects, overwrite=False, ignore_missing=False):
+	""" Publish the given list of objects, that are assumed to
+	    exist in directory dir. The list will be merged with
+	    existing objects in dir/.listing.
+	"""
+	lfn = os.path.join(dir, '.listing')
+
+	# Sanity check the objects list
+	if not ignore_missing:
+		for obj in objects:
+			path = os.path.join(dir, str(obj))
+			if not os.path.exists(path):
+				raise Exception("The object '%s', that you're trying to publish, does not exist." % path)
+
+	# Load contents of .listing
+	if not overwrite and os.path.isfile(lfn):
+		exobjs = set(s.strip() for s in open(lfn).xreadlines())
+	else:
+		exobjs = set()
+
+	# Merge the two lists
+	exobjs |= set(objects)
+
+	_safe_write_replace(lfn, exobjs)
+
+def do_remote_publish_join(args):
+	joins = []
+	for join in args.join:
+
+		jpath = os.path.join(args.db, '.%s.join' % join)
+		if os.path.isfile(jpath):	# Is it a join definition name, xxxx:yyyy
+			joins.append(jpath)
+		else:
+			jpath = os.path.join(args.db, join)
+			if join[-5:] == '.join' and os.path.isfile(jpath):	# Is it a .join file name relative to the database path?
+				joins.append(jpath)
+			else:
+				dbpath = os.path.abspath(args.db)
+				gg = [ g for g in glob.iglob(join) if os.path.abspath(os.path.dirname(g)) == dbpath and g[-5:] == '.join']	# Is it a pattern?
+				joins += gg
+
+	if joins:
+		joins = set(os.path.basename(jpath) for jpath in joins)
+		publish_objects(args.db, joins)
+
+		for join in joins:
+			print 'Join %s published.' % join[1:-5]
+	else:
+		print 'No join definition files found matching your specifications'
+
+def do_remote_follow_table(args):
+	db = lsd.DB(args.db)
+
+	force = args.force
+	for table in args.table:
+		table_dir = os.path.join(args.db, table)
+		if os.path.exists(table_dir):
+			if args.drop_existing:
+				drop_table(args.db, table)
+			elif not args.force:
+				raise Exception("Table %s must not already exist" % table)
+		else:
+			os.makedirs(table_dir)
+
+		with open(os.path.join(table_dir, '.remote'), 'w') as fp:
+			fp.write('%s/%s\n' % (args.remote, table))
+
+		try:
+			_ = db.table(table)
+		except:
+			# Something has gone wrong; clean up
+			if not args.force:
+				drop_table(args.db, table, quiet=True)
+			raise
+
+		print "Table '%s' follows remote table '%s/%s'" % (table, args.remote, table)
+
+def do_remote_unfollow_table(args):
+	for table in args.table:
+		dot_remote = os.path.join(args.db, table, '.remote')
+		if os.path.isfile(dot_remote):
+			remote = open(dot_remote).read().strip()
+			os.unlink(dot_remote)
+			print "Table '%s' stopped following '%s'." % (table, remote)
+
+def do_remote_fetch_join(args):
+	db = lsd.DB(args.db)
+
+	fetcher = Fetcher(args.remote)
+
+	pat = '.%s.join' % args.pattern
+	for fn in fetcher.listdir(''):
+		if not fnmatch.fnmatch(fn, pat):
+			continue
+		fetcher.fetch_to_file(fn, os.path.join(args.db, fn))
+		print "Fetched %s" % fn
+
+def _fetch_table_mapper(qresult, db, table):
+	uri_prefix = 'lsd:%s:' % table
+	for rows in qresult:
+		if len(rows) == 0:
+			continue
+
+		# Try to autodetect LSD URIs and fetch them
+		for col in rows.as_columns():
+			if type(col.flat[0]) != str:
+				continue
+
+			for s in np.unique(col):
+				if s.startswith(uri_prefix):
+					# This will download the file pointed to by the URI if it
+					# hasn't been downloaded already
+					with db.open_uri(s) as fp:
+						pass
+
+		yield len(rows)
+
+def do_remote_fetch_table(args):
+	db = lsd.DB(args.db)
+	
+	for table in args.table:
+		print >>sys.stderr, "Fetching %s:" % table,
+		q = db.query("SELECT * FROM '%s'" % table)
+		total = sum(q.execute([(_fetch_table_mapper, db, table)]))
+		print >>sys.stderr, "    %s rows fetched." % total
+		assert total == db.table(table).nrows()
+
 def get_snapshots_info(dbpath, table_name):
 	db = lsd.DB(dbpath)
 	# See if the database has a transaction opened
@@ -199,7 +414,7 @@ def do_vacuum_table(args):
 			print "done."
 	print "Vacuuming completed."
 
-def drop_table(dbpath, table):
+def drop_table(dbpath, table, quiet=False):
 	path = os.path.join(dbpath, table)
 	if not os.path.isdir(path):
 		raise Exception("Table %s does not exist at %s" % (table, path))
@@ -211,7 +426,8 @@ def drop_table(dbpath, table):
 	from shutil import rmtree
 	rmtree(path)
 
-	print "Table '%s' dropped." % table
+	if not quiet:
+		print "Table '%s' dropped." % table
 
 def do_drop_table(args):
 	for table in args.table:
@@ -282,6 +498,82 @@ parser_vacuum_table = subparsers2.add_parser('table', help='Reclaim space by del
 parser_vacuum_table.add_argument('table', type=str, help='Zero or more tables to vacuum. If left unspecified, all tables will be vacuumed', nargs='*')
 parser_vacuum_table.add_argument('-n', '--dry-run', help="Don't actually vacuum, just show what would have been vacuumed", default=False, action='store_true')
 parser_vacuum_table.set_defaults(func=do_vacuum_table)
+
+
+# REMOTE
+parser_remote = subparsers.add_parser('remote', help='Administer remote database access')
+subparsers2 = parser_remote.add_subparsers()
+
+# REMOTE PUBLISH
+parser_publish = subparsers2.add_parser('publish', help='Publish a database object (a table or a join), making it remotely accessible')
+subparsers3 = parser_publish.add_subparsers()
+
+# REMOTE PUBLISH TABLE
+parser_publish_table = subparsers3.add_parser('table', help='Publish table(s)')
+parser_publish_table.add_argument('table', type=str, help='Name of the table', nargs='*')
+parser_publish_table.add_argument('-u', '--update', help="Update the snapshot information for all already published tables", action='store_true')
+parser_publish_table.set_defaults(func=do_remote_publish_table)
+
+# REMOTE PUBLISH JOIN
+parser_publish_join = subparsers3.add_parser('join', help='Publish join definition(s)')
+parser_publish_join.add_argument('join', type=str, help='Name of the join definition, the filename, or a pattern', nargs='+')
+parser_publish_join.set_defaults(func=do_remote_publish_join)
+
+# REMOTE UNPUBLISH
+parser_unpublish = subparsers2.add_parser('unpublish', help='Unpublish a database object (table or join)')
+subparsers3 = parser_unpublish.add_subparsers()
+
+# REMOTE UNPUBLISH TABLE
+parser_unpublish_table = subparsers3.add_parser('table', help='Unpublish table(s)')
+parser_unpublish_table.add_argument('table', type=str, help='Name of the table to unpublish', nargs='+')
+parser_unpublish_table.set_defaults(func=do_remote_unpublish_table)
+
+# REMOTE UNPUBLISH JOIN
+parser_unpublish_join = subparsers3.add_parser('join', help='Publish join definition(s)')
+parser_unpublish_join.add_argument('join', type=str, help='Name of the join definition, the filename, or a pattern', nargs='+')
+parser_unpublish_join.set_defaults(func=do_remote_unpublish_join)
+
+# REMOTE LIST
+parser_list = subparsers2.add_parser('list', help='List the objects published in the remote database')
+parser_list.add_argument('remote', type=str, help='Remote database URL')
+parser_list.set_defaults(func=do_remote_list)
+
+# REMOTE LINK
+parser_follow = subparsers2.add_parser('follow', help='Follow (track) remote database objects (tables)')
+subparsers3 = parser_follow.add_subparsers()
+
+# REMOTE LINK TABLE
+parser_follow_table = subparsers3.add_parser('table', help='Set up a local table to follow a remote one')
+parser_follow_table.add_argument('remote', type=str, help='Remote database URL')
+parser_follow_table.add_argument('table', type=str, help='Name of the table', nargs='+')
+parser_follow_table.add_argument('--drop-existing', help='Drop the local table if it already exists', default=False, action='store_true')
+parser_follow_table.add_argument('--force', help='Set up a link even if the local table already exists', default=False, action='store_true')
+parser_follow_table.set_defaults(func=do_remote_follow_table)
+
+# REMOTE FETCH
+parser_fetch = subparsers2.add_parser('fetch', help='Fetch (download) remote tables and joins')
+subparsers3 = parser_fetch.add_subparsers()
+
+# REMOTE FETCH TABLE
+parser_fetch_table = subparsers3.add_parser('table', help='Fetch the contents of remote table(s)')
+parser_fetch_table.add_argument('table', type=str, help='One or more tables whose contents to fetch', nargs='+')
+parser_fetch_table.set_defaults(func=do_remote_fetch_table)
+
+# REMOTE FETCH JOIN
+parser_fetch_join = subparsers3.add_parser('join', help='Fetch a remote join definition')
+parser_fetch_join.add_argument('remote', type=str, help='Remote database URL')
+parser_fetch_join.add_argument('pattern', type=str, help='Pattern of .join files to fetch. Will be interpreted as .<pattern>.join', default='*', nargs='?')
+parser_fetch_join.set_defaults(func=do_remote_fetch_join)
+
+# REMOTE UNLINK
+parser_unfollow = subparsers2.add_parser('unfollow', help='Stop following remote database objects (tables)')
+subparsers3 = parser_unfollow.add_subparsers()
+
+# REMOTE UNLINK TABLE
+parser_unfollow_table = subparsers3.add_parser('table', help='Stop following a remote table')
+parser_unfollow_table.add_argument('table', type=str, help='The table(s) to unlink', nargs='+')
+parser_unfollow_table.set_defaults(func=do_remote_unfollow_table)
+
 
 try:
 	args = parser.parse_args()

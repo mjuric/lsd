@@ -40,7 +40,7 @@ class TextImporter:
 	comments = [ '#', ';' ]
 	delimiter = None	# Any sequence of whitespaces
 
-	def __init__(self, db, tabname, force, delimiter, usecols, dtype, skip_header=0, dms=[], hms=[], setcols={}):
+	def __init__(self, db, tabname, force, delimiter, usecols, dtype, skip_header=0, dms=[], hms=[], setcols={}, import_primary_key=False):
 		self.tabname = tabname
 		self.delimiter = delimiter.decode('string_escape') if delimiter is not None else None
 		self.dtype   = dtype
@@ -48,6 +48,7 @@ class TextImporter:
 		self.force = force
 		self.skip_header = skip_header
 		self.setcols = setcols
+		self.import_primary_key = import_primary_key
 
 		# Add user-defined converter to recognize True/False as boolean values
 		self.converters = { col: conv_bool for col, (name, type) in izip(usecols, dtype.descr) if np.dtype(type) == np.bool }
@@ -88,7 +89,7 @@ class TextImporter:
 				rows[col] = a
 
 		# Append to the table
-		ids = db.table(self.tabname).append(rows)
+		ids = db.table(self.tabname).append(rows, _update=self.import_primary_key)
 		assert len(ids) == len(rows)
 
 		# Return the total number of rows in the input file, and the number of rows actually
@@ -150,7 +151,7 @@ def get_importer(db, args):
 		dtype = table.dtype_for(usecolsn)
 
 	# Create a text importer
-	ldr = TextImporter(db, args.table, args.force, args.delimiter, usecols, dtype, skip_header=args.skip_header, dms=args.dms, hms=args.hms, setcols=setcols)
+	ldr = TextImporter(db, args.table, args.force, args.delimiter, usecols, dtype, skip_header=args.skip_header, dms=args.dms, hms=args.hms, setcols=setcols, import_primary_key=args.import_primary_key)
 
 	# Return importer and a list of chunks
 	return ldr, args.file

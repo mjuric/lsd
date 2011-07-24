@@ -13,6 +13,7 @@ of equal length.
 import numpy as np
 from utils import full_dtype
 import copy
+import tempfile, os, cPickle, sys
 
 def make_record(dtype):
 	# Construct a numpy record corresponding to a row of this table
@@ -615,6 +616,127 @@ def fromiter(it, dtype=None, blocks=False):
 
 	return buf
 
+def count_unique(v):
+	""" Given a ndarray v, return a tuple k, ct
+	    where k is an array of unique elements of v
+	    and ct is the number of occurrences of each
+	    element in v (frequency)
+	"""
+	v = np.sort(v.flatten())
+
+	# Unique values
+	keep = np.concatenate(([True], v[1:] != v[:-1]))
+	u = v[keep]
+
+	# Their count
+	ct = np.searchsorted(v, u, side='right') - np.searchsorted(v, u, side='left')
+
+	return u, ct
+
+def partitioned_fromiter(it, keycol, maxrows, dtype=None, blocks=False):
+	assert blocks == True, "blocks==False not implemented yet."
+
+	try:
+		keys = []
+		buf = None
+		fp = None
+		for rows in it:
+#			print "XXX:", rows.dtype, len(rows)
+			if buf is None:
+				# Just copy the first one
+				buf = rows.copy()
+				if dtype is None:
+					dtype = rows.dtype
+				at  = len(buf)
+			else:
+				at2 = at + len(rows)
+				if at2 > len(buf):
+					# Next higher power of two
+					newsize = 1 << int(np.ceil(np.log2(at2)))
+					buf.resize(newsize)
+
+				# append
+				buf[at:at+len(rows)] = rows
+				at = at + len(rows)
+				
+				# deallocate rows
+				rows = None
+
+			# If buf has exceeded the maximum partition size,
+			# back it to disk and continue with an empty one
+			if at > maxrows:
+				buf.resize(at)
+#				print "Writing block, len=", len(buf)
+				if fp is None:
+					fp = tempfile.NamedTemporaryFile(mode='r+b', prefix='fromiter-', dir=os.getenv('LSD_TEMPDIR'), suffix='.pkl', delete=True)
+				keys.append(buf[keycol].copy())
+				cPickle.dump(buf, fp, -1)
+				buf = None
+
+		# Truncate the buffer to output size
+		if buf is not None:
+			buf.resize(at)
+		else:
+			buf = ColGroup(dtype=dtype, size=0)
+
+		# If there was no backing to disk, just return
+		if fp is None:
+			yield buf
+			return
+
+		# Store the last buf to disk
+#		print "Writing last block, len=", len(buf)
+#		print "LAST:", buf.dtype, len(buf)
+		keys.append(buf[keycol].copy())
+		cPickle.dump(buf, fp, -1)
+#		print "nblocks = ", len(keys)
+
+		# yield (horizontally) partitioned pieces
+		nsaved = len(keys)
+		keys = np.concatenate(keys)
+		ukeys, counts = count_unique(keys)
+#		ccounts = np.concatenate(([0], np.cumsum(counts)))
+		ccounts = np.cumsum(counts)
+#		print len(ukeys), ukeys[:10]
+#		print len(counts), counts[:10]
+#		print len(ccounts), ccounts[:10]
+		i0 = 0
+		c0 = 0
+		while i0 < len(ccounts):
+			i1 = np.searchsorted(ccounts, c0 + maxrows, side='right')
+			if i1 == i0:
+				i1 += 1
+			c1 = ccounts[i1-1]
+			keep_keys = ukeys[i0:i1]
+			size = c1 - c0
+#			print >>sys.stderr, "CUT:", i0, i1, size, keep_keys
+			i0 = i1
+			c0 = c1
+
+			# Stream through the stored result and select
+			# out only the given block of keys
+			fp.seek(0)
+			buf = None
+			for _ in xrange(nsaved):
+				rows = cPickle.load(fp)
+				keep = np.in1d(rows[keycol], keep_keys)
+				if not np.any(keep):
+					continue
+
+				rows = rows[keep]
+				if buf is None:
+					buf = ColGroup(dtype=rows.dtype, size=size)
+					at = 0
+				buf[at:at+len(rows)] = rows
+				at += len(rows)
+			assert at == len(buf)
+
+			print >>sys.stderr, "YIELD", len(buf)
+			yield buf
+	finally:
+		if fp is not None:
+			fp.close()
+
 ############################################################
 # Unit tests
 
@@ -735,6 +857,13 @@ class Test_fromiter:
 		cg.f2 = np.arange(begin, end, dtype='f4')
 		return cg
 
+	def _mkarray_keyed(self, begin, end, mod):
+		cg = ColGroup()
+		cg.k = np.arange(begin, end) % mod
+		cg.f1 = np.arange(begin, end)
+		cg.f2 = np.arange(begin, end, dtype='f4')
+		return cg
+
 	def test_general(self):
 		"""fromiter: multiple elements"""
 		# More than one block of varying sizes
@@ -761,6 +890,33 @@ class Test_fromiter:
 			cg1 = self._mkarray(0, sum(s))
 			assert np.all(cg1 == cg2)
 
+	def test_partitioned_fromiter(self):
+		"""partitioned_fromiter"""
+		s    = [20, 2, 4, 570, 13, 44, 56, 88, 9999, 10030, 0, 1]
+		mods = [2,  5, 1, 30,  2,  10, 3,  22, 100,  110,   2, 1]
+		slist = [ self._mkarray_keyed(end-llen, end, mod) for (llen, end, mod) in izip(s, np.cumsum(s), mods) ] 
+		cg1 = ColGroup(np.concatenate([v.as_ndarray() for v in slist]))
+
+		# Quick (and incomplete) test for count_unique		
+		k, ct = count_unique(cg1.k)
+		assert np.all(k == np.unique(cg1.k))
+		assert sum(ct) == len(cg1.k)
+
+		cg1.sort('k')
+
+		# Try for a few different maxrows
+		for maxrows in [10000, 1000, 100, 10, 1]:
+			print "maxrows=%d" % maxrows
+			rlist = []
+			for rows in partitioned_fromiter(slist, 'k', maxrows, blocks=True):
+				assert len(rows) <= maxrows or np.all(rows['k'] == rows['k'][0])
+				print len(rows),
+				rlist.append(rows)
+			print ''
+			cg2 = fromiter(rlist, blocks=True)
+			cg2.sort('k')
+
+			assert np.all(cg1 == cg2)
 
 if __name__ == "__main__":
 	test_fromiter()

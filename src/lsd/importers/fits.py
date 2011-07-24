@@ -5,12 +5,13 @@ from itertools import izip
 import pyfits
 
 class FITSImporter:
-	def __init__(self, db, tabname, usecols, dtype, setcols={}, hdus=[1]):
+	def __init__(self, db, tabname, usecols, dtype, setcols={}, hdus=[1], import_primary_key=False):
 		self.tabname = tabname
 		self.dtype   = dtype
 		self.usecols = usecols
 		self.setcols = setcols
 		self.hdus    = hdus
+		self.import_primary_key = import_primary_key
 
 	def __call__(self, db, fn):
 		""" Load a FITS file and import it into the named table
@@ -39,7 +40,7 @@ class FITSImporter:
 				rows[col] = a
 
 		# Append to the table
-		ids = db.table(self.tabname).append(rows)
+		ids = db.table(self.tabname).append(rows, _update=self.import_primary_key)
 		assert len(ids) == len(rows)
 
 		# Return the total number of rows in the input file, and the number of rows actually
