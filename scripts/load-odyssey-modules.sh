@@ -18,3 +18,7 @@ module load hpc/gsl-gnu
 EXTRAMOD=/n/home06/mjuric/lfs/lib/python2.7/site-packages
 test x$(echo -n $PYTHONPATH | awk -v RS=: '"'$EXTRAMOD'" == $1' | head -n 1) == x"$EXTRAMOD" || export PYTHONPATH="$EXTRAMOD:$PYTHONPATH"
 
+# Prepend ~mjuric/lfs/lib to LD_LIBRARY_PATH (for curl)
+EXTRA_LIBPATH=/n/home06/mjuric/lfs/lib
+echo "Prepending to LD_LIBRARY_PATH:" $EXTRA_LIBPATH
+export LD_LIBRARY_PATH=$EXTRA_LIBPATH:$LD_LIBRARY_PATH
