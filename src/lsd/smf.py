@@ -289,7 +289,7 @@ def store_smf_list(db, exp_tabname, new_exps):
 	# Try to load from cache, query otherwise
 	try:
 		with db.open_uri(uri) as f:
-			old_exps = np.loadtxt(f, dtype=[('_EXP', 'u8'),('smf_fn', 'a40')])
+			old_exps = np.loadtxt(f, dtype=[('_EXP', 'u8'),('smf_fn', 'a40')], ndmin=1)
 	except IOError:
 		old_exps = db.query("select _EXP, smf_fn from %s" % exp_tabname).fetch(progress_callback=pool2.progress_pass)
 
