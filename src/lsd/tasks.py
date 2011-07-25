@@ -118,15 +118,20 @@ def compute_counts(db, tabname, force=False):
 		db2 = DB(':'.join(db.path))
 		try:
 			nrows = db2.table(tabname).nrows()
+			new = False
 		except IOError:
 			# This is a new table
 			nrows = 0
+			new = True
 
 		# Fetch all cells modified by this transaction
 		cells = db.table(tabname).get_cells_in_snapshot(db.snapid)
 
-		# Count up rows before modification
-		nrows_old = compute_counts_aux(db2, tabname, cells, progress_callback=pool2.progress_pct_nnl)
+		if not new:
+			# Count up rows before modification
+			nrows_old = compute_counts_aux(db2, tabname, cells, progress_callback=pool2.progress_pct_nnl)
+		else:
+			nrows_old = 0
 
 		# Count up rows in modified cells
 		nrows_new = compute_counts_aux(db,  tabname, cells)
