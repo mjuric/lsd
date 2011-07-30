@@ -758,13 +758,24 @@ class QueryInstance(object):
 			globals_ = self.prep_globals()
 
 		rows = ColGroup()
-		for (asname, name) in select_clause:
-#			col = self[name]	# For debugging
-			col = eval(name, globals_, self)
+		for (asnames, name) in select_clause:
+#			cols = self[name]	# For debugging
+			cols = eval(name, globals_, self)
 #			exit()
 
-			self[asname] = col
-			rows.add_column(asname, col)
+			if len(asnames) == 1:
+				if type(cols) is tuple:
+					# Handle multi-valued returns when there are no ASNAMEs to capture them
+					# Note: for this to work, the UDF must return a tuple
+					asname = asnames[0]
+					asnames = [ '%s[%d]' % (asname, k) for k in xrange(len(cols)) ]
+				else:
+					cols = [ cols ]
+			assert len(asnames) == len(cols)
+
+			for asname, col in zip(asnames, cols):
+				self[asname] = col
+				rows.add_column(asname, col)
 
 		return rows
 

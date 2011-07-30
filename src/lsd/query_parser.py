@@ -104,11 +104,24 @@ def parse(query):
 			else:
 				# as token is disallowed after wildcards
 				if token.lower() == 'as':
+					# expect:
+					# ... as COLNAME
+					# ... as (COL1, COL2, ...)
 					(_, name, _, _, _) = next(g)
+					if name == '(':
+						token = ','
+						names = []
+						while token != ')':
+							assert token == ','
+							(_, name, _, _, _) = next(g)	# Expect the column name
+							names.append(name)
+							(_, token, _, _, _) = next(g)	# Expect , or ')'
+					else:
+						names = [ name ]
 					(_, token, _, _, _) = next(g)
 				else:
-					name = col
-				newcols = [(name, col)]
+					names = [ col ]
+				newcols = [(names, col)]
 
 			# Column delimiter or end of SELECT clause
 			if token.lower() in ['', ',', 'from']:
