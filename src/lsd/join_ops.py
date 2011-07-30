@@ -725,7 +725,7 @@ class QueryInstance(object):
 		# We yield nothing if the result set is empty.
 
 	def prep_globals(self):
-		globals_ = globals()
+		globals_ = self.db.get_globals()
 
 		# Import packages of interest (numpy)
 		for i in np.__all__:
@@ -1049,7 +1049,7 @@ class IntoWriter(object):
 		return id
 
 	def prep_globals(self):
-		globals_ = globals()
+		globals_ = self.db.get_globals()
 
 		# Add implicit global objects present in queries
 		globals_['_PIX'] = self.table.pix
@@ -1571,6 +1571,10 @@ class Query(object):
 		"""
 		return self.fetch(cells=[cell_id], include_cached=include_cached, nworkers=1, progress_callback=pool2.progress_pass)
 
+class Namespace:
+	def __init__(self, name):
+		self.__name__ = name
+
 class DB(object):
 	"""
 	The interface to LSD databases
@@ -1586,7 +1590,7 @@ class DB(object):
 	def _tsnap_to_snapid(self, tsnap):
 		return "%s.%06d" % (time.strftime("%Y%m%d%H%M%S", time.gmtime(tsnap)), int(1e6*(tsnap-int(tsnap))))
 
-	def __init__(self, path):
+	def __init__(self, path, udf_modules = None):
 		"""
 		Opens an existing database.
 		
@@ -1597,6 +1601,14 @@ class DB(object):
 		     empty directory.
 		"""
 		self.path = path.split(':')
+
+		if udf_modules is None:
+			try:
+				udf_modules = os.environ['LSD_UDFS'].split(':')
+			except KeyError:
+				udf_modules = []
+		self.udfs = self._load_udfs(self.path, udf_modules)
+
 		self.snapid = self._tsnap_to_snapid(time.time())
 
 		for path in self.path:
@@ -1604,6 +1616,89 @@ class DB(object):
 				raise Exception('"%s" is not an acessible directory.' % (path))
 
 		self.tables = dict()	# A cache of table instances
+
+	def get_globals(self):
+		# Return the global environment for query calls
+
+		# Import LSD's built-in functions
+		from . import user as u
+		try:
+			globals_ = u.__all__.copy()
+		except AttributeError:
+			globals_ = { name: value for name, value in u.__dict__.iteritems() if name[:1] != '_' }
+
+		# Import UDFs
+		globals_.update(self.udfs.__dict__)
+
+		return globals_
+
+	def _load_udfs(self, pathlist, udf_modules):
+		import imp
+
+		def _import_module(target, fp, pathname, description, k):
+			# Load
+			tmpnam = '_udf_tmp_%d' % k
+			if tmpnam in sys.modules:
+				del sys.modules[tmpnam]
+			m = imp.load_module(tmpnam, fp, pathname, description)
+
+			# Extract all non-privates
+			names = getattr(m, '__all__', None)
+			if names is None:
+				names = []
+				for name in m.__dict__:
+					if name[:1] == '_':
+						continue
+					names.append(name)
+
+			# If __lsd_name__ attribute exists, pack this module into a separate namespace
+			# Otherwise, import everything into top-level namespace
+			try:
+				lname = m.__lsd_name__
+				#udf_dest = imp.new_module(lname)
+				udf_dest = Namespace(lname)
+				setattr(target, lname, udf_dest)
+			except AttributeError:
+				udf_dest = target
+
+			# Do the import
+			for name in names:
+				setattr(udf_dest, name, getattr(m, name))
+
+		# Create a new module namespace
+		#udfs = imp.new_module('udfs')
+		udfs = Namespace('udfs')
+		k = 0
+
+		# Load UDFs from the paths in reverse, so newer overwrite older
+		for path in reversed(pathlist):
+			fp = None
+			try:
+				# Find
+				try:
+					(fp, pathname, description) = imp.find_module('user', [ path ])
+				except ImportError:
+					continue
+
+				_import_module(udfs, fp, pathname, description, k)
+				k += 1
+
+			finally:
+				if fp is not None:
+					fp.close()
+
+		# Load the explicitly given UDF modules
+		for modname in reversed(udf_modules):
+			fp = None
+			try:
+				(fp, pathname, description) = imp.find_module(modname)
+				_import_module(udfs, fp, pathname, description, k)
+				k += 1
+			finally:
+				if fp is not None:
+					fp.close()
+
+		return udfs
 
 	def _check_transaction(self):
 		if not self._transaction:
@@ -2220,195 +2315,6 @@ def _into_writer(kw, qwriter):
 	for rows in irows:
 		rows = qwriter._write(cell_id, rows)
 		yield rows
-
-###############################
-
-def _fitskw_dumb(hdrs, kw):
-	# Easy way
-	import StringIO
-	res = []
-	for ahdr in hdrs:
-		hdr = pyfits.Header( txtfile=StringIO(ahdr) )
-		res.append(hdr[kw])
-	return res
-
-def fits_quickparse(header):
-	"""
-	An ultra-simple FITS header parser.
-	
-	Does not support CONTINUE statements, HIERARCH, or anything of the
-	sort; just plain vanilla:
-	
-	    	key = value / comment
-
-	one-liners. The upshot is that it's fast, much faster than the
-	PyFITS equivalent.
-
-	NOTE: Assumes each 80-column line has a '\n' at the end (which is
-	      how we store FITS headers internally.)
-	"""
-	res = {}
-	for line in header.split('\n'):
-		at = line.find('=')
-		if at == -1 or at > 8:
-			continue
-
-		# get key
-		key = line[0:at].strip()
-
-		# parse value (string vs number, remove comment)
-		val = line[at+1:].strip()
-		if val[0] == "'":
-			# string
-			val = val[1:val[1:].find("'")]
-		else:
-			# number or T/F
-			at = val.find('/')
-			if at == -1: at = len(val)
-			val = val[0:at].strip()
-			if val.lower() in ['t', 'f']:
-				# T/F
-				val = val.lower() == 't'
-			else:
-				# Number
-				val = float(val)
-				if int(val) == val:
-					val = int(val)
-		res[key] = val
-	return res;
-
-def fitskw(hdrs, kw, default=0):
-	"""
-	Intelligently extract a keyword kw from an arbitrarely
-	shaped object ndarray of FITS headers.
-	
-	Designed to be called from within LSD queries.
-	"""
-	shape = hdrs.shape
-	hdrs = hdrs.reshape(hdrs.size)
-
-	res = []
-	cache = dict()
-	for ahdr in hdrs:
-		ident = id(ahdr)
-		if ident not in cache:
-			if ahdr is not None:
-				#hdr = pyfits.Header( txtfile=StringIO(ahdr) )
-				hdr = fits_quickparse(ahdr)
-				cache[ident] = hdr.get(kw, default)
-			else:
-				cache[ident] = default
-		res.append(cache[ident])
-
-	#assert res == _fitskw_dumb(hdrs, kw)
-
-	res = np.array(res).reshape(shape)
-	return res
-
-def ffitskw(uris, kw, default = False, db=None):
-	""" Intelligently load FITS headers stored in
-	    <uris> ndarray, and fetch the requested
-	    keyword from them.
-	"""
-
-	if len(uris) == 0:
-		return np.empty(0)
-
-	uuris, idx = np.unique(uris, return_inverse=True)
-	idx = idx.reshape(uris.shape)
-
-	if db is None:
-		# _DB is implicitly defined inside queries
-		global _DB
-		db = _DB
-
-	ret = []
-	for uri in uuris:
-		if uri is not None:
-			with db.open_uri(uri) as f:
-				hdr_str = f.read()
-			hdr = fits_quickparse(hdr_str)
-			ret.append(hdr.get(kw, default))
-		else:
-			ret.append(default)
-
-	# Broadcast
-	ret = np.array(ret)[idx]
-
-	assert ret.shape == uris.shape, '%s %s %s' % (ret.shape, uris.shape, idx.shape)
-
-	return ret
-
-def OBJECT(uris, db=None):
-	""" Dereference blobs referred to by URIs,
-	    assuming they're pickled Python objects.
-	"""
-	return deref(uris, db, True)
-
-def BLOB(uris, db=None):
-	""" Dereference blobs referred to by URIs,
-	    loading them as plain files
-	"""
-	return deref(uris, db, False)
-
-def deref(uris, db=None, unpickle=False):
-	""" Dereference blobs referred to by URIs,
-	    either as BLOBs or Python objects
-	"""
-	if len(uris) == 0:
-		return np.empty(0, dtype=object)
-
-	uuris, idx = np.unique(uris, return_inverse=True)
-	idx = idx.reshape(uris.shape)
-
-	if db is None:
-		# _DB is implicitly defined inside queries
-		db = _DB
-
-	ret = np.empty(len(uuris), dtype=object)
-	for i, uri in enumerate(uuris):
-		if uri is not None:
-			with db.open_uri(uri) as f:
-				if unpickle:
-					ret[i] = cPickle.load(f)
-				else:
-					ret[i] = f.read()
-		else:
-			ret[i] = None
-
-	# Broadcast
-	ret = np.array(ret)[idx]
-
-	assert ret.shape == uris.shape, '%s %s %s' % (ret.shape, uris.shape, idx.shape)
-
-	return ret
-
-def bin(v):
-	"""
-	Similar to __builtin__.bin but works on ndarrays.
-	
-	Useful in queries for converting flags to bit strings.
-
-	FIXME: The current implementation is painfully slow.
-	"""
-	import __builtin__
-	if not isinstance(v, np.ndarray):
-		return __builtin__.bin(v)
-
-	# Must be some kind of integer
-	assert v.dtype.kind in ['i', 'u']
-
-	# Create compatible string array
-	l = v.dtype.itemsize*8
-	ss = np.empty(v.shape, dtype=('a', v.dtype.itemsize*9))
-	s = ss.reshape(-1)
-	for i, n in enumerate(v.flat):
-		c = __builtin__.bin(n)[2:]
-		c = '0'*(l-len(c)) + c
-		ll = [ c[k:k+8] for k in xrange(0, l, 8) ]
-		s[i] = ','.join(ll)
-		#s[i] = c
-	return ss
 
 ###############################
 
