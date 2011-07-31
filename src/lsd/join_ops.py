@@ -1643,6 +1643,16 @@ class DB(object):
 
 		return globals_
 
+	def register_udf(self, udf, name=None):
+		""" Register a User Defined Function (UDF) or symbol.
+
+		    UDFs are available in query namespace during query execution.
+		"""
+		if name is None:
+			name = getattr(udf, "__lsd_name__", udf.__name__)
+
+		setattr(self.udfs, name, udf)
+
 	def _load_udfs(self, pathlist, udf_modules):
 		import imp
 
