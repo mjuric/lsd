@@ -3,6 +3,28 @@
 import numpy
 import numpy as np
 
+def galequ(l, b):
+	# Appendix of Reid et al. (http://adsabs.harvard.edu/cgi-bin/bib_query?2004ApJ...616..872R)
+	# This convention is also used by LAMBDA/WMAP (http://lambda.gsfc.nasa.gov/toolbox/tb_coordconv.cfm)
+	angp = np.radians(192.859508333) #  12h 51m 26.282s (J2000)
+	dngp = np.radians(27.128336111)  # +27d 07' 42.01" (J2000) 
+	l0   = np.radians(32.932)
+	ce   = np.cos(dngp)
+	se   = np.sin(dngp)
+
+	l = np.radians(l)
+	b = np.radians(b)
+
+	cb, sb = np.cos(b), np.sin(b)
+	cl, sl = np.cos(l-l0), np.sin(l-l0)
+
+	ra  = np.arctan2(cb*cl, sb*ce-cb*se*sl) + angp
+	dec = np.arcsin(cb*ce*sl + sb*se)
+
+	ra = np.where(ra < 0, ra + 2.*np.pi, ra)
+
+	return np.degrees(ra), np.degrees(dec)
+
 def _fits_quickparse(header):
 	"""
 	An ultra-simple FITS header parser.
