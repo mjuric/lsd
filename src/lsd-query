@@ -32,12 +32,12 @@ def T(*args):
 		return intervalset(tuple(args))
 
 def usage():
-	print "Usage: %s --db=dbdir --bounds=bounds --format=[fits|text|null] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
+	print "Usage: %s --db=dbdir --udf='udfname=pycode' --bounds=bounds --format=[fits|text|null] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
 
 if __name__ == "__main__":
 	np.seterr(over='raise')
 
-	optlist, (dbdir,), (query,) = tui_getopt('b:f:o:q', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds=', 'nc'], 1, usage)
+	optlist, (dbdir,), (query,) = tui_getopt('b:f:o:qu:', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds=', 'nc', 'udf='], 1, usage)
 
 	bounds = []
 	format = 'text'
@@ -45,6 +45,7 @@ if __name__ == "__main__":
 	progress_callback = None
 	testbounds = True
 	include_cached = False
+	udfs = {}
 	for o, a in optlist:
 		if o in ('-b', '--bounds'):
 			bounds.extend(eval('[' + a + ']'))
@@ -59,10 +60,17 @@ if __name__ == "__main__":
 			testbounds = a.lower() in ['true', '1', 't', 'y', 'yes']
 		if o in ('--nc'):
 			include_cached = True
+		if o in ('--udf', '-u'):
+			name, code = a.split('=', 1)
+			udfs[name.strip()] = code.strip()
 
 	######### Actual work
 
 	db = lsd.DB(dbdir)
+
+	for name, code in udfs.iteritems():
+		g = db.get_globals()
+		db.register_udf(eval(code, g), name)
 
 	bounds = make_canonical(bounds)
 

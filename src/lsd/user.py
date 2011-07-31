@@ -1,5 +1,6 @@
 # LSD-defined functions available within queries
 
+import numpy
 import numpy as np
 
 def _fits_quickparse(header):
@@ -176,3 +177,56 @@ def bin(v):
 		ll = [ c[k:k+8] for k in xrange(0, l, 8) ]
 		s[i] = ','.join(ll)
 	return ss
+
+class Map(object):
+	def __init__(self, k, v, missing):
+		import numpy as np
+		i = np.argsort(k)
+		self.k = k[i]
+		self.v = v[i]
+		self.missing = missing
+
+	def __call__(self, x):
+		i = np.searchsorted(self.k, x)
+		i[i == len(self.k)] = 0
+
+		v = self.v[i]
+		v[self.k[i] != x] = self.missing
+
+		return v
+
+class FileTable(object):
+	data = None
+
+	def __init__(self, fn, **kwargs):
+		import os.path
+		import numpy as np
+
+		basename, ext = os.path.splitext(fn)
+		ext = ext.lower()
+
+		if ext == '.fits':
+			# Assume fits
+			import pyfits
+			self.data = np.array(pyfits.getdata(fn, **kwargs))
+		elif ext == '.pkl':
+			# Assume pickled
+			import cPickle
+			from . import colgroup
+			with open(fn) as fp:
+				self.data = cPickle.load(fp)
+				if isinstance(self.data, colgroup.ColGroup):
+					self.data = self.data.as_ndarray()
+				assert isinstance(self.data, np.ndarray)
+		else:
+			# Assume text
+			from . import utils
+			self.data = np.genfromtxt(utils.open_ex(fn), **kwargs)
+
+	def map(self, key=0, val=1, missing=0):
+		if not isinstance(key, str):
+			key = self.data.dtype.names[key]
+		if not isinstance(val, str):
+			val = self.data.dtype.names[val]
+
+		return Map(self.data[key], self.data[val], missing)
