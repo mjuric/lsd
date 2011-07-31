@@ -2,6 +2,20 @@ import subprocess, os, errno
 import numpy as np
 import contextlib
 
+def open_ex(fname):
+	""" Transparently open bzipped/gzipped/raw file, based on suffix """
+	# lifted from numpy.loadtxt
+	if fname.endswith('.gz'):
+		import gzip
+		fh = gzip.GzipFile(fname)
+	elif fname.endswith('.bz2'):
+		import bz2
+		fh = bz2.BZ2File(fname)
+	else:
+		fh = file(fname)
+
+	return fh
+
 def isiterable(x):
 	try:
 		iter(x)

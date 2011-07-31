@@ -3,6 +3,7 @@
 import numpy as np
 import warnings
 from itertools import izip
+from ..utils import open_ex
 
 def conv_bool(s):
 	""" Convert string s to bool, recognizing True/False as literals """
@@ -21,20 +22,6 @@ def conv_dms(ss):
 def conv_hms(ss):
 	""" Convert a hexagessimal h:m:s.s coordinate to decimal """
 	return 15.*conv_dms(ss)
-
-def _open_file(fname):
-	""" Transparently open bzipped/gzipped/raw file, based on suffix """
-	# lifted from numpy.loadtxt
-	if fname.endswith('.gz'):
-		import gzip
-		fh = gzip.GzipFile(fname)
-	elif fname.endswith('.bz2'):
-		import bz2
-		fh = bz2.BZ2File(fname)
-	else:
-		fh = file(fname)
-
-	return fh
 
 class TextImporter:
 	comments = [ '#', ';' ]
@@ -68,11 +55,11 @@ class TextImporter:
 		# Allow errors in files
 		with warnings.catch_warnings():
 			warnings.simplefilter("ignore")
-			rows = np.genfromtxt(_open_file(fn), dtype=self.dtype, usecols=self.usecols, converters=self.converters, delimiter=self.delimiter, skip_header=self.skip_header, invalid_raise=not self.force)
+			rows = np.genfromtxt(open_ex(fn), dtype=self.dtype, usecols=self.usecols, converters=self.converters, delimiter=self.delimiter, skip_header=self.skip_header, invalid_raise=not self.force)
 
 		# Count up the number of lines
 		nlines = 0
-		with _open_file(fn) as fp:
+		with open_ex(fn) as fp:
 			for s in fp:
 				s = s.strip()
 				if not s or s[0] in self.comments:
