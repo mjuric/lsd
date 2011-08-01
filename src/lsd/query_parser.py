@@ -252,10 +252,10 @@ def resolve_wildcards(select_clause, tablecols):
 					else:
 						c = col
 						selcols.add(c)
-					ret.append((c,c))
+					ret.append(([c],c))
 		elif len(col) > 2 and col[-2:] == '.*':
 			tbl = col[:-2]
-			ret.extend(( (tbl+'.'+col, tbl+'.'+col) for col in tablecols[tbl] ))
+			ret.extend(( ([tbl+'.'+col], tbl+'.'+col) for col in tablecols[tbl] ))
 		else:
 			ret.append((ascol, col))
 	return ret
