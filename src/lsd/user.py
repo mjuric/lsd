@@ -2,6 +2,7 @@
 
 import numpy
 import numpy as np
+from . import colgroup
 
 def galequ(l, b):
 	# Appendix of Reid et al. (http://adsabs.harvard.edu/cgi-bin/bib_query?2004ApJ...616..872R)
@@ -201,11 +202,13 @@ def bin(v):
 	return ss
 
 class Map(object):
-	def __init__(self, k, v, missing):
+	def __init__(self, k, v, missing=None):
 		import numpy as np
+
 		i = np.argsort(k)
 		self.k = k[i]
 		self.v = v[i]
+
 		self.missing = missing
 
 	def __call__(self, x):
@@ -213,7 +216,14 @@ class Map(object):
 		i[i == len(self.k)] = 0
 
 		v = self.v[i]
-		v[self.k[i] != x] = self.missing
+		wipe = self.k[i] != x
+		if np.any(wipe):
+			if self.missing is not None:
+				v[wipe] = [ self.missing ]
+			else:
+				# Have the missing records be set to zero
+				tmp = np.zeros(v.shape, v.dtype)
+				tmp[~wipe] = v[~wipe]
 
 		return v
 
@@ -245,10 +255,54 @@ class FileTable(object):
 			from . import utils
 			self.data = np.genfromtxt(utils.open_ex(fn), **kwargs)
 
-	def map(self, key=0, val=1, missing=0):
+	def map(self, key=0, val=1, *extra_vals, **kwargs):
 		if not isinstance(key, str):
 			key = self.data.dtype.names[key]
 		if not isinstance(val, str):
 			val = self.data.dtype.names[val]
 
-		return Map(self.data[key], self.data[val], missing)
+		missing = kwargs.get('missing', None)
+
+		if len(extra_vals) == 0:
+			# Attach a name
+			dt = [ tuple((val,) + d[1:]) for d in self.data[val].dtype.descr ]
+			val = self.data[val].view(dtype=dt)
+			if missing is not None:
+				missing = (missing,)
+		else:
+			# Extract a subset of the structured array
+			extra_vals = (val,) + extra_vals	# List of column names (or indices)
+			val = colgroup.ColGroup()
+			for v in extra_vals:
+				if not isinstance(v, str):
+					v = self.data.dtype.names[v]
+				val[v] = self.data[v]
+
+		return Map(self.data[key], val, missing=missing)
+
+def filetable(x, fn, key, val, *extra_vals, **kwargs):
+	# Keep the three most recently loaded tables available
+	# Makes it possible to avoid explicit FileTable initialization, 
+	# at the cost of keeping things cached in memory
+	self = filetable
+	try:
+		cache = self.__cache__
+	except AttributeError:
+		import collections
+		cache = self.__cache__ = collections.OrderedDict()
+
+	ckey = fn, key, val, extra_vals, tuple(sorted(kwargs.items()))
+	if ckey not in cache:
+		# Load table and construct mapping
+		m = FileTable(fn, **kwargs).map(key, val, *extra_vals, **kwargs)
+	else:
+		m = cache[ckey]
+		del cache[ckey]
+
+	# Cache and trim cache if needed
+	cache[ckey] = m
+	if len(cache) > 3:
+		del cache[next(iter(cache))]
+
+	# Return
+	return m(x)
