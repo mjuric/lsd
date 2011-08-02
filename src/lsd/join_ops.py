@@ -1586,6 +1586,40 @@ class Namespace:
 	def __init__(self, name):
 		self.__name__ = name
 
+class ModuleProxy(object):
+	""" A proxy class used to wrap modules imported as UDFs
+	    to make them pickleable.
+	"""
+	def __init__(self, obj):
+		object.__setattr__(self, '_obj_', obj)
+
+	## Forward non-pickle calls to the real module
+	def __getattribute__(self, name):
+		#print "GET:", name
+		if name in ['__reduce_ex__', '__reduce__', '__getnewargs__', '__getstate__', '__class__', '__setstate__']:
+			return object.__getattribute__(self, name)
+		obj = object.__getattribute__(self, '_obj_')
+		return getattr(obj, name)
+	
+	def __setattr__(self, name, value):
+		obj = object.__getattribute__(self, '_obj_')
+		return setattr(obj, name, value)
+
+	def __delattr__(self, name):
+		obj = object.__getattribute__(self, '_obj_')
+		return delattr(obj, name)
+
+
+	## Pickling support: just store the module name, for reconstruction later on
+	def __getstate__(self):
+		obj = object.__getattribute__(self, '_obj_')
+		return obj.__name__,
+
+	def __setstate__(self, state):
+		name, = state
+		__import__(name)
+		object.__setattr__(self, '_obj_', sys.modules[name])
+
 class DB(object):
 	"""
 	The interface to LSD databases
@@ -1676,7 +1710,6 @@ class DB(object):
 			# Otherwise, import everything into top-level namespace
 			try:
 				lname = m.__lsd_name__
-				#udf_dest = imp.new_module(lname)
 				udf_dest = Namespace(lname)
 				setattr(target, lname, udf_dest)
 			except AttributeError:
@@ -1684,10 +1717,12 @@ class DB(object):
 
 			# Do the import
 			for name in names:
-				setattr(udf_dest, name, getattr(m, name))
+				item = getattr(m, name)
+				if type(item) is type(imp):
+					item = ModuleProxy(item)
+				setattr(udf_dest, name, item)
 
 		# Create a new module namespace
-		#udfs = imp.new_module('udfs')
 		udfs = Namespace('udfs')
 		k = 0
 
