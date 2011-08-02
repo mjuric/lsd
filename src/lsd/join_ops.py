@@ -763,16 +763,34 @@ class QueryInstance(object):
 			cols = eval(name, globals_, self)
 #			exit()
 
-			if len(asnames) == 1:
-				if type(cols) is tuple:
-					# Handle multi-valued returns when there are no ASNAMEs to capture them
-					# Note: for this to work, the UDF must return a tuple
-					asname = asnames[0]
-					asnames = [ '%s[%d]' % (asname, k) for k in xrange(len(cols)) ]
-				else:
-					cols = [ cols ]
-			assert len(asnames) == len(cols)
+			# eval() is expected to return:
+			#	- a plain numpy array, or
+			#	- a structured numpy array (or an object with the same API), or
+			#	- a tuple
+			# For the latter two cases, the number of generated columns may be > 1
+			# Also, if a structured array is return, we'll take it's field names
+			#     for the generated column names, if asnames is empty
+			# If a tuple is returned, and asnames is empty, we'll generate the
+			#     column names from 'name' by appending [0], [1], ...
 
+			if getattr(cols, 'dtype', None) is not None and cols.dtype.names is not None:
+				# A structured array
+				if not asnames:
+					asnames = cols.dtype.names
+
+				# Unpack to tuple
+				cols = tuple( cols[name] for name in cols.dtype.names )
+			elif type(cols) is tuple:
+				# A tuple
+				if not asnames:
+					asnames = [ '%s[%d]' % (name, k) for k in xrange(len(cols)) ]
+			else:
+				# A simple numpy array
+				if not asnames:
+					asnames = [ name ]
+				cols = [ cols ]
+
+			assert len(asnames) == len(cols)
 			for asname, col in zip(asnames, cols):
 				self[asname] = col
 				rows.add_column(asname, col)

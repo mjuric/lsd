@@ -100,7 +100,7 @@ def parse(query):
 			if col == '*' or len(col) > 2 and col[-2:] == '.*':
 				# wildcards
 				tbl = col[:-2]
-				newcols = [ (col, col) ]
+				newcols = [ ([], col) ]
 			else:
 				# as token is disallowed after wildcards
 				if token.lower() == 'as':
@@ -120,7 +120,7 @@ def parse(query):
 						names = [ name ]
 					(_, token, _, _, _) = next(g)
 				else:
-					names = [ col ]
+					names = []
 				newcols = [(names, col)]
 
 			# Column delimiter or end of SELECT clause
@@ -252,10 +252,10 @@ def resolve_wildcards(select_clause, tablecols):
 					else:
 						c = col
 						selcols.add(c)
-					ret.append(([c],c))
+					ret.append(([],c))
 		elif len(col) > 2 and col[-2:] == '.*':
 			tbl = col[:-2]
-			ret.extend(( ([tbl+'.'+col], tbl+'.'+col) for col in tablecols[tbl] ))
+			ret.extend(( ([], tbl+'.'+col) for col in tablecols[tbl] ))
 		else:
 			ret.append((ascol, col))
 	return ret
