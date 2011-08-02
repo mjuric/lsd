@@ -265,6 +265,14 @@ class ColGroup(object):
 		"""
 		return np.dtype([ (self.column_map[pos], full_dtype(col)) for (pos, col) in enumerate(self.column_data) ])
 
+	@property
+	def shape(self):
+		"""
+		Return the shape this column group would have if it was a
+		numpy structured array
+		"""
+		return (len(self), )
+
 	def column(self, idx):
 		"""
 		Return the column at index idx.
