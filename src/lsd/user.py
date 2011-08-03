@@ -24,7 +24,10 @@ def galequ(l, b):
 
 	ra = np.where(ra < 0, ra + 2.*np.pi, ra)
 
-	return np.degrees(ra), np.degrees(dec)
+	ra = np.degrees(ra)
+	dec = np.degrees(dec)
+
+	return [('ra', ra), ('dec', dec)]
 
 def _fits_quickparse(header):
 	"""
@@ -234,12 +237,20 @@ class Map(object):
 		return v
 
 class FileTable(object):
-	data = None
+	""" FileTable - load a FITS/pkl/text key/value table in queries
+	"""
+	__key, __vals, __map = 0, [1], None
 
 	def __init__(self, fn, **kwargs):
 		import os.path
 		import numpy as np
 
+		# Look for short-hand syntax
+		if fn.find(':') != -1:
+			fn, self.__key, vals = ( s.strip() for s in fn.split(':') )
+			self.__vals = [ s.strip() for s in vals.split(',') ]
+
+		# Load the file
 		basename, ext = os.path.splitext(fn)
 		ext = ext.lower()
 
@@ -260,6 +271,12 @@ class FileTable(object):
 			# Assume text
 			from . import utils
 			self.data = np.genfromtxt(utils.open_ex(fn), **kwargs)
+
+	def __call__(self, x):
+		if self.__map is None:
+			self.__map = self.map(self.__key, *self.__vals)
+
+		return self.__map(x)
 
 	def map(self, key=0, val=1, *extra_vals, **kwargs):
 		if not isinstance(key, str):
@@ -287,6 +304,13 @@ class FileTable(object):
 		return Map(self.data[key], val, missing=missing)
 
 def filetable(x, fn, key, val, *extra_vals, **kwargs):
+	"""
+	# NOTE: In retrospect, I think this function is a bad idea that
+	#       encourages bad user behavior. I've disabled it until a
+	#       convincing argument changes my mind
+	"""
+	assert 0, "This function has been deprecated. Use the FileTable object"
+
 	# Keep the three most recently loaded tables available
 	# Makes it possible to avoid explicit FileTable initialization, 
 	# at the cost of keeping things cached in memory

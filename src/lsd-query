@@ -32,12 +32,12 @@ def T(*args):
 		return intervalset(tuple(args))
 
 def usage():
-	print "Usage: %s --db=dbdir --udf='udfname=pycode' --bounds=bounds --format=[fits|text|null] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
+	print "Usage: %s --db=dbdir --define='funcname=pycode' --bounds=bounds --format=[fits|text|null] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
 
 if __name__ == "__main__":
 	np.seterr(over='raise')
 
-	optlist, (dbdir,), (query,) = tui_getopt('b:f:o:qu:', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds=', 'nc', 'udf='], 1, usage)
+	optlist, (dbdir,), (query,) = tui_getopt('b:f:o:qD:', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds=', 'nc', 'define='], 1, usage)
 
 	bounds = []
 	format = 'text'
@@ -60,7 +60,7 @@ if __name__ == "__main__":
 			testbounds = a.lower() in ['true', '1', 't', 'y', 'yes']
 		if o in ('--nc'):
 			include_cached = True
-		if o in ('--udf', '-u'):
+		if o in ('--define', '-D'):
 			name, code = a.split('=', 1)
 			udfs[name.strip()] = code.strip()
 
