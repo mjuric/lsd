@@ -1688,7 +1688,7 @@ class DB(object):
 		# Return the global environment for query calls
 
 		# Import LSD's built-in functions
-		from . import user as u
+		from . import builtins as u
 		try:
 			globals_ = u.__all__.copy()
 		except AttributeError:

@@ -2,7 +2,7 @@
 
 import numpy
 import numpy as np
-from . import colgroup
+from .. import colgroup
 
 def galequ(l, b):
 	# Appendix of Reid et al. (http://adsabs.harvard.edu/cgi-bin/bib_query?2004ApJ...616..872R)
