@@ -2,6 +2,70 @@ import subprocess, os, errno
 import numpy as np
 import contextlib
 
+class LazyCreate(object):
+	""" Lazy (on-demand) creation of objects.
+	
+	    This class allows the object to appear instantiated, while
+	    in fact it will be instantiated on first use. This is useful
+	    for "heavy" (== memory consuming) objects that may or may
+	    not be called by the user -- if they're never called, they
+	    are never created.
+	    
+	    Example usage:
+	    ====
+	    I instead of:
+	    	obj = HeavyObject(arg1, arg2, ...)
+	    replace it by:
+	        obj = LazyCreate(HeavyObject, arg1, arg2, ...)
+
+	    The object's constructor will not be called until it's
+	    actually accessed (e.g., a method is called on it, or
+	    an attribute is accessed). All of this is transparent
+	    to users of obj -- it behaves exactly like an instance
+	    of HeavyObject.
+	"""
+	def __init__(self, cls, *args, **kwargs):
+		object.__setattr__(self, '__LazyCreate__data__', (cls, args, kwargs))
+		object.__setattr__(self, '__LazyCreate__obj__', None)
+
+	def __getattribute__(self, name):
+		if name in ['_LazyCreate__get_internal', '__reduce_ex__', '__reduce__', '__getnewargs__', '__getstate__', '__class__', '__setstate__']:
+			return object.__getattribute__(self, name)
+		return getattr(self.__get_internal(), name)
+
+	def __setattr__(self, name, value):
+		return setattr(self.__get_internal(), name, value)
+
+	def __delattr__(self, name):
+		return delattr(self.__get_internal(), name)
+
+	def __call__(self, *args, **kwargs):
+		return self.__get_internal()(*args, **kwargs)
+
+	## Object auto-creation
+	def __get_internal(self):
+		obj = object.__getattribute__(self, '__LazyCreate__obj__')
+		if obj is None:
+			cls, args, kwargs = object.__getattribute__(self, '__LazyCreate__data__')
+			obj = cls(*args, **kwargs)
+			object.__setattr__(self, '__LazyCreate__obj__', obj)
+
+		return obj
+
+	## Pickling support: if the object hasn't been constructed,
+	## pickling this class won't trigger its construction. But if the object
+	## has been constructed, the constructed instance will be pickled and
+	## passed along.
+	def __getstate__(self):
+		objdef = object.__getattribute__(self, '__LazyCreate__data__')
+		obj    = object.__getattribute__(self, '__LazyCreate__obj__')
+		return objdef, obj
+
+	def __setstate__(self, state):
+		objdef, obj = state
+		object.__setattr__(self, '__LazyCreate__data__', objdef)
+		object.__setattr__(self, '__LazyCreate__obj__', obj)
+
 def open_ex(fname):
 	""" Transparently open bzipped/gzipped/raw file, based on suffix """
 	# lifted from numpy.loadtxt
