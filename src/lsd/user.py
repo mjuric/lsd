@@ -225,6 +225,12 @@ class Map(object):
 				tmp = np.zeros(v.shape, v.dtype)
 				tmp[~wipe] = v[~wipe]
 
+		# If this is a single-column return, return only the
+		# single column, to allow expressions such as x + y(z)
+		# in queries
+		if len(v.dtype.names) == 1:
+			return v[v.dtype.names[0]]
+
 		return v
 
 class FileTable(object):
