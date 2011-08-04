@@ -44,19 +44,14 @@ class DustMap(object):
 			dir = os.getenv('DUST_DIR', os.path.join(config.data_dir, 'sfd-dust-maps'))
 
 		fname = os.path.join(dir, fname)
-		ext = 'fits'
-		if os.access(fname+'_ngp.fits', os.F_OK):
-			ext = 'fits'
-		elif os.access(fname+'_ngp.fits.gz', os.F_OK):
-			ext = 'fits.gz'
-		else:
+		if not os.access(fname+'_ngp.fits', os.F_OK):
 			raise Exception('Map file %s not found. Check your $DUST_DIR or download it from http://www.astro.princeton.edu/~schlegel/dust/data/data.html.' % (fname+'_ngp.fits[.gz]'))
 
 		# Load the maps
 		self.data = {}
 		for pole in ['ngp', 'sgp']:
-			fn = fname+'_%s.%s' % (pole, ext)
-			with pyfits.open(fn) as hdulist:
+			fn = fname+'_%s.fits' % (pole,)
+			with pyfits.open(fn, memmap=True) as hdulist:
 				self.data[pole] = hdulist[0].header, hdulist[0].data
 
 	def __call__(self, l, b, order=0):

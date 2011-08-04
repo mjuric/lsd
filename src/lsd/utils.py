@@ -7,6 +7,44 @@ class NamedList(list):
 		self.names = [ name for name, _ in items ]
 		list.__init__(self, [ col for _, col in items ])
 
+class Namespace:
+	def __init__(self, name=''):
+		self.__name__ = name
+
+class ModuleProxy(object):
+	""" A proxy class used to wrap modules imported as UDFs
+	    to make them pickleable.
+	"""
+	def __init__(self, obj):
+		object.__setattr__(self, '_obj_', obj)
+
+	## Forward non-pickle calls to the real module
+	def __getattribute__(self, name):
+		#print "GET:", name
+		if name in ['__reduce_ex__', '__reduce__', '__getnewargs__', '__getstate__', '__class__', '__setstate__']:
+			return object.__getattribute__(self, name)
+		obj = object.__getattribute__(self, '_obj_')
+		return getattr(obj, name)
+	
+	def __setattr__(self, name, value):
+		obj = object.__getattribute__(self, '_obj_')
+		return setattr(obj, name, value)
+
+	def __delattr__(self, name):
+		obj = object.__getattribute__(self, '_obj_')
+		return delattr(obj, name)
+
+
+	## Pickling support: just store the module name, for reconstruction later on
+	def __getstate__(self):
+		obj = object.__getattribute__(self, '_obj_')
+		return obj.__name__,
+
+	def __setstate__(self, state):
+		name, = state
+		__import__(name)
+		object.__setattr__(self, '_obj_', sys.modules[name])
+
 class LazyCreate(object):
 	""" Lazy (on-demand) creation of objects.
 	
@@ -28,10 +66,27 @@ class LazyCreate(object):
 	    an attribute is accessed). All of this is transparent
 	    to users of obj -- it behaves exactly like an instance
 	    of HeavyObject.
+	    
+	    Special kwargs read by LazyCreate:
+	    ==================================
+	    _LC_del_on_pickle -- (default: True)
+	    	Destroy the inner object when pickled, if it was already
+	    	instantiated. When unpickled, the LazyCreate instance will
+	    	start with the inner object uncreated.
 	"""
 	def __init__(self, cls, *args, **kwargs):
+		# Extract arguments intended for LazyCreate
+		lcargs = Namespace()
+		lcargs.del_on_pickle = True
+		for k, v in kwargs.iteritems():
+			if k.startswith('_LC_'): setattr(lcargs, k[4:], v)
+
+		kwargs = { k: v for k, v in kwargs.iteritems() if not k.startswith('_LC_') }
+
+		# Store the attributes
 		object.__setattr__(self, '__LazyCreate__data__', (cls, args, kwargs))
 		object.__setattr__(self, '__LazyCreate__obj__', None)
+		object.__setattr__(self, '__LazyCreate__lcargs__', lcargs)
 
 	def __getattribute__(self, name):
 		if name in ['_LazyCreate__get_internal', '__reduce_ex__', '__reduce__', '__getnewargs__', '__getstate__', '__class__', '__setstate__']:
@@ -64,10 +119,16 @@ class LazyCreate(object):
 	def __getstate__(self):
 		objdef = object.__getattribute__(self, '__LazyCreate__data__')
 		obj    = object.__getattribute__(self, '__LazyCreate__obj__')
-		return objdef, obj
+		lcargs = object.__getattribute__(self, '__LazyCreate__lcargs__')
+
+		if lcargs.del_on_pickle:
+			obj = None
+
+		return lcargs, objdef, obj
 
 	def __setstate__(self, state):
-		objdef, obj = state
+		lcargs, objdef, obj = state
+		object.__setattr__(self, '__LazyCreate__lcargs__', lcargs)
 		object.__setattr__(self, '__LazyCreate__data__', objdef)
 		object.__setattr__(self, '__LazyCreate__obj__', obj)
 
