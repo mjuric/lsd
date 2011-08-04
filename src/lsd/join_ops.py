@@ -767,15 +767,16 @@ class QueryInstance(object):
 			#	- a plain numpy array, or
 			#	- a structured numpy array (or an object with the same API), or
 			#	- a tuple of (unnamed) columns
-			#       - a list of (name, col) tuples
-			# For the latter two cases, the number of generated columns may be > 1
+			#       - a NamedList instance
+			# For the latter three cases, the number of generated columns may be > 1
 			# Also, if a structured array is return, we'll take it's field names
 			#     for the generated column names, if asnames is empty
 			# If a tuple is returned, and asnames is empty, we'll generate the
 			#     column names from 'name' by appending [0], [1], ...
 
-			if isinstance(cols, list):
-				cols = ColGroup(cols)
+			if isinstance(cols, utils.NamedList):
+				asnames = cols.names
+				cols = tuple(cols)
 
 			if getattr(cols, 'dtype', None) is not None and cols.dtype.names is not None:
 				# A structured array

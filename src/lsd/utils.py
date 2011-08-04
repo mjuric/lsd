@@ -2,6 +2,11 @@ import subprocess, os, errno
 import numpy as np
 import contextlib
 
+class NamedList(list):
+	def __init__(self, *items):
+		self.names = [ name for name, _ in items ]
+		list.__init__(self, [ col for _, col in items ])
+
 class LazyCreate(object):
 	""" Lazy (on-demand) creation of objects.
 	
