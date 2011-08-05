@@ -32,10 +32,14 @@ def T(*args):
 		return intervalset(tuple(args))
 
 def usage():
-	print "Usage: %s --db=dbdir --define='funcname=pycode' --bounds=bounds --format=[fits|text|null] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
+	print "Usage: %s --version --db=dbdir --define='funcname=pycode' --bounds=bounds --format=[fits|text|null] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
 
 if __name__ == "__main__":
 	np.seterr(over='raise')
+
+	if sys.argv[1] in ['-v', '--version']:
+		print "Large Survey Database, version %s" % (lsd.__version__)
+		exit()
 
 	optlist, (dbdir,), (query,) = tui_getopt('b:f:o:qD:', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds=', 'nc', 'define='], 1, usage)
 
