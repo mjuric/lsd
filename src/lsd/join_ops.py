@@ -1673,14 +1673,19 @@ class DB(object):
 		setattr(self.udfs, name, udf)
 
 	def _load_udfs(self, pathlist, udf_modules):
-		import imp
+		import imp, hashlib
 
-		def _import_module(target, fp, pathname, description, k):
-			# Load
-			tmpnam = '_udf_tmp_%d' % k
-			if tmpnam in sys.modules:
-				del sys.modules[tmpnam]
-			m = imp.load_module(tmpnam, fp, pathname, description)
+		def _import_module(target, fp, pathname, description, modname):
+			# If the module name is unknown, construct a unique one using 
+			# the hash of the pathname
+			if modname is None:
+				modname = '_udfmodule_' + hashlib.md5(pathname).hexdigest()
+
+			# Get or load the module
+			try:
+				m = sys.modules[modname]
+			except KeyError:
+				m = imp.load_module(modname, fp, pathname, description)
 
 			# Extract all non-privates
 			names = getattr(m, '__all__', None)
@@ -1709,7 +1714,6 @@ class DB(object):
 
 		# Create a new module namespace
 		udfs = utils.Namespace('udfs')
-		k = 0
 
 		# Load UDFs from the paths in reverse, so newer overwrite older
 		for path in reversed(pathlist):
@@ -1721,8 +1725,7 @@ class DB(object):
 				except ImportError:
 					continue
 
-				_import_module(udfs, fp, pathname, description, k)
-				k += 1
+				_import_module(udfs, fp, pathname, description, None)
 
 			finally:
 				if fp is not None:
@@ -1733,8 +1736,7 @@ class DB(object):
 			fp = None
 			try:
 				(fp, pathname, description) = imp.find_module(modname)
-				_import_module(udfs, fp, pathname, description, k)
-				k += 1
+				_import_module(udfs, fp, pathname, description, modname)
 			finally:
 				if fp is not None:
 					fp.close()
