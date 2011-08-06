@@ -625,7 +625,7 @@ class Pool:
 						os.ftruncate(fp.file.fileno(), 0)
 						fp.close()
 						fp = None
-					raise
+				raise
 			finally:
 				if back_to_disk:
 					# Close/clear the intermediate result backing store from the previous step
@@ -639,6 +639,7 @@ class Pool:
 
 					if fp is not None:
 						prev_fp, prev_mm = fp, mm
+						fp, mm = None, None
 
 		if progress_callback != None:
 			progress_callback('mapreduce', 'end', None, None, None)
