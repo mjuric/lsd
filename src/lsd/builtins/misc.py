@@ -280,7 +280,7 @@ class FileTable(object):
 		elif ext == '.pkl':
 			# Assume pickled
 			import cPickle
-			from . import colgroup
+			from .. import colgroup
 			with open(fn) as fp:
 				self.data = cPickle.load(fp)
 				if isinstance(self.data, colgroup.ColGroup):
@@ -288,7 +288,7 @@ class FileTable(object):
 				assert isinstance(self.data, np.ndarray)
 		else:
 			# Assume text
-			from . import utils
+			from .. import utils
 			self.data = np.genfromtxt(utils.open_ex(fn), **kwargs)
 
 	def __call__(self, x):
