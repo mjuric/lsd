@@ -1,2 +1,1 @@
-prune src/data/*
 include src/native/*.h src/native/*.cpp

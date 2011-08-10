@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os, os.path, sys, glob
+from fnmatch import fnmatch
 
 try:
         import numpy
@@ -97,7 +98,22 @@ def get_filelist(dir):
 	return res.items()
 
 # Enumerate data files that are to be copied to /share/lsd/data. Format them the way disttools wants it.
-data_files = [ (os.path.join('share', 'lsd', *dest.split('/')[1:]), f) for dest, f in get_filelist('src/data') ]
+if os.path.isdir('src/data'):
+        data_files = [ (os.path.join('share', 'lsd', *dest.split('/')[1:]), f) for dest, f in get_filelist('src/data') ]
+else:
+        data_files = []
+
+# Filter only a "necessary" subset of all data. The user can download the whole lsd-data package
+# if they're interested. (TODO: provide an automated way to do this)
+data_files_whitelist = { } # 'src/data/sfd-dust-maps/SFD_dust_4096_*.fits'
+data_files2 = []
+for to, files in data_files:
+	f2 = []
+	for f in files:
+		f2 += [ f for pat in data_files_whitelist if fnmatch(f, pat) ]
+	if f2:
+		data_files2.append((to, f2))
+data_files = data_files2
 
 inc = [ numpy.get_include() ]
 
