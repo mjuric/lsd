@@ -155,6 +155,7 @@ args = {
 	'data_files'    : [
 				('share/lsd/examples', ['src/examples/latitude_histogram.py', 'src/examples/count_rows.py']),
 				('share/lsd/schemas', glob.glob('src/schemas/*.yaml') + glob.glob('src/schemas/*.map')),
+				('share/lsd/data', ['src/README.data'])
 			  ] + data_files
 }
 

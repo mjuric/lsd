@@ -1,0 +1,7 @@
+This directory contains LSD data files. Because of their size, not all of
+them are bundled with LSD, but have to be obtained separately. Download them
+from:
+
+	http://lsddb.org/data
+
+and unzip into this subdirectory.
