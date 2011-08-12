@@ -15,7 +15,7 @@ import time
 import locking
 
 from contextlib  import contextmanager
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 import query_parser as qp
 import bhpix
@@ -48,15 +48,43 @@ class TabletCache:
 
 		TODO: Perhaps merge it with DB? Or make it a global?
 	"""
-	cache = {}		# Cache of loaded tables, in the form of cache[cell_id][include_cached][table][cgroup] = rows
+	cache = None		# Cache of loaded tables, in the form of (cell_id, table, cgroup, include_cached) -> rows
 
 	root_path = None	# The name of the root table (string). Used for figuring out if _not_ to load the cached rows.
 	include_cached = False	# Should we load the cached rows from the root table?
 
-	def __init__(self, root_path, include_cached = False):
-		self.cache = {}
+	def __init__(self, root_path, include_cached = False, max_cached=10):
+		self.cache = OrderedDict()
 		self.root_path = root_path
 		self.include_cached = include_cached
+		self.max_cached = max_cached
+
+	def _fetch_tablet(self, cell_id, table, cgroup, include_cached, autoexpand=True):
+		key = (cell_id, table.name, cgroup, include_cached)
+
+		try:
+			rows = self.cache[key]
+
+			# Move this tablet at the back of the OrderedDict (LRU cache)
+			del self.cache[key]
+			self.cache[key] = rows
+		except KeyError:
+			# Drop the least recently used tablet (== first in OrderedDict)
+			# if we maxed out the cache
+			if len(self.cache) > self.max_cached:
+				self.cache.popitem(last=False)
+
+			# Load and cache the tablet
+			rows = table.fetch_tablet(cell_id, cgroup, include_cached=include_cached)
+
+			# Ensure it's as long as the primary table (this allows us to support "sparse" tablets)
+			if autoexpand and cgroup != table.primary_cgroup:
+				nrows = len(self.load_column(cell_id, table.primary_key.name, table))
+				rows.resize(nrows)
+
+			self.cache[key] = rows
+
+		return rows
 
 	def load_column(self, cell_id, name, table, autoexpand=True, resolve_blobs=False):
 		# Return the column 'name' from table 'table'.
@@ -71,28 +99,7 @@ class TabletCache:
 		# Figure out which table contains this column
 		cgroup = table.columns[name].cgroup
 
-		# Create self.cache[cell_id][table.name][include_cached][cgroup] hierarchy if needed
-		if  cell_id not in self.cache:
-			self.cache[cell_id] = {}
-		if table.name not in self.cache[cell_id]:
-			self.cache[cell_id][table.name] = {}
-		if include_cached not in self.cache[cell_id][table.name]:		# This bit is to support (in the future) self-joins. Note that (yes) this can be implemented in a much smarter way.
-			self.cache[cell_id][table.name][include_cached] = {}
-
-		# See if we have already loaded the required tablet
-		tcache = self.cache[cell_id][table.name][include_cached]
-		if cgroup not in tcache:
-			# Load and cache the tablet
-			rows = table.fetch_tablet(cell_id, cgroup, include_cached=include_cached)
-
-			# Ensure it's as long as the primary table (this allows us to support "sparse" tablets)
-			if autoexpand and cgroup != table.primary_cgroup:
-				nrows = len(self.load_column(cell_id, table.primary_key.name, table))
-				rows.resize(nrows)
-
-			tcache[cgroup] = rows
-		else:
-			rows = tcache[cgroup]
+		rows = self._fetch_tablet(cell_id, table, cgroup, include_cached, autoexpand=autoexpand)
 
 		col = rows[name]
 		
@@ -1043,6 +1050,9 @@ class IntoWriter(object):
 			self.table  = self.create_into_table()
 
 		rows = self.eval_into(cell_id, rows)
+
+		self._tcache = None	# HACKish: drop the cache, assuming that write() usually gets called only once per cell
+
 		return (cell_id, rows)
 
 	def _find_into_dest_rows(self, cell_id, table, into_col, vals):
