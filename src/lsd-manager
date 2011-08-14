@@ -5,7 +5,8 @@ import logging
 import threading
 import sys, os
 import time
-from lsd.pyrpc import PyRPCServer, AllowAllAccessControl
+from collections import defaultdict
+from lsd.pyrpc import Server as PyRPCServer, AllowAllAccessControl
 from lsd.tui import *
 
 ########### Simple check-in server
@@ -50,69 +51,114 @@ class WorkerManager:
 
 		return nworkers
 
-class AccessSync:
-	_lock = None
-	_leases = None
+def digest(fn):
+	import hashlib
+	return hashlib.md5(fn).hexdigest()
 
+class AccessSync:
+	"""
+	Give leases for file access to clients.
+
+	Not more than maxleases can be outstanding at any time. A lease can
+	no more than self._duration seconds; it must either be released in
+	that period, renewed, or it will expire automatically.
+
+	The leases are given on a per-client basis. Once a client is
+	approved a lease, it will be automatically approved for any
+	subsequent requests as long as the lease does not expire (with each
+	subsequent request renewing the lease).
+
+	"""
 	def __init__(self, maxleases):
-		self._lock = threading.Lock()
-		self._leases = threading.BoundedSemaphore(maxleases)
-		self._leases_expire = dict()
 		self._maxleases = maxleases
 
-		self._lease_expiration_thread = threading.Thread(target=self._expire_leases)
-		self._lease_expiration_thread.daemon = True
-		self._lease_expiration_thread.start()
+		self._lock = threading.Lock()
+		self._leases_available = threading.BoundedSemaphore(maxleases)
+		self._active_leases = {}	# client -> (expires, [list of leased files])
+		self._duration = 10		# lease duration (in seconds)
+
+		th = threading.Thread(target=self._expire_leases_thread)
+		th.daemon = True
+		th.start()
 
 		logger.info("AccessSync manager started, maxleases=%d" % (self._maxleases,))
 
-	def obtain_access_lease(self, fn, _context):
+	def obtain_file_lease(self, fn, _context):
 		cli_info = "%s:%s %s" % (_context.client_address + (_context.creds.user, ))
-		logger.info("[%s] [AccessSync] requested lease for %s" % (cli_info, fn))
+		logger.debug("[%s] [AccessSync] requested lease for %s" % (cli_info, digest(fn)))
 
-		self._leases.acquire()
-		with self._lock:
-			self._leases_expire[_context.client_address] = time.time() + 10
-
-		logger.info("[%s] [AccessSync] acquired lease for %s" % (cli_info, fn))
-		return True
-
-	def relinquish_access_lease(self, fn, _context):
+		cli = _context.client_address
 		with self._lock:
 			try:
-				del self._leases_expire[_context.client_address]
-				self._leases.release()
+				(expires, files) = self._active_leases[cli]
+				files.append(fn)
+				self._active_leases[cli] = (time.time() + self._duration, files)
+
+				logger.debug("[%s] [AccessSync] lease extended for %s" % (cli_info, digest(fn)))
+				return True
 			except KeyError:
 				pass
 
-		cli_info = "%s:%s %s" % (_context.client_address + (_context.creds.user, ))
-		logger.info("[%s] [AccessSync] released lease for %s" % (cli_info, fn))
+		# Acquire a lease
+		self._leases_available.acquire()
+
+		# Record it
+		with self._lock:
+			assert cli not in self._active_leases
+			self._active_leases[cli] = (time.time() + self._duration, [fn])
+			##assert self._leases_available._initial_value - self._leases_available._Semaphore__value == len(self._active_leases)
+
+		logger.debug("[%s] [AccessSync] acquired lease for %s (%d active leases)" % (cli_info, digest(fn), len(self._active_leases)))
+		return True
+
+	def release_file_lease(self, fn, _context):
+		cli = _context.client_address
+		with self._lock:
+			try:
+				(expires, files) = self._active_leases[cli]
+
+				if fn is not None:
+					files.remove(fn)
+				else:
+					del files[:]
+
+				if len(files) == 0:
+					del self._active_leases[cli]
+					self._leases_available.release()
+					##assert self._leases_available._initial_value - self._leases_available._Semaphore__value == len(self._active_leases)
+
+				logger.debug("[%s:%s %s] [AccessSync] released lease for %s (%d active leases)" % (cli[0], cli[1], _context.creds.user, digest(fn), len(self._active_leases)))
+			except KeyError:
+				logger.debug("[%s:%s %s] [AccessSync] tried to release expired lease for %s (%d active leases)" % (cli[0], cli[1], _context.creds.user, digest(fn), len(self._active_leases)))
+				pass
 
 		return True
 
 	def __disconnect__(self, _context):
-		self.relinquish_access_lease(None, _context)
+		if _context.client_address in self._active_leases:
+			self.release_file_lease(None, _context)
 
-	def _expire_leases(self):
+	def _expire_leases_thread(self):
 		while True:
 			with self._lock:
 				t = time.time()
-				for lease, exptime in self._leases_expire.items():
-					if exptime > t:
-						continue
-					self._leases.release()
-					del self._leases_expire[lease]
+				for cli, (exptime, files) in self._active_leases.items():
+					if exptime < t:
+						del self._active_leases[cli]
+						self._leases_available.release()
+						##assert self._leases_available._initial_value - self._leases_available._Semaphore__value == len(self._active_leases)
+						logger.debug("[global] [AccessSync] expired lease for %s (%d active leases)" % (cli, len(self._active_leases)))
 			time.sleep(1)
 
 def usage():
 	print "Usage: %s --quiet <max_cores>" % sys.argv[0]
 
 if __name__ == "__main__":
-	optlist, (max_cores,) = tui_getopt('q', ['quiet'], 1, usage, stdopts=False)
+	optlist, (max_cores, max_leases) = tui_getopt('q', ['quiet'], 2, usage, stdopts=False)
 
 	# Instantiate a server
 	server = PyRPCServer("localhost", 9030)
 	server.register_instance(AllowAllAccessControl())
 	server.register_instance(WorkerManager(int(max_cores)))
-	server.register_instance(AccessSync(1))
+	server.register_instance(AccessSync(int(max_leases)))
 	server.serve_forever()

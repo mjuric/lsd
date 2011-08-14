@@ -7,6 +7,7 @@ import json
 import re
 import logging
 import os
+import time
 
 from . import utils
 
@@ -51,8 +52,8 @@ class Credentials(utils.Namespace):
 	user = None
 	access = False
 
-	def __bool__(self):
-		return bool(access)
+	def __nonzero__(self):
+		return bool(self.access)
 
 class AllowAllAccessControl:	# Allow access to everyone, recording their username if they login
 	def login(self, user):
@@ -98,14 +99,14 @@ class SimpleAccessControl:
 
 		return None
 
-class PyRPCServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+class Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
 	funcs = None		# Function name->Callable dictionary
 	instances = None	# Object instances with functions
 
 	timeout = float(os.getenv("PYRPCTIMEOUT", "30."))		# Timeout before the connection is presumed dead and dropped
 
 	def __init__(self, host, port, *args, **kwargs):
-		socketserver.TCPServer.__init__(self, (host, port), PyRPCHandler, *args, **kwargs)
+		socketserver.TCPServer.__init__(self, (host, port), Handler, *args, **kwargs)
 		self.funcs = dict()
 		self.instances = set()
 
@@ -132,7 +133,11 @@ class PyRPCServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 		raise RPCError('Unknown function %s' % func)
 
 	def register_instance(self, instance):
-		instance._server = self
+		try:
+			instance._server = self
+		except AttributeError:
+			pass
+
 		self.instances.add(instance)
 
 		for hook_dispatcher in dir(self):
@@ -150,7 +155,11 @@ class PyRPCServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 				pass
 
 	def register_function(self, func, name=None):
-		func._server = self
+		try:
+			func._server = self
+		except AttributeError:
+			pass
+
 		if name is None:
 			name = func.__name__
 
@@ -174,7 +183,6 @@ class PyRPCServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 			context = utils.Namespace(client_address=client_address, creds=creds)
 			return self._get_func(func)(*args, _context=context)
 		except TypeError as err:
-			print err
 			return self._get_func(func)(*args)
 
 	#
@@ -201,7 +209,7 @@ class PyRPCServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 		for fun in getattr(self, '_disconnect_callbacks', ()):
 			fun(_context=context)
 
-class PyRPCHandler(socketserver.StreamRequestHandler):
+class Handler(socketserver.StreamRequestHandler):
 	creds = Credentials()		# The currently logged-in users' credentials
 
 	def encode(self, v):
@@ -225,11 +233,10 @@ class PyRPCHandler(socketserver.StreamRequestHandler):
 		return socketserver.StreamRequestHandler.setup(self)
 
 	def finish(self):
-		logger.info("[%s %s] Connection closed" % (self.formatted_addr, self.creds.user))
-
-		# Call __disconnect_ hook in server
+		# Call __disconnect__ hook in server
 		self.server.on_disconnect(self.client_address, self.creds)
 
+		logger.info("[%s %s] Connection closed" % (self.formatted_addr, self.creds.user))
 		return socketserver.StreamRequestHandler.finish(self)
 
 	def handle(self):
@@ -241,12 +248,12 @@ class PyRPCHandler(socketserver.StreamRequestHandler):
 
 				line = line.strip()
 				if len(line) == 0:
-					logger.info("[%s %s] HEARTBEAT" % (self.formatted_addr, self.creds.user))
+#					logger.info("[%s %s] HEARTBEAT" % (self.formatted_addr, self.creds.user))
 					continue			# Empty lines/heartbeats
 
 				tokens = line.split(None, 1) + [ "[]" ]
 				func, args = tokens[:2]
-				logger.info("[%s %s] CALL %s %s" % (self.formatted_addr, self.creds.user, func, args))
+#				logger.info("[%s %s] CALL %s %s" % (self.formatted_addr, self.creds.user, func, args))
 
 				# Check for authorization
 				if func[0] == '_' or not self.server.on_auth(self.creds, func):
@@ -265,98 +272,66 @@ class PyRPCHandler(socketserver.StreamRequestHandler):
 				# Return the result
 				self.rpc_return("RESULT", result)
 
-				logger.info("[%s %s] RESULT %s" % (self.formatted_addr, self.creds.user, self.encode(result)))
+#				logger.info("[%s %s] RESULT %s" % (self.formatted_addr, self.creds.user, self.encode(result)))
 			except socket.timeout:
 				logger.info("[%s %s] Lost heartbeat - connection timed out." % (self.formatted_addr, self.creds.user))
 				break
 			except Exception as e:
-				import traceback
-				traceback.print_exc()
-
 				logger.info("[%s %s] RESULT %s" % (self.formatted_addr, self.creds.user, e))
 				self.rpc_return("FAULT", str(e))
 
-class PyRPCProxy(object):
-	_sock = None	# Socket connection to server
-	_rfile = None	# file-like object for reading from socket
-	_wfile = None	# file-like object for writing from socket
-	_lock = None	# lock protecting rfile/wfile/sock
+class Proxy(object):
+	_sock = None		# Socket connection to server
+	_rfile = None		# file-like object for reading from socket
+	_wfile = None		# file-like object for writing from socket
 
-	_heatbeat_interval = None	# The interval in which to send heartbeats to the server
-	_hbeat_run = True		# Whether to run a heartbeat thread or not
-	_hbeat = None			# The heatbeat timer thread
+	_lock = None		# lock protecting rfile/wfile/sock
+
+	_debug_stop_heartbeat = False	# For debugging: set to True to stop the heartbeat thread
 
 	def __init__(self, host, port, heartbeat_interval=5.):
 		# Set up the call lock
 		self._lock = threading.Lock()
 		self._addr = (host, port)
-		self._heartbeat_interval = heartbeat_interval
-		self._hbeat_run = False
 
-		#self._connect()
+		# Connect
+		self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		self._sock.connect(self._addr)
 
-	def _post_connect(self):
-		pass
+		self._rfile = self._sock.makefile('rb', -1)
+		self._wfile = self._sock.makefile('wb', 0)
 
-	def _connect(self):
-		if self._wfile is None:
-			self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-			self._sock.connect(self._addr)
+		# Start the hearbeat thread
+		th = threading.Thread(target=self._heartbeat_thread, args=(heartbeat_interval,))
+		th.daemon = True
+		th.start()
 
-			self._rfile = self._sock.makefile('rb', -1)
-			self._wfile = self._sock.makefile('wb', 0)
+	def _heartbeat_thread(self, interval):
+		try:
+			while not self._debug_stop_heartbeat:
+				time.sleep(interval)
+				with self._lock:
+					if self._sock is None:
+						break
+					self._wfile.write("\n")
+		except Exception as e:
+			logger.warning("Lost connection to %s:%s (%s)" % (self._addr[0], self._addr[1], e))
+			self._close()
+		finally:
+			self._debug_stop_heartbeat = False
 
-			self._post_connect()
-
-			# Start the hearbeat thread
-			self._hbeat_run = True
-			self._heartbeat()
-
-	# Deletion/closure of proxy object
 	def _close(self):
-		self._stop_heartbeat()
-
 		with self._lock:
-			try:
-				if self._rfile is not None: self._rfile.close()
-			except:
-				pass
-
-			try:
-				if self._wfile is not None: self._wfile.close()
-			except:
-				pass
-
-			try:
-				if self._sock  is not None: self._sock.close()
-			except:
-				pass
-
+			for obj in (self._rfile, self.wfile, self._sock):
+				try:
+					if obj is not None:
+						self.obj.close()
+				except:
+					pass
 			self._rfile = self._wfile = self._sock = None
 
 	def __del__(self):
 		self._close()
-
-	## Heatbeat methods
-	def _heartbeat(self):
-		try:
-			with self._lock:
-				self._wfile.write("\n")
-
-				# Schedule next firing
-				if self._hbeat_run:
-					self._hbeat = threading.Timer(self._heartbeat_interval, self._heartbeat)
-					self._hbeat.daemon = True
-					self._hbeat.start()
-		except Exception as e:
-			logger.warning("Lost connection to %s:%s (%s)" % (self._addr[0], self._addr[1], e))
-
-	def _stop_heartbeat(self):
-		with self._lock:
-			if self._hbeat:
-				self._hbeat.cancel()
-				self._hbeat = None
-				self._hbeat_run = False
 
 	# Remote procedure caller
 	class _Method:
@@ -367,14 +342,16 @@ class PyRPCProxy(object):
 		def __call__(self, *args):
 			return self.__call(self.__func, args)
 
-	def __call(self, func, args):
+	def _call(self, func, args):
 		a = escape_nl(json.dumps(args))
 
 		try:
-			self._connect()
 			with self._lock:
+				if not self._sock:
+					raise RPCError("Calling a method on a closed connection.")
+
 				self._wfile.write("%s %s\n" % (func, a))	# Request
-				line = self._rfile.readline().strip()	# Response
+				line = self._rfile.readline().strip()		# Response
 		except socket.error as e:
 			# Pass any socket error as RPCError
 			raise RPCError(str(e))
@@ -382,7 +359,7 @@ class PyRPCProxy(object):
 		# Check if the server hung up on us
 		if line == '':
 			self._close()
-			raise RPCError("Connection closed")
+			raise RPCError("Connection closed by server")
 
 		# Parse the return
 		status, data = line.split(None, 1)
@@ -392,7 +369,101 @@ class PyRPCProxy(object):
 		raise RPCError(data)
 
 	def __getattr__(self, func):
-		return self._Method(self.__call, func)
+		return self._Method(self._call, func)
+
+class StatelessProxy(object):
+	""" A proxy that acts as if it's connection-less. It will
+	    also transparently handle being duplicated by a fork().
+	"""
+	_proxy = None
+	_pid = None
+
+	def __init__(self, *args, **kwargs):
+		self._init_args = (args, kwargs)
+		self._pid = os.getpid()
+
+	def _startup(self):
+		# To be overridden by the user to do any initialization
+		# when the connection to the RPC server has been established
+		# (typically, logging in)
+		pass
+
+	def __getattr__(self, func):
+		return Proxy._Method(self._call, func)
+
+	def _call(self, func, args):
+		try:
+			# Test if we got forked while not looking
+			if self._pid != os.getpid():
+				self._close()
+
+			if self._proxy is None:
+				self._proxy = Proxy(*self._init_args[0], **self._init_args[1])
+				self._pid = os.getpid()
+				self._startup()
+
+			return self._proxy._call(func, args)
+		except RPCError as e:
+			# If anything went wrong, delete the proxy
+			self._proxy = None
+			raise
+
+	def _close(self):
+		if self._proxy is not None:
+			self._proxy._close()
+			self._proxy = None
+
+	def __del__(self):
+		self._close()
+
+class CachingProxy(StatelessProxy):
+	_defaults_obj = None	# Object whose methods will be called if RPC call fails
+	_retry_interval = 0	# Interval during which we won't retry RPC calls after one fails
+
+	_next_try = None
+	_cache = None
+
+	def __init__(self, host, port, defaults=None, retry_interval=0, cache_for=0, *args, **kwargs):
+		self._defaults_obj = defaults
+		self._retry_interval = retry_interval
+		self._cache_for = cache_for
+		self._cache = {}
+
+		StatelessProxy.__init__(self, host, port, *args, **kwargs)
+
+	def _startup(self):
+		if self._defaults_obj:
+			try:
+				f = self._defaults_obj._startup
+			except AttributeError as e:
+				return
+
+			return f(self)
+
+	def _call(self, func, args):
+		# See if it's cached and unexpired
+		try:
+			(expires, result) = self._cache[func]
+			if expires > time.time():
+				return result
+		except KeyError:
+			expires = None
+
+		try:
+			# Invoke the RPC on the remote
+			result = StatelessProxy._call(self, func, args)
+			cache_for = self._cache_for
+		except (RPCError, socket.error) as e:
+			# Problem connecting to remote; get a result from defaults
+			# unless an old cached value exists
+			if expires is None:
+				result = getattr(self._defaults_obj, func)(*args)
+			cache_for = self._retry_interval
+
+		expires = time.time() + cache_for
+		self._cache[func] = (expires, result)
+
+		return result
 
 ########### Unit tests
 
@@ -413,7 +484,7 @@ def test_escape_nl():
 
 		assert us == s
 
-class TestPyRPCProxy:
+class TestProxy:
 	host, port = "localhost", 0
 
 	@classmethod
@@ -426,10 +497,11 @@ class TestPyRPCProxy:
 		logging.basicConfig(format=format, datefmt=datefmt, level=level)
 
 		# Instantiate a server
-		server = PyRPCServer(cls.host, cls.port)
+		server = Server(cls.host, cls.port)
 		cls.host, cls.port = server.server_address
 
 		server.register_instance(SimpleAccessControl({'mjuric': 'bla'}))
+		server.register_function(time.time)
 		server.register_function(foo)
 		server.register_function(bla)
 		server.register_instance(A())
@@ -439,15 +511,15 @@ class TestPyRPCProxy:
 
 	@classmethod
 	def tearDownClass(cls):
-		svr = PyRPCProxy(cls.host, cls.port)
+		svr = Proxy(cls.host, cls.port)
 		svr.login("mjuric", "bla")
 		svr.shutdown()
 		svr._close()
 
 	def test_connect(self):
-		""" PyRPCProxy: Connect and run """
+		""" Proxy: Connect and run """
 		# Run a number of calls against the server
-		svr = PyRPCProxy(self.host, self.port)
+		svr = Proxy(self.host, self.port)
 
 		assert svr.login("mjuric", "bla")
 		assert svr.foo(10) == 52
@@ -457,27 +529,85 @@ class TestPyRPCProxy:
 
 		svr._close()
 
+	def test_defaults(self):
+		""" CachingProxy: Test if defaults work """
+		# Run a number of calls against the server
+
+		class Defaults(object):
+			def login(self, user, passwd):
+				return True
+
+			def echo(self, x):
+				return "FB: %s" % x
+
+		svr = CachingProxy(self.host, self.port+1, defaults=Defaults())
+		assert svr.login("mjuric", "bla")
+		assert svr.echo("aa") == "FB: aa"
+
+		svr._close()
+
+	def test_caching(self):
+		""" CachingProxy: Test if caching works """
+		# Run a number of calls against the server
+
+		class Defaults(object):
+			def _startup(self, proxy):
+				proxy.login("mjuric", "bla")
+
+		svr = CachingProxy(self.host, self.port, defaults=Defaults(), cache_for=4)
+		assert svr.echo("aa") == "aa"
+		t0 = svr.time()
+		time.sleep(2)
+		t1 = svr.time()
+		assert t0 == t1
+		time.sleep(3)
+		t2 = svr.time()
+		assert t0 != t2
+
+		svr._close()
+
+	def test_inexistent(self):
+		""" Proxy: Invoke a function that does not exist """
+		# Run a number of calls against the server
+		svr = Proxy(self.host, self.port)
+
+		assert svr.login("mjuric", "bla")
+
+		try:
+			svr.not_there()
+			assert 0, "Should have failed"
+		except RPCError as e:
+			pass
+
+		svr._close()
 
 	def test_timeout(self):
-		""" PyRPCProxy: Timeouts """
+		""" StatelessProxy: Timeouts """
 		import time
 
 		# Connect once to reset the timeout to 1 (the new timeout does not apply until
 		# the next connection)
 		print "Reducing timeout to 1 second"
-		svr = PyRPCProxy(self.host, self.port)
+		svr = Proxy(self.host, self.port)
 		assert svr.login("mjuric", "bla")
 		old_timeout = svr.set_timeout(1.)
 		svr._close()
 
-		print "Sleeping for 5 sec (heartbeats should keep us alive)"
-		svr = PyRPCProxy(self.host, self.port, heartbeat_interval=0.5)
-		assert svr.login("mjuric", "bla")
-		time.sleep(5)
+		class MyProxy(StatelessProxy):
+			def _startup(self):
+				print "In startup, logging in"
+				assert self.login("mjuric", "bla")
+
+		print "Sleeping for 3 sec (heartbeats should keep us alive)"
+		svr = MyProxy(self.host, self.port, heartbeat_interval=0.5)
+		assert svr.echo("All OK") == "All OK"
+		time.sleep(3)
 
 		print "Stopping heartbeats. We should get disconnected."
-		svr._stop_heartbeat()
-		time.sleep(1)
+		svr._proxy._debug_stop_heartbeat = True
+		while svr._proxy._debug_stop_heartbeat:	# Wait for the heartbeat thread to exit
+			time.sleep(0.2)
+		time.sleep(2)				# Wait for the server to kick us out
 		try:
 			svr.bar()
 			assert 0, "Should have failed"
@@ -485,7 +615,7 @@ class TestPyRPCProxy:
 			pass
 
 		print "Reconnecting and checking if heartbeats will restart."
-		assert svr.login("mjuric", "bla")
+		assert svr.echo("All OK") == "All OK"
 		svr.bar()
 		time.sleep(2)
 		try:
@@ -495,7 +625,7 @@ class TestPyRPCProxy:
 		svr._close()
 
 		print "Returning timeout to old value"
-		svr = PyRPCProxy(self.host, self.port, heartbeat_interval=0.5)
+		svr = Proxy(self.host, self.port, heartbeat_interval=0.5)
 		svr.login("mjuric", "bla")
 		svr.set_timeout(old_timeout)
 		svr._close()
@@ -514,7 +644,7 @@ class TestPyRPCProxy:
 				self.e = e
 
 	def test_mt_connect(self):
-		""" PyRPCProxy: Connection flood """
+		""" Proxy: Connection flood """
 
 		objs = [ self.mt_helper(self) for _ in xrange(10) ]
 		threads = [ threading.Thread(target=o.run) for o in objs ]
@@ -550,7 +680,7 @@ class A(object):
 ############
 
 if __name__ == "__main__":
-	#x = TestPyRPCProxy()
+	#x = TestProxy()
 	#x.test_timeout()
 	#exit()
 
@@ -561,7 +691,7 @@ if __name__ == "__main__":
 	logging.basicConfig(format=format, datefmt=datefmt, level=level)
 
 	host, port = "localhost", 1234
-	server = PyRPCServer(host, port)
+	server = Server(host, port)
 	server.register_instance(SimpleAccessControl({'mjuric': 'bla'}))
 	server.register_function(foo)
 	server.register_function(bla)

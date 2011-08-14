@@ -95,7 +95,7 @@ formatters:
 handlers:
   console:
     class: logging.StreamHandler
-    level: INFO
+    level: WARNING
     formatter: simple
     stream: ext://sys.stderr
   file:
