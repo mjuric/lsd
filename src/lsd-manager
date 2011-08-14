@@ -4,14 +4,15 @@ import multiprocessing
 import logging
 import threading
 import sys, os
-from lsd.pyrpc import PyRPCServer
+import time
+from lsd.pyrpc import PyRPCServer, AllowAllAccessControl
 from lsd.tui import *
 
 ########### Simple check-in server
 
 logger = logging.getLogger()
 
-class ActiveWorkerManager:
+class WorkerManager:
 	_lock = None
 	_pools = None
 	
@@ -21,29 +22,87 @@ class ActiveWorkerManager:
 		self._maxcores = maxcores
 		logger.info("LSD manager started, maxcores=%d" % (self._maxcores,))
 
-	def __connect__(self, client_address):
+	def register_workers(self, nworkers, _context):
+		client_address = _context.client_address
 		with self._lock:
 			assert client_address not in self._pools
 			self._pools[client_address] = 1
-			logger.info("%s:%s connected (%d active connections)" % (client_address[0], client_address[1], len(self._pools)))
+			cli_info = "%s:%s %s" % (_context.client_address + (_context.creds.user, ))
+			logger.info("[%s] [WorkerManager] begun managing (%d active connections)" % (cli_info, len(self._pools)))
 
-	def __disconnect__(self, client_address):
+	def __disconnect__(self, _context):
 		with self._lock:
-			del self._pools[client_address]
-			logger.info("%s:%s disconnected (%d active connections)" % (client_address[0], client_address[1], len(self._pools)))
+			if _context.client_address not in self._pools:
+				return
+			del self._pools[_context.client_address]
+			cli_info = "%s:%s %s" % (_context.client_address + (_context.creds.user, ))
+			logger.info("[%s] [WorkerManager] stopped managing (%d active connections)" % (cli_info, len(self._pools)))
 
 	def nworkers(self):
 		""" Return the number of workers the client should have active """
-		#ncores = multiprocessing.cpu_count()
 		ncores = self._maxcores
 
 		with self._lock:
 			nworkers = int(float(ncores) / len(self._pools))
-		
+
 		if nworkers == 0:
 			nworkers = 1
 
 		return nworkers
+
+class AccessSync:
+	_lock = None
+	_leases = None
+
+	def __init__(self, maxleases):
+		self._lock = threading.Lock()
+		self._leases = threading.BoundedSemaphore(maxleases)
+		self._leases_expire = dict()
+		self._maxleases = maxleases
+
+		self._lease_expiration_thread = threading.Thread(target=self._expire_leases)
+		self._lease_expiration_thread.daemon = True
+		self._lease_expiration_thread.start()
+
+		logger.info("AccessSync manager started, maxleases=%d" % (self._maxleases,))
+
+	def obtain_access_lease(self, fn, _context):
+		cli_info = "%s:%s %s" % (_context.client_address + (_context.creds.user, ))
+		logger.info("[%s] [AccessSync] requested lease for %s" % (cli_info, fn))
+
+		self._leases.acquire()
+		with self._lock:
+			self._leases_expire[_context.client_address] = time.time() + 10
+
+		logger.info("[%s] [AccessSync] acquired lease for %s" % (cli_info, fn))
+		return True
+
+	def relinquish_access_lease(self, fn, _context):
+		with self._lock:
+			try:
+				del self._leases_expire[_context.client_address]
+				self._leases.release()
+			except KeyError:
+				pass
+
+		cli_info = "%s:%s %s" % (_context.client_address + (_context.creds.user, ))
+		logger.info("[%s] [AccessSync] released lease for %s" % (cli_info, fn))
+
+		return True
+
+	def __disconnect__(self, _context):
+		self.relinquish_access_lease(None, _context)
+
+	def _expire_leases(self):
+		while True:
+			with self._lock:
+				t = time.time()
+				for lease, exptime in self._leases_expire.items():
+					if exptime > t:
+						continue
+					self._leases.release()
+					del self._leases_expire[lease]
+			time.sleep(1)
 
 def usage():
 	print "Usage: %s --quiet <max_cores>" % sys.argv[0]
@@ -52,6 +111,8 @@ if __name__ == "__main__":
 	optlist, (max_cores,) = tui_getopt('q', ['quiet'], 1, usage, stdopts=False)
 
 	# Instantiate a server
-	server = PyRPCServer("localhost", 9029)
-	server.register_instance(ActiveWorkerManager(int(max_cores)))
+	server = PyRPCServer("localhost", 9030)
+	server.register_instance(AllowAllAccessControl())
+	server.register_instance(WorkerManager(int(max_cores)))
+	server.register_instance(AccessSync(1))
 	server.serve_forever()

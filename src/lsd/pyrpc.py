@@ -8,6 +8,8 @@ import re
 import logging
 import os
 
+from . import utils
+
 logger = logging.getLogger('lsd.pyrpc')
 
 def escape_nl(s):
@@ -45,8 +47,19 @@ class RPCError(Exception):
 	def __init__(self, msg, *args, **kwargs):
 		Exception.__init__(self, msg, *args, **kwargs)
 
-class Credentials(dict):
-	pass
+class Credentials(utils.Namespace):
+	user = None
+	access = False
+
+	def __bool__(self):
+		return bool(access)
+
+class AllowAllAccessControl:	# Allow access to everyone, recording their username if they login
+	def login(self, user):
+		return Credentials(user=user, access=True)
+
+	def __auth__(self, creds, func):
+		return True
 
 class SimpleAccessControl:
 	users = None		# User->Password dictionary
@@ -60,22 +73,30 @@ class SimpleAccessControl:
 	def login(self, user, password):
 		""" Authorize access of user 'user' to the entire server """
 		if user in self.users and self.users[user] == password:
-			return Credentials([('user', user)])
+			return Credentials(user=user, access=True)
 		else:
 			return Credentials()
 
 	def __auth__(self, creds, func):
 		"""
 		Authorize access of user with credentials 'creds' to function 'func'
+		
+		Returns:
+			- True, if the access is positively granted
+			- False, if the access is explicitly denied
+			- None, if this object cannot decide whether to grant
+			  or deny access
 		"""
 		if func == "add_user":
 			return False
-		
+
 		if func == "login":
 			return True
 
 		if creds:
 			return True
+
+		return None
 
 class PyRPCServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 	funcs = None		# Function name->Callable dictionary
@@ -93,11 +114,20 @@ class PyRPCServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 		if func in self.funcs:
 			return self.funcs[func]
 		else:
+			f = []
 			for instance in self.instances:
 				try:
-					return getattr(instance, func)
+					f.append(getattr(instance, func))
 				except AttributeError:
 					pass
+
+			# Detect if there are multiple functions registered to the same name,
+			# saving the programmer from suffering bugs that'd be otherwise
+			# caused by this.
+			if len(f) == 1:
+				return f[0]
+			elif len(f) > 1:
+				raise RPCError('Ambiguous function "%s" (%d functions registered under that name)' % (func, len(f)))
 
 		raise RPCError('Unknown function %s' % func)
 
@@ -105,11 +135,17 @@ class PyRPCServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 		instance._server = self
 		self.instances.add(instance)
 
-		for hook in dir(self):
-			if hook[:3] != "on_": continue
+		for hook_dispatcher in dir(self):
+			if hook_dispatcher[:3] != "on_": continue
 			try:
-				name = "__%s__" % hook[3:]
-				setattr(self, hook, getattr(instance, name))
+				name = "__%s__" % hook_dispatcher[3:]
+				hook = getattr(instance, name)
+
+				tmp = "_%s_callbacks" % hook_dispatcher[3:]
+				callbacks = getattr(self, tmp, [])
+				setattr(self, tmp, callbacks)
+
+				callbacks.append(hook)
 			except AttributeError:
 				pass
 
@@ -117,29 +153,53 @@ class PyRPCServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 		func._server = self
 		if name is None:
 			name = func.__name__
+
+		if name in self.funcs:
+			raise Exception("Function names '%s' already registered." % name)
+
 		self.funcs[name] = func
 
-		for hook in dir(self):
-			if hook[:3] != "on_": continue
-			if name == '__%s__' % hook[3:]:
-				setattr(self, hook, func)
+		for hook_dispatcher in dir(self):
+			if hook_dispatcher[:3] != "on_": continue
+			if name == '__%s__' % hook_dispatcher[3:]:
+				tmp = "_%s_callbacks"
+				callbacks = getattr(self, tmp, [])
+				setattr(self, tmp, callbacks)
 
-	def _dispatch(self, func, args):
-		return self._get_func(func)(*args)
+				callbacks.append(func)
+
+	def _dispatch(self, func, args, client_address, creds):
+		try:
+			# Try passing extra context information
+			context = utils.Namespace(client_address=client_address, creds=creds)
+			return self._get_func(func)(*args, _context=context)
+		except TypeError as err:
+			print err
+			return self._get_func(func)(*args)
 
 	#
-	# Hooks, (re)set by register_instance/register_function
+	# Hooks, with callbacks filled by register_instance/register_function
 	#
 
 	def on_auth(self, creds, func):
-		""" Default authorization function """
-		return True
+		""" Authorization function dispatcher """
+		for auth in getattr(self, '_auth_callbacks', ()):
+			r = auth(creds, func)
+			if r is not None:
+				return r
 
-	def on_connect(self, client_address):
-		return True
+		return False
 
-	def on_disconnect(self, client_address):
-		return True
+	def on_connect(self, client_address, creds):
+		""" On-connect event dispatcher """
+		context = utils.Namespace(client_address=client_address, creds=creds)
+		for fun in getattr(self, '_connect_callbacks', ()):
+			fun(_context=context)
+
+	def on_disconnect(self, client_address, creds):
+		context = utils.Namespace(client_address=client_address, creds=creds)
+		for fun in getattr(self, '_disconnect_callbacks', ()):
+			fun(_context=context)
 
 class PyRPCHandler(socketserver.StreamRequestHandler):
 	creds = Credentials()		# The currently logged-in users' credentials
@@ -155,20 +215,20 @@ class PyRPCHandler(socketserver.StreamRequestHandler):
 
 	def setup(self):
 		self.formatted_addr = "%s:%s" % self.client_address
-		logger.info("[%s] Connection opened" % self.formatted_addr)
+		logger.info("[%s %s] Connection opened" % (self.formatted_addr, self.creds.user))
 
 		# Call __connect__ hook in server
-		self.server.on_connect(self.client_address)
+		self.server.on_connect(self.client_address, self.creds)
 
 		self.timeout = self.server.timeout
 
 		return socketserver.StreamRequestHandler.setup(self)
 
 	def finish(self):
-		logger.info("[%s] Connection closed" % self.formatted_addr)
+		logger.info("[%s %s] Connection closed" % (self.formatted_addr, self.creds.user))
 
 		# Call __disconnect_ hook in server
-		self.server.on_disconnect(self.client_address)
+		self.server.on_disconnect(self.client_address, self.creds)
 
 		return socketserver.StreamRequestHandler.finish(self)
 
@@ -181,12 +241,12 @@ class PyRPCHandler(socketserver.StreamRequestHandler):
 
 				line = line.strip()
 				if len(line) == 0:
-					logger.info("[%s] HEARTBEAT" % (self.formatted_addr,))
+					logger.info("[%s %s] HEARTBEAT" % (self.formatted_addr, self.creds.user))
 					continue			# Empty lines/heartbeats
 
 				tokens = line.split(None, 1) + [ "[]" ]
 				func, args = tokens[:2]
-				logger.info("[%s] CALL %s %s" % (self.formatted_addr, func, args))
+				logger.info("[%s %s] CALL %s %s" % (self.formatted_addr, self.creds.user, func, args))
 
 				# Check for authorization
 				if func[0] == '_' or not self.server.on_auth(self.creds, func):
@@ -194,21 +254,26 @@ class PyRPCHandler(socketserver.StreamRequestHandler):
 
 				# Parse the arguments and call the function
 				args = self.decode(args)
-				result = self.server._dispatch(func, args)
+				result = self.server._dispatch(func, args, self.client_address, self.creds)
 
 				# Check for special results
 				if isinstance(result, Credentials):
-					self.creds, result = result, len(result) != 0
+					if result:
+						self.creds = result
+					result = bool(result)
 
 				# Return the result
 				self.rpc_return("RESULT", result)
 
-				logger.info("[%s] RESULT %s" % (self.formatted_addr, self.encode(result)))
+				logger.info("[%s %s] RESULT %s" % (self.formatted_addr, self.creds.user, self.encode(result)))
 			except socket.timeout:
-				logger.info("[%s] Lost heartbeat - connection timed out." % (self.formatted_addr))
+				logger.info("[%s %s] Lost heartbeat - connection timed out." % (self.formatted_addr, self.creds.user))
 				break
 			except Exception as e:
-				logger.info("[%s] RESULT %s" % (self.formatted_addr, e))
+				import traceback
+				traceback.print_exc()
+
+				logger.info("[%s %s] RESULT %s" % (self.formatted_addr, self.creds.user, e))
 				self.rpc_return("FAULT", str(e))
 
 class PyRPCProxy(object):
@@ -230,6 +295,9 @@ class PyRPCProxy(object):
 
 		#self._connect()
 
+	def _post_connect(self):
+		pass
+
 	def _connect(self):
 		if self._wfile is None:
 			self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -238,12 +306,14 @@ class PyRPCProxy(object):
 			self._rfile = self._sock.makefile('rb', -1)
 			self._wfile = self._sock.makefile('wb', 0)
 
+			self._post_connect()
+
 			# Start the hearbeat thread
 			self._hbeat_run = True
 			self._heartbeat()
 
 	# Deletion/closure of proxy object
-	def close(self):
+	def _close(self):
 		self._stop_heartbeat()
 
 		with self._lock:
@@ -265,7 +335,7 @@ class PyRPCProxy(object):
 			self._rfile = self._wfile = self._sock = None
 
 	def __del__(self):
-		self.close()
+		self._close()
 
 	## Heatbeat methods
 	def _heartbeat(self):
@@ -311,7 +381,7 @@ class PyRPCProxy(object):
 
 		# Check if the server hung up on us
 		if line == '':
-			self.close()
+			self._close()
 			raise RPCError("Connection closed")
 
 		# Parse the return
@@ -372,7 +442,7 @@ class TestPyRPCProxy:
 		svr = PyRPCProxy(cls.host, cls.port)
 		svr.login("mjuric", "bla")
 		svr.shutdown()
-		svr.close()
+		svr._close()
 
 	def test_connect(self):
 		""" PyRPCProxy: Connect and run """
@@ -385,7 +455,7 @@ class TestPyRPCProxy:
 		for s in ['true', '\n', '\\n', '[ a, "foo\nbar"]\nSomething else', 'B\\\nla\nGla\\\n']:
 			assert svr.echo(s) == s
 
-		svr.close()
+		svr._close()
 
 
 	def test_timeout(self):
@@ -398,7 +468,7 @@ class TestPyRPCProxy:
 		svr = PyRPCProxy(self.host, self.port)
 		assert svr.login("mjuric", "bla")
 		old_timeout = svr.set_timeout(1.)
-		svr.close()
+		svr._close()
 
 		print "Sleeping for 5 sec (heartbeats should keep us alive)"
 		svr = PyRPCProxy(self.host, self.port, heartbeat_interval=0.5)
@@ -422,13 +492,13 @@ class TestPyRPCProxy:
 			svr.bar()
 		except RPCError as e:
 			assert 0, "Failed to keep connection"
-		svr.close()
+		svr._close()
 
 		print "Returning timeout to old value"
 		svr = PyRPCProxy(self.host, self.port, heartbeat_interval=0.5)
 		svr.login("mjuric", "bla")
 		svr.set_timeout(old_timeout)
-		svr.close()
+		svr._close()
 
 	####
 	# Launch a number of concurrent connection requests towards the server

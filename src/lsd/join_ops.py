@@ -1710,7 +1710,8 @@ class DB(object):
 			# Otherwise, import everything into top-level namespace
 			try:
 				lname = m.__lsd_name__
-				udf_dest = utils.Namespace(lname)
+				udf_dest = utils.Namespace()
+				setattr(udf_dest, '__name__', lname)
 				setattr(target, lname, udf_dest)
 			except AttributeError:
 				udf_dest = target
@@ -1723,7 +1724,8 @@ class DB(object):
 				setattr(udf_dest, name, item)
 
 		# Create a new module namespace
-		udfs = utils.Namespace('udfs')
+		udfs = utils.Namespace()
+		setattr(udfs, '__name__', 'udfs')
 
 		# Load UDFs from the paths in reverse, so newer overwrite older
 		for path in reversed(pathlist):

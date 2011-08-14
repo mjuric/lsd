@@ -23,8 +23,12 @@ from pixelization import Pixelization
 from collections  import OrderedDict
 from contextlib   import contextmanager
 from colgroup     import ColGroup
+from .pyrpc       import PyRPCProxy, RPCError
 
 logger = logging.getLogger("lsd.table")
+
+_mgr = None
+_mgr_pid = 0
 
 class BLOBAtom(tables.ObjectAtom):
 	"""
@@ -945,35 +949,54 @@ class Table:
 		Employs no locking of any kind.
 		"""
 
-		if mode == 'r':
-			fn_r = self._tablet_file(cell_id, cgroup)
-		        # --- hack: preload the entire file to have it appear in filesystem cache
-		        #     this will speed up subsequent random reads within the file
-			with open(fn_r) as f:
-				f.read()
-			# ---
-			fp = tables.openFile(fn_r)
-		elif mode == 'r+':
-			self._check_transaction()
-			fn_w = self._tablet_file(cell_id, cgroup, mode='w')
-			if os.path.isfile(fn_w):
-				fp = tables.openFile(fn_w, mode='a')
-			elif self.tablet_exists(cell_id, cgroup): 	# Note: this will download the tablet from remote, if needed
-				# A file exists in an older snapshot. Copy it over here.
+		# Obtain a proxy to file access manager
+		global _mgr, _mgr_pid
+		if _mgr_pid != os.getpid():
+			print "NEW PROCESS: %s -> %s" % (_mgr_pid, os.getpid())
+			_mgr_pid = os.getpid()
+			_mgr = PyRPCProxy("localhost", 9030)
+
+		try:
+			leased = _mgr.obtain_access_lease(str((cell_id, cgroup, mode)))
+		except RPCError:
+			leased = False
+		
+		try:
+			if mode == 'r':
 				fn_r = self._tablet_file(cell_id, cgroup)
-				assert fn_r != fn_w, (fn_r, fn_w)
-				shutil.copy(fn_r, fn_w)
-				os.chmod(fn_w, 0664)	# Ensure it's writable
-				fp = tables.openFile(fn_w, mode='a')
-			else:
-				# No file exists
+			        # --- hack: preload the entire file to have it appear in filesystem cache
+			        #     this will speed up subsequent random reads within the file
+				with open(fn_r) as f:
+					f.read()
+				# ---
+				fp = tables.openFile(fn_r)
+			elif mode == 'r+':
+				self._check_transaction()
+				fn_w = self._tablet_file(cell_id, cgroup, mode='w')
+				if os.path.isfile(fn_w):
+					fp = tables.openFile(fn_w, mode='a')
+				elif self.tablet_exists(cell_id, cgroup): 	# Note: this will download the tablet from remote, if needed
+					# A file exists in an older snapshot. Copy it over here.
+					fn_r = self._tablet_file(cell_id, cgroup)
+					assert fn_r != fn_w, (fn_r, fn_w)
+					shutil.copy(fn_r, fn_w)
+					os.chmod(fn_w, 0664)	# Ensure it's writable
+					fp = tables.openFile(fn_w, mode='a')
+				else:
+					# No file exists
+					fp = self._create_tablet(fn_w, cgroup)
+			elif mode == 'w':
+				self._check_transaction()
+				fn_w = self._tablet_file(cell_id, cgroup, mode='w')
 				fp = self._create_tablet(fn_w, cgroup)
-		elif mode == 'w':
-			self._check_transaction()
-			fn_w = self._tablet_file(cell_id, cgroup, mode='w')
-			fp = self._create_tablet(fn_w, cgroup)
-		else:
-			raise Exception("Mode must be one of 'r', 'r+', or 'w'")
+			else:
+				raise Exception("Mode must be one of 'r', 'r+', or 'w'")
+		finally:
+			if leased:
+				try:
+					_mgr.relinquish_access_lease(str((cell_id, cgroup, mode)))
+				except RPCError:
+					pass
 
 		return fp
 

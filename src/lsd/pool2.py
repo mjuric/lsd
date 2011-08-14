@@ -17,6 +17,7 @@ import traceback
 import platform
 import logging
 import signal
+import getpass
 from utils import unpack_callable
 
 logger = logging.getLogger('lsd.pool2')
@@ -327,7 +328,7 @@ class Pool:
 			try:
 				self._ntarget = min(_mgr.nworkers(), self.nworkers)
 			except RPCError:
-				_mgr.close()
+				_mgr._close()
 				logger.warning("Error contacting lsd-manager. Cannot coordinate resource usage with others, using %d cores." % self._ntarget)
 				pass
 			self._ntarget_time = time.time()
@@ -356,7 +357,12 @@ class Pool:
 		if parallel:
 			try:
 				# Create workers (if not created already)
-				_mgr = PyRPCProxy("localhost", 9029)
+				_mgr = PyRPCProxy("localhost", 9030)
+				def post_connect(self, user=getpass.getuser(), nworkers=self.nworkers):
+					# Called every time we (re)connect
+					self.login(user);
+					self.register_workers(nworkers)
+				_mgr._post_connect = post_connect.__get__(_mgr, _mgr.__class__) # See http://stackoverflow.com/questions/962962/python-changing-methods-and-attributes-at-runtime about this idiom
 				self._create_workers()
 
 				# Connect to worker manager and stop workers over the limit
@@ -452,7 +458,7 @@ class Pool:
 			finally:
 				# Make sure the connection to manager is closed (e.g., if an
 				# exception is thrown)
-				_mgr.close()
+				_mgr._close()
 		else:
 			# Execute in-thread, without external workers
 			for (i, item) in enumerate(input):
