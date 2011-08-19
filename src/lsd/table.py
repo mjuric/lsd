@@ -388,7 +388,9 @@ class Table:
 		else:
 			raise Exception("Invalid mode '%s'" % mode)
 
-		return '%s/tablets/%s' % (self._snapshot_path(snapid), self.pix.path_to_cell(cell_id))
+		path = self.catalog.path_to_cell(snapid, cell_id)
+
+		return '%s/tablets/%s' % (self._snapshot_path(snapid), path)
 
 	def _tablet_filename(self, cgroup):
 		""" Return the filename of a tablet of the given cgroup """
