@@ -850,7 +850,7 @@ class Table:
 		logger.debug("Released lock %s" % (lock))
 
 	#### Low level tablet creation/access routines. These employ no locking
-	def _get_row_group(self, fp, group, cgroup):
+	def _get_row_group(self, node, group, cgroup):
 		"""
 		Get a handle to the given HDF5 node.
 		
@@ -868,17 +868,22 @@ class Table:
 		"""
 		assert group in ['main', 'cached']
 
-		g = getattr(fp.root, group, None)
+		if isinstance(node, tables.File):
+		        node = node.root
+
+		g = getattr(node, group, None)
 
 		if g is None:
+		        fp = node._v_file
+		        path = node._v_pathname + '/' + group
 			schema = self._get_schema(cgroup)
 
 			# cgroup
 			filters      = schema.get('filters', self._filters)
 			expectedrows = schema.get('expectedrows', 20*1000*1000)
 
-			fp.createTable('/' + group, 'table', np.dtype(schema["columns"]), createparents=True, expectedrows=expectedrows, filters=tables.Filters(**filters))
-			g = getattr(fp.root, group)
+			fp.createTable(path, 'table', np.dtype(schema["columns"]), createparents=True, expectedrows=expectedrows, filters=tables.Filters(**filters))
+			g = getattr(node, group)
 
 			# Primary key sequence
 			if group == 'main' and 'primary_key' in schema:
@@ -898,7 +903,7 @@ class Table:
 					else:
 						atom = tables.Atom.from_dtype(np.dtype(type))
 
-					fp.createVLArray('/' + group +'/blobs', blobcol, atom, "BLOBs", createparents=True, filters=tables.Filters(**filters), expectedsizeinMB=expectedsizeinMB)
+					fp.createVLArray(path + '/blobs', blobcol, atom, "BLOBs", createparents=True, filters=tables.Filters(**filters), expectedsizeinMB=expectedsizeinMB)
 					
 					b = getattr(g.blobs, blobcol)
 					if isinstance(atom, BLOBAtom):
@@ -919,9 +924,9 @@ class Table:
 			for cgroup in self._cgroups:
 				if self._is_pseudotablet(cgroup):
 					continue
-				with cell.open(cgroup) as fp:
-					if group in fp.root:
-						fp.removeNode('/', group, recursive=True);
+				with cell.open(cgroup) as node:
+					if group in node:
+						getattr(node, group)._f_remove(recursive=True);
 
 	class _TabletFile(object):
 		""" Wrap the tables.File object, adding lease requesting.
@@ -940,7 +945,7 @@ class Table:
 				_mgr.release_file_lease(self._x_fn)
 			return self._x_fp.close()
 
-	def _create_tablet(self, fn, cgroup):
+	def _create_tablet(self, fn, cell_id, cgroup):
 		"""
 		Create a new tablet.
 		
@@ -960,10 +965,13 @@ class Table:
 		logger.debug("Creating tablet %s" % (fn))
 		fp  = self._TabletFile(fn, mode='w')
 
-		# Force creation of the main subgroup
-		self._get_row_group(fp, 'main', cgroup)
+		# Create cell_id group
+		node = fp.createGroup('/', 'c%d' % cell_id, 'Cell %d' % cell_id)
 
-		return fp
+		# Force creation of the main subgroup
+		self._get_row_group(node, 'main', cgroup)
+
+		return node
 
 	def _open_tablet(self, cell_id, cgroup, mode='r'):
 		"""
@@ -1009,15 +1017,19 @@ class Table:
 				fp = self._TabletFile(fn_w, mode='a')
 			else:
 				# No file exists
-				fp = self._create_tablet(fn_w, cgroup)
+				fp = self._create_tablet(fn_w, cell_id, cgroup)._v_file
 		elif mode == 'w':
 			self._check_transaction()
 			fn_w = self._tablet_file(cell_id, cgroup, mode='w')
-			fp = self._create_tablet(fn_w, cgroup)
+			fp = self._create_tablet(fn_w, cell_id, cgroup)._v_file
 		else:
 			raise Exception("Mode must be one of 'r', 'r+', or 'w'")
 
-		return fp
+		# Find the node corresponding to cell_id. Default to fp.root for
+		# v0.5.x style tables
+		node = getattr(fp.root, 'c%d' % cell_id, fp.root)
+
+		return node
 
 	### Public methods
 	def __init__(self, path, snapid, open_transaction, mode='r', name=None):
@@ -1244,8 +1256,8 @@ class Table:
 					continue
 
 				# Get the tablet file handles
-				fp    = self._open_tablet(cur_cell_id, mode='r+', cgroup=cgroup)
-				g     = self._get_row_group(fp, group, cgroup)
+				node  = self._open_tablet(cur_cell_id, mode='r+', cgroup=cgroup)
+				g     = self._get_row_group(node, group, cgroup)
 				t     = g.table
 				blobs = schema['blobs'] if 'blobs' in schema else dict()
 
@@ -1318,7 +1330,7 @@ class Table:
 
 					# Resolve blobs, merge them with ours (and immediately delete)
 					for colname in colsB:
-						bb = self._fetch_blobs_fp(fp, colname, rows[colname])
+						bb = self._fetch_blobs_fp(node, colname, rows[colname])
 						len0 = len(bb)
 						bb = np.resize(bb, (nrows + nnew,) + bb.shape[1:])
 						# Since np.resize fills the newly allocated part with zeros, change it to None
@@ -1330,10 +1342,10 @@ class Table:
 
 					# Close and reopen (otherwise truncate appears to have no effect)
 					# -- bug in PyTables ??
-					logger.debug("Closing tablet (%s)" % (fp.filename))
-					fp.close()
-					fp = self._open_tablet(cur_cell_id, mode='r+', cgroup=cgroup)
-					g  = self._get_row_group(fp, group, cgroup)
+					logger.debug("Closing tablet (%s)" % (node._v_file.filename))
+					node._v_file.close()
+					node = self._open_tablet(cur_cell_id, mode='r+', cgroup=cgroup)
+					g  = self._get_row_group(node, group, cgroup)
 					t  = g.table
 
 					# Enlarge the array to accommodate new rows (this will also set them to zero)
@@ -1396,8 +1408,8 @@ class Table:
 #					print 'LEN:', colname, bsize, len(barray), ito
 
 				t.append(rows)
-				logger.debug("Closing tablet (%s)" % (fp.filename))
-				fp.close()
+				logger.debug("Closing tablet (%s)" % (node._v_file.filename))
+				node._v_file.close()
 #				exit()
 
 			self._unlock_cell(lock)
@@ -1504,9 +1516,9 @@ class Table:
 
 		return blobs
 
-	def _fetch_blobs_fp(self, fp, column, refs, include_cached=False):
+	def _fetch_blobs_fp(self, node, column, refs, include_cached=False):
 		"""
-		Fetch the BLOBs referenced by refs from PyTables file object fp
+		Fetch the BLOBs referenced by refs from PyTables group node
 
 		The BLOB references are indices into a VLArray (variable
 		length array) in the HDF5 file. By convention, the indices
@@ -1519,8 +1531,8 @@ class Table:
 		
 		Parameters
 		----------
-		fp : table.File
-		    PyTables file object from which to load the BLOBs
+		node : table.Group
+		    PyTables group from which to load the BLOBs
 		column : string
 		    The column name of the BLOB column
 		refs : ndarray of int64
@@ -1542,12 +1554,12 @@ class Table:
 		refs = refs.reshape(refs.size)
 
 		# Load the blobs
-		b1 = getattr(fp.root.main.blobs, column)
-		if include_cached and 'cached' in fp.root:
+		b1 = getattr(node.main.blobs, column)
+		if include_cached and 'cached' in node:
 			# We have cached objects in 'cached' group -- read the blobs
 			# from there as well. blob refs of cached objects are
 			# negative.
-			b2 = getattr(fp.root.cached.blobs, column)
+			b2 = getattr(node.cached.blobs, column)
 
 			blobs = np.empty(len(refs), dtype=object)
 			blobs[refs >= 0] = self._smart_load_blobs(b1,   refs[refs >= 0]),
@@ -1560,7 +1572,7 @@ class Table:
 
 		return blobs
 
-	def fetch_blobs(self, cell_id, column, refs, include_cached=False, _fp=None):
+	def fetch_blobs(self, cell_id, column, refs, include_cached=False):
 		"""
 		Instantiate BLOBs for a given column.
 
@@ -1586,8 +1598,8 @@ class Table:
 
 		# load the blobs arrays
 		with self.lock_cell(cell_id) as cell:
-			with cell.open(cgroup) as fp:
-				blobs = self._fetch_blobs_fp(fp, column, refs, include_cached)
+			with cell.open(cgroup) as node:
+				blobs = self._fetch_blobs_fp(node, column, refs, include_cached)
 
 		return blobs
 
@@ -1638,10 +1650,10 @@ class Table:
 
 		if self.tablet_exists(cell_id, cgroup):	# Note: this will download the tablet from remote, if needed
 			with self.lock_cell(cell_id) as cell:
-				with cell.open(cgroup) as fp:
-					rows = fp.root.main.table.read()
-					if include_cached and 'cached' in fp.root:
-						rows2 = fp.root.cached.table.read()
+				with cell.open(cgroup) as node:
+					rows = node.main.table.read()
+					if include_cached and 'cached' in node:
+						rows2 = node.cached.table.read()
 						# Make any neighbor cache BLOBs negative (so that fetch_blobs() know to
 						# look for them in the cache, instead of 'main')
 						schema = self._get_schema(cgroup)
@@ -1675,9 +1687,9 @@ class Table:
 		nrows1 = nrows2 = 0
 		if self.cell_exists(cell_id):
 			with self.lock_cell(cell_id) as cell:
-				with cell.open(self.primary_cgroup) as fp:
-					nrows1 = len(fp.root.main.table)
-					nrows2 = len(fp.root.cached.table) if (include_cached and 'cached' in fp.root) else 0
+				with cell.open(self.primary_cgroup) as node:
+					nrows1 = len(node.main.table)
+					nrows2 = len(node.cached.table) if (include_cached and 'cached' in node) else 0
 		nrows = nrows1 + nrows2
 
 		cached = np.zeros(nrows, dtype=np.bool)			# _CACHED
@@ -1718,12 +1730,12 @@ class Table:
 			if cgroup is None:
 				cgroup = self.table.primary_cgroup
 
-			fp = self.table._open_tablet(self.cell_id, mode=self.mode, cgroup=cgroup)
+			node = self.table._open_tablet(self.cell_id, mode=self.mode, cgroup=cgroup)
 
-			yield fp
+			yield node
 
-			logger.debug("Closing tablet (%s)" % (fp.filename))
-			fp.close()
+			logger.debug("Closing tablet (%s)" % (node._v_file.filename))
+			node._v_file.close()
 
 	@contextmanager
 	def lock_cell(self, cell_id, mode='r', timeout=None):
