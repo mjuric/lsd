@@ -159,11 +159,6 @@ class Table:
 		tabtreepkl = self._find_metadata_path('catalog.pkl')
 		if os.path.isfile(tabtreepkl):
 			self.catalog = TableCatalog(fn=tabtreepkl)
-		elif os.path.isdir(os.path.join(self.path, 'tablets')) and not os.path.isdir(os.path.join(self.path, 'tablets', 'snapshots')):
-			# Backwards compatibility: Auto-create it for old-style (pre v0.4) tables
-		        assert self._snapshots[0] == 0
-			print >> sys.stderr, "[%s] Updating tablet catalog:" % (self.name),
- 			self.rebuild_catalog(rebuild_pre_v050_snap=True)
 		else:
 		        # A new table, opened on an uncommitted snapshot, has no saved catalog
 		        # Create an empty one.
@@ -173,19 +168,11 @@ class Table:
 	def get_cells_in_snapshot(self, snapid, include_cached=True):
 		return self.catalog.get_cells_in_snapshot(snapid, include_cached=include_cached)
 
-	def rebuild_catalog(self, rebuild_pre_v050_snap=False):
+	def rebuild_catalog(self):
 		self._check_transaction()
 
-		# A bit of backwards compatibility for older tables
-		if not rebuild_pre_v050_snap:
-			snapid = self.snapid
-		else:
-			# Initialize an empty catalog
-			snapid = 0
-
 		# Update to the requested snapshot
-		pattern = self._tablet_filename(self.primary_cgroup)
-		self.catalog.update(self.path, pattern, snapid)
+		self.catalog.update(self.path, self._cgroups, self.snapid)
 
 		# Save
 		fn = os.path.join(self._snapshot_path(snapid), 'catalog.pkl')
@@ -378,30 +365,27 @@ class Table:
 
 		return path
 
-	def _cell_path(self, cell_id, mode='r'):
-		""" Return the full path to a particular cell """
+	def _tablet_file(self, cell_id, cgroup, mode='r'):
+		"""
+		Return the full path to the physical tablet containing the
+		requested logical (cell_id, cgroup).
+		
+		Assumptions if mode != 'r':
+		- The cell_id has been locked (and self.catalog updated to reflect
+		  the location of physical tablets containing cell_id)
+		"""
+
 		if mode == 'r':
-			snapid = self.catalog.snapshot_of_cell(cell_id)
+			snapid, storage_cell_id = self.catalog.tablet_location(cell_id, cgroup)
 		elif mode in ['w', 'r+']:
 			self._check_transaction()
+			storage_cell_id = self.catalog.writable_tablet_location(cell_id, cgroup)
 			snapid = self.snapid
 		else:
 			raise Exception("Invalid mode '%s'" % mode)
 
-		path = self.catalog.path_to_cell(snapid, cell_id)
-
-		return '%s/tablets/%s' % (self._snapshot_path(snapid), path)
-
-	def _tablet_filename(self, cgroup):
-		""" Return the filename of a tablet of the given cgroup """
-		return '%s.%s.h5' % (self.name, cgroup)
-
-	def _tablet_file(self, cell_id, cgroup, mode='r'):
-		"""
-		Return the full path to the tablet of the given cgroup
-		"""
-		path = self._cell_path(cell_id, mode)
-		return '%s/%s' % (path, self._tablet_filename(cgroup))
+		fn = '%s/tablets/%s/%s.%s.h5' % (self._snapshot_path(snapid), self.pix.path_to_cell(storage_cell_id), self.name, cgroup)
+		return fn
 
         def cell_exists(self, cell_id):
         	try:
@@ -813,7 +797,67 @@ class Table:
 		self._rebuild_internal_schema()
 		self._store_schema()
 
+class Partitioner(object):
+	def partition(self, cell_id):
+		...
+
 	### Cell locking routines
+	def has_cell_split(self, cell_id):
+		"""
+		Check if a cell was split, and return how.
+
+		Assumes the physical cell_id is locked.
+		"""
+		self._check_transaction()
+
+		- look for file ending in .split, describing how the cell was split
+			- just a dict of cell_id -> new_storage_cell_id?
+			- what about cells that didn't exist at time of the split?
+		- return an object describing the split
+
+	def lock_cell2(self, cell_id, timeout):
+		"""
+		Lock the logical cell cell_id, for the given list of cgroups
+		(this list must contain _all_ cgroups existing in the table)
+		
+		This method will:
+		- Discover to which physical cells the logical cell cell_id
+		  belongs, allocating new physical cells if it doesn't exist.
+		- Store this information to self.index
+		- Lock the physical cells
+		"""
+		self._check_transaction()
+
+		locks = []
+		try:
+			for cgroup in self._cgroups:
+				while True:
+					try:
+						storage_cell_id = self.index[(cell_id, cgroup)]
+					except:
+						snapid, storage_cell_id = self.catalog.tablet_location(cell_id, cgroup)
+						self.index[(cell_id, cgroup)] = storage_cell_id
+
+					# Lock it
+					lock = self._lock_storage_cell(storage_cell_id, timeout)
+
+					# See if this cell got split
+					splits = self.has_cell_split(storage_cell_id)
+					if splits:
+						self.index[(cell_id, cgroup)] =  ... figure out where cell_id wound up ...
+						self._unlock_storage_cell(lock)
+						continue
+
+					# Successfully locked
+					locks.append(lock)
+					break
+		except:
+			for lock in locks:
+				self._unlock_storage_cell(lock)
+			raise
+
+		return locks
+
 	def _lock_cell(self, cell_id, timeout=None):
 		"""
 		Low-level: Lock a given cell for writing.

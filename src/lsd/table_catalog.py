@@ -158,22 +158,16 @@ class TableCatalog:
 
 		# Check if the cell directory exists (give up if it doesn't)
 		bmap = self._bmaps[lev]
-		offs = bmap[i, j]
-		if not offs:
+		spatial = bmap[i, j]
+		if not spatial:
 			return
 
 		# If re reached the bottom of the hierarchy
-		if offs > 1:
+		if lev == self._pix.level:
 			# Get the cell_ids for leaf cells matching pattern
 			xybounds = None if(bounds_xy.area() == box.area()) else bounds_xy
-			next = 0
-			while next != END_MARKER:
-				(t, _, _, next) = self._leaves[offs]
-				has_data = next > 0
-				next = abs(next)
-				if next != END_MARKER:	# Not really necessary, but numpy warns of overflow otherwise.
-					offs += next
 
+			for t, (snapid, storage_cell_id, has_data) in spatial.iteritems():
 				if not has_data and not self._include_cached:
 					continue
 
@@ -194,13 +188,10 @@ class TableCatalog:
 				else:
 					# Static cell
 					tbounds = bounds_t
-					assert next == END_MARKER, "There can be only one static cell (x,y,t=%s,%s,%s)" % (x, y, t)
-
-				# Compute cell ID
-				cell_id = (x, y, t)
+					assert len(spatial) == 1, "There can be only one static cell (x,y,t=%s,%s,%s)" % (x, y, t)
 
 				# Add to output
-				_add_bounds(outcells, cell_id, xybounds, tbounds)
+				_add_bounds(outcells, (x, y, t), xybounds, tbounds)
 		else:
 			# Recursively subdivide the four subpixels
 			for (di, dj) in [(0, 0), (0, 1), (1, 0), (1, 1)]:
@@ -240,9 +231,9 @@ class TableCatalog:
 			lev = min(4, self._pix.level)
 			ij = np.indices((2**lev,2**lev)).reshape(2, -1).T # List of i,j coordinates
 			for cells_ in pool.imap_unordered(ij, _get_cells_kernel, (lev, self, bounds), progress_callback=pool2.progress_pass):
-				for cell_id, b in cells_.iteritems():
+				for xyt, b in cells_.iteritems():
 					for xyb, tb in b.iteritems():
-						_add_bounds(cells, cell_id, xyb, tb)
+						_add_bounds(cells, xyt, xyb, tb)
 			del pool
 
 		if len(cells):
@@ -258,35 +249,69 @@ class TableCatalog:
 		else:
 			return cells
 
-	def get_cells_in_snapshot(self, snapid, include_cached=True):
+	def get_cells_in_snapshot(self, snapid, cgroup, include_cached=True):
 		""" Return a list of cells that are physically stored in snapshot snapid """
-		keep = self._leaves['snapid'] == snapid
-		if not include_cached:
-			keep &= self._leaves['next'] > 0
-		cells = self._leaves['cell_id'][keep]
-		return cells
+		xyt = []
+		for (x, y), spatial in self.spatial_index[cgroup][self._pix.level].iteritems():
+			for t, (snapid_, storage_cell_id, has_data) in spatial.iteritems():
+				if snapid_ == snapid:
+					xyt.append((x, y, t))
 
-	def snapshot_of_cell(self, cell_id):
+		xyt = np.array(xyt).transpose()
+		return self._pix._cell_id_for_xyt(xyt[0], xyt[1], xyt[2])
+
+	def tablet_location(self, cell_id, cgroup):
+		# A replacement for snapshot_of_cell
+		x, y, t = self._pix._xyt_from_cell_id(cell_id)
+		w2 = self.width / 2
+		i, j = (x // dx + w2, y // dx + w2)
 		try:
-			offs = self._cell_to_offs[cell_id]
-			return self._leaves[offs]['snapid']
+			snapid, storage_cell_id, has_data = self.spatial_index[cgroup][(x, y)][t]
+			return snapid, storage_cell_id
 		except KeyError:
 			raise LookupError()
 
+	def writable_tablet_location(self, cell_id, cgroup, snapid, table_path):
+		# Find/update writable tablet location
+
+		# See if we already have the location in catalog
+		try:
+			return self.index[(cell_id, cgroup)]
+		except KeyError:
+			pass
+
+		# See if the tablet exists in previous snapshot
+		try:
+			storage_snapid, storage_cell_id = self.tablet_location(cell_id, cgroup)
+			self.index[(cell_id, cgroup)] = snapid, storage_cell_id
+			return snapid, storage_cell_id
+		except LookupError:
+			pass
+
+		# An unpopulated cell -- find where to place it
+		...
+
+		base = get_snapshot_path(table_path, snapid)
+
 	#################
 
-	def _get_temporal_siblings(self, path, pattern):
-		""" Given a cell_id, get all sibling temporal cells (including the static
+	def _get_temporal_siblings(self, path):
+		""" Given a path to a cell, get all sibling temporal cells (including the static
 		    sky cell) that exist in it.
 		"""
-		pattern = "%s/*/%s" % (path, pattern)
+
+		pattern = "%s/*/%s.*.h5" % (path, self.__name)	# The first asterisk is either 'Txxxx' or 'static'. The second is for cgroup
 
 		for fn in glob.iglob(pattern):
 			# parse out the time, construct cell ID
-			(kind, _) = fn.split('/')[-2:]
+			(kind, fname) = fn.split('/')[-2:]
 			t = self._pix.t0 if kind == 'static' else float(kind[1:])
 
-			yield t, fn
+			# parse out the cgroup
+			_, cgroup, _ = fname.split('.')
+			assert cgroup in self.__cgroups
+
+			yield t, cgroup, fn
 
         def _has_data(self, node):
 		# check if there are any non-cached data in here
@@ -303,6 +328,7 @@ class TableCatalog:
 
 		# .../snapshots/XXXXXX/tablets/-0.5+0.5/..../
 		snapid = self._snapid
+
 		path = '%s/tablets/%s' % (get_snapshot_path(table_path, snapid),  self._pix._path_to_cell_base_xy(x, y, lev))
 
 		if not os.path.isdir(path): # Dead end
@@ -320,45 +346,53 @@ class TableCatalog:
 			i, j = (x // dx + w2, y // dx + w2)
 
 			# Collect the data we have, and add them to the set of cells that exist
-			for tcell, fn in self._get_temporal_siblings(path, self.__pattern):
+			for tcell, cgroup, fn in self._get_temporal_siblings(path):
+				storage_cell_id = self._pix._cell_id_for_xyt(x, y, tcell)
 				with tables.openFile(fn) as fp:
 					# check if this is a v0.5.x file
 					if 'main' in fp.root:
 						has_data = self._has_data(fp.root)
-						cell_id = self._pix._cell_id_for_xyt(x, y, tcell)
-
-						if bmap[i, j] == 0: bmap[i, j] = {}
-						bmap[i, j][tcell] = (snapid, cell_id, cell_id, has_data)
+						self._add_tablet(bmap, x, y, tcell, w2, cgroup, storage_cell_id, has_data)
 					else:
 						# Enumerate all cells that are stored in this file
 						for (name, node) in fp.root._v_children.iteritems():
-							if name[0] == 'c':
-								cell_id = np.uint64(name[1:])
-								has_data = self._has_data(node)
-								x, y, tcell = self._pix._xyt_from_cell_id(cell_id)
+							if name[0] != 'c':
+								continue
 
-								if bmap[i, j] == 0: bmap[i, j] = {}
-								bmap[i, j][tcell] = (snapid, cell_id, cell_id, has_data)
+							cell_id = np.uint64(name[1:])
+							has_data = self._has_data(node)
 
+							xx, yy, tt = self._pix._xyt_from_cell_id(cell_id)
+							self._add_tablet(bmap, xx, yy, tt, w2, cgroup, storage_cell_id, has_data)
 
-	_leaves_dtype = [('mjd', 'f4'), ('snapid', object), ('cell_id', 'u8'), ('storage_cell_id', 'u8'), ('next', 'i4')]
+	# bmaps: bmaps[cgroup][(i, j)][tcell] -> (snapid, storage_cell_id)
+	def _add_tablet(self, bmaps, x, y, tcell, w2, cgroup, snapid, storage_cell_id, has_data):
+		# Get the map for the given cgroup
+		try:
+			bmap = bmaps[cgroup]
+		except KeyError:
+			bmap = bmaps[cgroup] = defaultdict(dict)
 
-	def _update(self, table_path, snapid):
+		# Find the spatial cell
+		i, j = (x // dx + w2, y // dx + w2)
+		spatial = bmap[(i, j)]
+
+		# Store the location information to the
+		# apropriate temporal cell
+		spatial[tcell] = (snapid, storage_cell_id, has_data)
+
+	def update(self, table_path, cgroups, snapid):
+		self.__cgroups = cgroups
+
 		# Find what we already have loaded
-		prevsnap = np.max(self._leaves['snapid']) if len(self._leaves) > 2 else None
+		prevsnap = self.snapid
 		assert prevsnap <= snapid, "Cannot update a catalog to an older snapshot"
 
-		# The snapshot to which we're updating
-		self._snapid = snapid
+		# Update the snapshot ID
+		self.snapid = snapid
 
-		# Unpack existing data
-		w = bhpix.width(self._pix.level)
-		bmap = np.zeros((w, w), dtype=object)
-		bmap_old = self._bmaps[self._pix.level]
-		for i, j in zip(*bmap_old.nonzero()):
-			bmap[i, j] = {}
-			for tcell, snapid, cell_id, storage_cell_id, next in iter_siblings(self._leaves, bmap_old[i, j]):
-				bmap[i, j][tcell] = (snapid, cell_id, storage_cell_id, next > 0)
+		# Get existing top-level maps from self.spatial_index
+		bmaps = { cgroup: bmaps[self._pix.level] for cgroup, bmaps in self.spatial_index }
 
 		# Recursively scan, in parallel
 		lev = min(4, self._pix.level)
@@ -368,104 +402,60 @@ class TableCatalog:
 		x, y =  (i - w2 + 0.5)*dx, (j - w2 + 0.5)*dx
 
 		pool = pool2.Pool()
-		for bmap2 in pool.imap_unordered(zip(x, y), _scan_recursive_kernel, (lev, self)):
-			assert not np.any((bmap != 0) & (bmap2 != 0))
-			mask = bmap2 != 0
-			bmap[mask] = bmap2[mask]
+		for bmaps2 in pool.imap_unordered(zip(x, y), _scan_recursive_kernel, (lev, self)):
+			# Update the existing map with new data
+			# NOTE: We don't yet support deletion !
+			for cgroup, bmap2 in bmaps2.iteritems():
+				try:
+					bmap = bmaps[cgroup]
+				except KeyError:
+					bmap = bmaps[cgroup] = defaultdict(dict)
+
+				for key, spatial in bmap2:
+					bmap[key].update(spatial)
 		del pool
 
-		# Repack the temporal siblings to a single numpy array, emulating a linked list
-		dicts = bmap[bmap != 0]
-		llens = np.fromiter( (len(l) for l in dicts), dtype=np.int32 )
-		leaves = np.empty(np.sum(llens)+2, dtype=self._leaves_dtype)
-		leaves[:2] = [(np.inf, 0, 0, 0, END_MARKER)]*2	# We start with two dummy entries, so that offs=0 and 1 are invalid and can take other meanings.
-		seen = dict()
-		at = 2
-		for l in dicts:
-			last_i = len(l) - 1
-			for (i, (mjd, (snapid, cell_id, storage_cell_id, has_data))) in enumerate(l.iteritems()):
-				# Make equal strings refer to the same string object,
-				# for more efficient pickling
-				try:
-					snapid = seen[snapid]
-				except KeyError:
-					seen[snapid] = snapid
-
-				next = 1 if has_data else -1
-				if i == last_i:
-					next *= END_MARKER
-
-				leaves[at] = (mjd, snapid, cell_id, storage_cell_id, next)
-				at += 1
-
-		# Construct bmap that has offsets to head of the linked list of siblings
-		offs     = np.zeros(len(llens), dtype=np.int64)
-		offs[1:] = np.cumsum(llens)[:-1]
-		offs     += 2				# Pointers to beginnings of individual lists
-		assert np.all(abs(leaves['next'][offs-1]) == END_MARKER)
-		obmap = np.zeros(bmap.shape, dtype=np.int32)
-		obmap[bmap != 0] = offs
-
 		# Recompute mipmaps
-		bmaps = self._compute_mipmaps(obmap)
-
-		return bmaps, leaves
+		self.spatial_index = { cgroup: self._compute_mipmaps(b) for cgroup, b in bmaps }
 
 	def _compute_mipmaps(self, bmap):
+		# True/False bitmap: is there's data in a spatial cell?
+		bmapTF = np.zeros((self.width, self.width), dtype=np.bool)
+		for key, spatial:
+			bmapTF[key] = len(spatial) != 0
+
 		# Create mip-maps
-		bmaps = {self._pix.level: bmap}	# Mip-maps of bmap with True if the cell has data in its leaves, and False otherwise
+		bmaps = {self._pix.level: bmapTF}
 		for lev in xrange(self._pix.level-1, -1, -1):
 			w = bhpix.width(lev)
-			m0 = np.zeros((w, w), dtype=np.int32)
+			m0 = np.zeros((w, w), dtype=np.bool)
 			m1 = bmaps[lev+1]
 			for (i, j) in [(0, 0), (0, 1), (1, 0), (1, 1)]:
 				m0[:,:] |= m1[i::2, j::2]
-			m0 = m0 != 0
-
 			bmaps[lev] = m0
 
+		# Final mipmap is the dict with data
+		bmaps[self._pix.level] = bmap
+
 		return bmaps
-
-	def _rebuild_internal_state(self):
-		self._cell_to_offs = dict(v for v in izip(self._leaves['cell_id'][2:], xrange(2, len(self._leaves))))
-		assert len(self._cell_to_offs) == len(self._leaves)-2, (len(self._cell_to_offs), len(self._leaves))
-
-	def update(self, table_path, pattern, snapid):
-		self.__pattern = pattern
-
-		self._bmaps, self._leaves = self._update(table_path, snapid)
-		self._rebuild_internal_state()
 
 	def save(self, fn):
 		dir = os.path.dirname(os.path.normpath(fn))
 		if dir != '':
 			utils.mkdir_p(dir)
-		cPickle.dump((self._bmaps, self._leaves, self._pix), file(fn, mode='w'), -1)
+		cPickle.dump((self.spatial_index, self._pix), file(fn, mode='w'), -1)
 
 	def load(self, fn):
-		self._bmaps, self._leaves, self._pix = cPickle.load(file(fn))
-		
-		# compatibility with v0.5.x files; storage_cell_id is always equal
-		# cell_id there.
-		if 'storage_cell_id' not in self._leaves.dtype.names:
-			leaves = np.empty(len(self._leaves), dtype=self._leaves_dtype)
-			for n in self._leaves.dtype.names:
-			        leaves[n] = self._leaves[n]
-			leaves['storage_cell_id'] = leaves['cell_id']
-			self._leaves = leaves
+		data = cPickle.load(file(fn))
+		if len(data) == 3:
+			# v0.5.x compatibility
+			self._bmaps, self._leaves, self._pix = data
 
-		self._rebuild_internal_state()
+			# TODO: write code transforming this to new data structures
+			...
 
-	def clear(self):
-		# Initialize an empty table
-		w = bhpix.width(self._pix.level)
-		self._bmaps = self._compute_mipmaps(np.zeros((w, w), dtype=object))
-		self._leaves = np.empty(2, self._leaves_dtype)
-		self._leaves[:2] = [(np.inf, 0, 0, 0, END_MARKER)]*2
-		
-		self._rebuild_internal_state()
 
-	def __init__(self, fn=None, pix=None, snapid=None):
+	def __init__(self, fn=None, pix=None):
 		if fn is not None:
 			assert pix is None
 			self.load(fn)
@@ -473,7 +463,9 @@ class TableCatalog:
 			assert pix is not None
 			assert fn is None
 			self._pix = pix
-			self.clear()
+			self.spatial_index = {}
+
+		self.width = bhpix.width(self._pix.level)
 
 	def __eq__(self, b):
 		# Compare Pixelization objects
