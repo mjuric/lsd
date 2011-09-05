@@ -2,3 +2,4 @@
 
 from .misc import *
 from . import SFD
+from . import SDSS
