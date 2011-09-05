@@ -286,10 +286,17 @@ class FileTable(object):
 				if isinstance(self.data, colgroup.ColGroup):
 					self.data = self.data.as_ndarray()
 				assert isinstance(self.data, np.ndarray)
+		elif ext == '.par':
+			# Assume an SDSS .par file
+			import surveys.sdss.par_reader as pr
+			with open(fn) as fp:
+				self.data = pr.read(fp)
+				assert isinstance(self.data, np.ndarray)
 		else:
 			# Assume text
 			from .. import utils
 			self.data = np.genfromtxt(utils.open_ex(fn), **kwargs)
+			print "AAAA", self.data.dtype, self.data.shape
 
 	def __call__(self, x):
 		if self.__map is None:
