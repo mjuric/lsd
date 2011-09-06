@@ -20,5 +20,5 @@ test x$(echo -n $PYTHONPATH | awk -v RS=: '"'$EXTRAMOD'" == $1' | head -n 1) == 
 
 # Prepend ~mjuric/lfs/lib to LD_LIBRARY_PATH (for curl)
 EXTRA_LIBPATH=/n/home06/mjuric/lfs/lib
-echo "Prepending to LD_LIBRARY_PATH:" $EXTRA_LIBPATH >2
+echo "Prepending to LD_LIBRARY_PATH:" $EXTRA_LIBPATH >&2
 export LD_LIBRARY_PATH=$EXTRA_LIBPATH:$LD_LIBRARY_PATH
