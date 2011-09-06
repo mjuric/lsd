@@ -122,7 +122,7 @@ class Table:
 					if not os.path.exists(local_fn):
 						self.fetch_from_remote(local_fn)
 
-		self._snapshots = self.list_snapshots(snapid)
+		self._snapshots = self.list_snapshots(self.snapid)
 		# Sorted list of snapshots, newest first
 		self._snapshots.sort(reverse=True)
 
