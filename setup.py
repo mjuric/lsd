@@ -149,7 +149,7 @@ args = {
 	 			'src/lsd-query', 'src/lsd-xmatch', 'src/mr-peer',
 	 			'src/lsd-manager', 'src/lsd-admin', 'src/lsd-import',
 	 			'src/lsd-check'],
-	'packages'	: ['lsd', 'lsd.builtins', 'lsd.importers', 'surveys', 'surveys.ps1', 'mr', 'lsd.config'],
+	'packages'	: ['lsd', 'lsd.builtins', 'lsd.importers', 'surveys', 'surveys.ps1', 'surveys.sdss', 'mr', 'lsd.config'],
 	'package_dir'	: {'': 'src'},
 	'ext_modules'	: [Extension('lsd.native', ['src/native/main.cpp'], include_dirs=inc)],
 	'data_files'    : [
