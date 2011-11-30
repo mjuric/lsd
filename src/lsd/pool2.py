@@ -12,7 +12,6 @@ import os
 import sys
 import tempfile
 import time
-import mmap
 import traceback
 import platform
 import logging
@@ -28,6 +27,11 @@ BUFSIZE = 100 * 2**20 if platform.architecture()[0] == '32bit' else 1000 * 2**30
 
 # OS X HFS+ filesystem does not support sparse files
 back_to_disk = platform.system() != 'Darwin'
+
+# do not use memory-mapping, if requested
+use_mmap = False if os.getenv("LSD_NOMMAP") == "1" else True
+if use_mmap:
+	import mmap
 
 # allow diskless operation with LSD_DISKLESS environment variable
 if os.getenv("LSD_DISKLESS") == "1":
@@ -111,7 +115,10 @@ def _unserializer(file, offsets):
 	# a list of offsets, and returns a generator unpickling objects
 	# at given offsets
 	with open(file) as f:
-		mm = mmap.mmap(f.fileno(), 0, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+		if use_mmap:
+			mm = mmap.mmap(f.fileno(), 0, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ)
+		else:
+			mm = f
 
 		for offs in offsets:
 			##print "Seek to ", offs
@@ -581,9 +588,12 @@ class Pool:
 
 					# Create a disk backing store for intermediate results
 					fp = tempfile.NamedTemporaryFile(mode='wb', prefix='mapresults-', dir=os.getenv('LSD_TEMPDIR'), suffix='.pkl', delete=True)
-					fd = fp.file.fileno()
-					os.ftruncate(fd, BUFSIZE)
-					mm = mmap.mmap(fd, 0)
+					if use_mmap:
+						fd = fp.file.fileno()
+						os.ftruncate(fd, BUFSIZE)
+						mm = mmap.mmap(fd, 0)
+					else:
+						mm = fp
 
 			try:
 				# Call the distributed mappers
@@ -616,7 +626,7 @@ class Pool:
 				# In case of an exception, delete the temporary file so the kernel
 				# won't attempt to flush them to the disk
 				if back_to_disk:
-					if mm is not None:
+					if mm is not None and use_mmap:
 						mm.resize(1)
 						mm.close()
 						mm = None
@@ -632,8 +642,9 @@ class Pool:
 					# ensuring it's truncated first so it doesn't hit the disk if it hasn't
 					# already.
 					if prev_fp is not None:
-						prev_mm.resize(1)
-						prev_mm.close()
+						if use_mmap:
+							prev_mm.resize(1)
+							prev_mm.close()
 						os.ftruncate(prev_fp.file.fileno(), 0)
 						prev_fp.close()
 
