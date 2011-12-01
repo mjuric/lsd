@@ -11,7 +11,7 @@ module load hpc/ipython-0.10.2_python-2.7.1
 module load hpc/python-2.7_modules
 
 module load math/hdf5-1.8.5_gnu
-module load hpc/git-1.6.4
+module load hpc/git-1.7.4
 module load hpc/gsl-gnu
 
 # Test if we have extra modules in PYTHONPATH
