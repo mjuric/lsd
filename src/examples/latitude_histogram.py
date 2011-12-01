@@ -2,6 +2,7 @@
 
 from lsd import DB
 import numpy as np
+import os
 
 def mapper(qresult, bins):
 	for rows in qresult:
@@ -14,7 +15,7 @@ def reducer(kv):
 	bin, counts = kv
 	yield (bin, sum(counts))
 
-db = DB('db')
+db = DB(os.environ['LSD_DB'])
 query = db.query("SELECT dec FROM sdss")
 
 ddec = 10.
