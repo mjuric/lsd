@@ -2088,7 +2088,8 @@ class DB(object):
 						dbpath = '/'.join(dbpath.split('/')[:-1] + [ dbdir ])
 					path = '%s/%s' % (dbpath, tn)
 					if os.path.isdir(path):
-						self.tables[tabname] = Table(path, snapid=snapid, open_transaction=self.in_transaction())
+						in_transaction = self.path[0] == dbpath and self.in_transaction()
+						self.tables[tabname] = Table(path, snapid=snapid, open_transaction=in_transaction)
 						break
 				else:
 					raise IOError("Table %s not found in %s" % (tabname, ':'.join(self.path)))

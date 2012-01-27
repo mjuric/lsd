@@ -176,7 +176,7 @@ class Table:
 
 	def _check_transaction(self):
 		if not self.transaction:
-			raise Exception("Trying to modify a table without starting a transaction")
+			raise Exception("Trying to modify a table without starting a transaction. This can also happen if you have multiple directories on LSD_DB path, and the table you're trying to modify is not in the first directory.")
 
 	def begin_transaction(self, snapid, load_state=True):
 		assert not self.transaction
