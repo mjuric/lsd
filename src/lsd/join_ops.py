@@ -1637,7 +1637,10 @@ class DB(object):
 				udf_modules = os.environ['LSD_USER_MODULES'].split(':')
 			except KeyError:
 				udf_modules = []
-		self.udfs = self._load_udfs(self.path, udf_modules)
+		if os.getenv('LSD_NO_UDF', None) == '1':
+			self.udfs = utils.Namespace('udfs')
+		else:
+			self.udfs = self._load_udfs(self.path, udf_modules)
 
 		self.snapid = self._tsnap_to_snapid(time.time())
 
