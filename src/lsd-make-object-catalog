@@ -53,7 +53,7 @@ if explist is not None:
 db = lsd.DB(dbdir)
 
 with db.transaction():
-	if create or auto:
+	if (create or auto) and not db.table_exists(obj_tabname):
 		smf.create_object_table(db, obj_tabname, det_tabname)
 
 	newexp = None

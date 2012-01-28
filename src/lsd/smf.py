@@ -757,37 +757,34 @@ def get_cells_with_dets_from_exps(db, explist, exp_tabname, det_tabname, fovradi
 def create_object_table(db, obj_tabname, det_tabname):
 	""" Create a new object table, linkage table, and the joins required
 	    to join it to detections table.
-	    
-	    Skip table creation if tables already exists, and overwrite joins
-	    if they already exist.
+
+	    It is the responsibility of the caller to ensure none of these
+	    already exist.
 	"""
 	# Create a new object table
 	o2d_tabname = '_%s_to_%s' % (obj_tabname, det_tabname)
-	obj_table = db.create_table(obj_tabname, obj_table_def, ignore_if_exists=True)
-	o2d_table = db.create_table(o2d_tabname, o2d_table_def, ignore_if_exists=True)
+	obj_table = db.create_table(obj_tabname, obj_table_def)
+	o2d_table = db.create_table(o2d_tabname, o2d_table_def)
 
 	# Set up a one-to-X join relationship between the two tables (join obj_table:obj_id->det_table:det_id)
 	db.define_default_join(obj_tabname, det_tabname,
 		type = 'indirect',
 		m1   = (o2d_tabname, "obj_id"),
-		m2   = (o2d_tabname, "det_id"),
-		_overwrite = True
-			)
+		m2   = (o2d_tabname, "det_id")
+		)
 
 	# Set up a join between the indirection table and detections table (det_table:det_id->o2d_table:o2d_id)
 	db.define_default_join(det_tabname, o2d_tabname,
 		type = 'indirect',
 		m1   = (o2d_tabname, "det_id"),
-		m2   = (o2d_tabname, "o2d_id"),
-		_overwrite = True
+		m2   = (o2d_tabname, "o2d_id")
 		)
 
 	# Set up a join between the indirection table and detections table (det_table:det_id->o2d_table:o2d_id)
 	db.define_default_join(obj_tabname, o2d_tabname,
 		type = 'indirect',
 		m1   = (o2d_tabname, "obj_id"),
-		m2   = (o2d_tabname, "o2d_id"),
-		_overwrite = True
+		m2   = (o2d_tabname, "o2d_id")
 		)
 
 def make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=1./3600., explist=None, oldexps=None, fovradius=None):
