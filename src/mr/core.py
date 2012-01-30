@@ -544,7 +544,7 @@ class Pool:
 #				print >>sys.stderr, datetime.datetime.now().ctime(), "[PROGRESS]", msg, args
 
 		sys.stderr.write('\n')
-		print >>sys.stderr, "EXITING map_reduce_chain"
+#		print >>sys.stderr, "EXITING map_reduce_chain"
 
 def _make_buffer_mmap(size, return_file=False):
 	# See if we have a user-specified temp directory
@@ -2669,6 +2669,15 @@ class Peer:
 			spec = TaskSpec.unserialize(spec)
 
 			worker_stub = os.path.abspath(sys.argv[0])
+
+			# Ensure the worker's PYTHONPATH includes the location of pymr modules,
+			# otherwise we won't be able to launch
+			#
+			pymr_mod_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+			if 'PYTHONPATH' in spec.env:
+				spec.env['PYTHONPATH'] = spec.env['PYTHONPATH'] + ':' + pymr_mod_path
+			else:
+				spec.env['PYTHONPATH'] = pymr_mod_path
 
 			# spawn the Worker -- we do this with subprocess, instead of fork()
 			# to give the process a clean slate, free of any (namespace) clutter
