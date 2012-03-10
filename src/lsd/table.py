@@ -88,6 +88,7 @@ class Table:
 	transaction    = False  #: True if we're in a transaction (the current snapshot is writable)
 
 	_default_commit_hooks = [('Updating neighbors', 0, 'lsd.tasks', 'build_neighbor_cache')] #: Default commit hook rebuilds the neighbor cache
+	remote = None
 
 	### Transaction/Snapshotting support
 	def set_snapshot(self, snapid):
