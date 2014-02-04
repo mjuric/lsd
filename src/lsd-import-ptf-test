@@ -1,0 +1,85 @@
+#!/usr/bin/env python
+#
+# Initial run: ./lsd-import-ptf-test -c test_det test_exp >output_test 2>errors_test
+# Next run: ./lsd-import-ptf-test test_det test_exp >output_test2 2>errors_test2
+
+import sys, os
+import getopt
+from lsd import DB
+import lsd.ptf as ptf
+from lsd.utils import *
+from lsd.tui import *
+import numpy as np
+import shutil
+import lsd.smf as smf
+import subprocess 
+
+def usage():
+    print "Usage: %s [-c|--create] [-f|--file] <det_table> <exp_table>" % sys.argv[0]
+
+optlist, (dbdir,), (det_tabname, exp_tabname) = tui_getopt('cf:', ['create', 'file=', ], 2, usage, argn_max=2)
+
+create = False
+filelist = 'None'
+for (o, a) in optlist:
+	if o == '-c' or o == '--create':
+		create = True
+	if o == '-f' or o == '--file':
+		filelist = str(a)
+
+if create:
+	if os.access(dbdir+'/'+det_tabname, os.F_OK):
+		subprocess.check_call(['chmod', '-R', '755', dbdir+'/'+det_tabname])
+		shutil.rmtree(dbdir+'/'+det_tabname)
+	if os.access(dbdir+'/'+exp_tabname, os.F_OK):
+		subprocess.check_call(['chmod', '-R', '755', dbdir+'/'+exp_tabname])
+		shutil.rmtree(dbdir+'/'+exp_tabname)
+	if os.access(dbdir+'/.'+det_tabname+':'+exp_tabname+'.join', os.F_OK):
+		os.remove(dbdir+'/.'+det_tabname+':'+exp_tabname+'.join')
+
+#
+# Actual work
+#
+db = DB(dbdir)
+
+if filelist != 'None':
+	files = np.genfromtxt(filelist, dtype='a')
+else:
+	print "Fetching filenames..."
+	import psycopg2
+	conn = psycopg2.connect("dbname='ptf7' user='ptfbs' host='ptfsdm2'");
+	cur = conn.cursor()
+	# define SQL query
+	if create:
+		SQL = "select a.filename from ancilfiles a, procimages p, exposures e, fields f where a.pid=p.pid and p.expid=e.expid and e.fieldid=f.fieldid and a.anciltype=\'sexcat\' and p.ppid=5 and p.vbest > 0 and p.status > 0 and p.svid>41 and f.ptffield=120001 and a.archivestatus=1 and e.obsmjd < 55686 order by e.expid"
+#		SQL = "select a.filename from ancilfiles a, procimages p, exposures e, fields f where a.pid=p.pid and p.expid=e.expid and e.fieldid=f.fieldid and a.anciltype=\'sexcat\' and p.ppid=5 and p.vbest > 0 and p.status > 0 and p.svid>41 and f.ptffield=120001 and a.archivestatus=1 order by e.expid"
+#		SQL = "select a.filename from ancilfiles a, procimages p, exposures e, fields f where a.pid=p.pid and p.expid=e.expid and e.fieldid=f.fieldid and a.anciltype=\'sexcat\' and p.ppid=5 and p.vbest > 0 and p.status > 0 and p.svid>41 and f.ptffield=100037 and a.archivestatus=1 and p.ccdid=0 order by e.expid"
+#		SQL = "select a.filename from ancilfiles a, procimages p, exposures e, fields f where a.pid=p.pid and p.expid=e.expid and e.fieldid=f.fieldid and a.anciltype=\'sexcat\' and p.ppid=5 and p.vbest>0 and p.status>0 and p.svid>41 and f.ptffield in (4081, 4258, 4506, 4082, 2939, 3044, 3148, 3149, 3252, 3355, 3455, 3456, 3457, 3556, 3557, 3655, 3656, 3657, 3753, 3754, 3943, 4036) and a.archivestatus=1"
+	else:
+		SQL = "select a.filename from ancilfiles a, procimages p, exposures e, fields f where a.pid=p.pid and p.expid=e.expid and e.fieldid=f.fieldid and a.anciltype=\'sexcat\' and p.ppid=5 and p.vbest > 0 and p.status > 0 and p.svid>41 and f.ptffield=120001 and a.archivestatus=1 and e.obsmjd >= 55686 order by e.expid"
+#		SQL = "select a.filename from ancilfiles a, procimages p, exposures e, fields f where a.pid=p.pid and p.expid=e.expid and e.fieldid=f.fieldid and a.anciltype=\'sexcat\' and p.ppid=5 and p.vbest > 0 and p.status > 0 and p.svid>41 and f.ptffield=100037 and a.archivestatus=1 and p.ccdid=0 order by e.expid"
+	cur.execute(SQL)
+	dat = cur.fetchall()
+	files = []
+	for row in dat:
+		files.append(row[0])
+
+with db.transaction():
+	print "Importing SExtractor catalog files:"
+	ptf.import_from_catalogs(db, det_tabname, exp_tabname, files, create, all)
+	print " done."
+	
+# Commit the result
+#db.begin_transaction(join=True)
+#db.commit()
+
+# Sanity check: all queries linking to images must resolve within cell
+#print >> sys.stderr, "Consistency check: ",
+#q = db.query('_CELLID, det_id, ra, dec, exp_id, equinox FROM "%s", "%s"(outer) WHERE equinox == 0' % (det_tabname, exp_tabname))
+#for row in q.iterate():
+#	raise Exception("Inconsistency detected: (cell_id, det_id, ra, dec, exp_id, equinox) = " + str(row))
+
+# Done
+#det_table = db.table(det_tabname)
+#exp_table = db.table(exp_tabname)
+#print "Import done.", det_table.nrows(), "detections in", exp_table.nrows() , "exposures."

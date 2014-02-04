@@ -1,0 +1,96 @@
+#!/usr/bin/env python
+#
+# Example: time nice -n 10 ./lsd-make-ptf-object-catalog -c ptf_obj ptf_det ptf_exp >output_object 2>errors_object
+# Example: time nice -n 10 ./lsd-make-ptf-object-catalog --explist=explist.txt ptf_obj ptf_det ptf_exp >output_object 2>errors_object
+#
+
+import sys
+import getopt
+import lsd
+import lsd.smf as smf
+from lsd.utils import *
+from lsd.tui import *
+import os, shutil, subprocess
+
+def usage():
+	print "Usage: %s [-a|--auto] [-c|--create] [-r|--radius=<arcsec>] [-f|--fov-radius=<deg>] [-g|--gen-explist] [-e|--explist=explist.txt] <obj_table> <det_table> <exp_table>" % sys.argv[0]
+
+optlist, (dbdir,), (obj_tabname, det_tabname, exp_tabname) = tui_getopt('cge:r:f:a', ['create', 'gen-explist', 'explist=', 'radius=', 'fov-radius=', 'auto'], 3, usage)
+
+create = False
+gen_explist = False
+explist = None
+fovradius = 1.0
+radius = 1.5
+auto = False
+make_catalog = True
+oldexps = None
+newexp = None
+for (o, a) in optlist:
+	if o == '-a' or o == '--auto':
+		auto = True
+	elif o == '-c' or o == '--create':
+		create = True
+	elif o == '-r' or o == '--radius':
+		radius = float(a)
+	elif o == '-f' or o == '--fov-radius':
+		fovradius = float(a)
+	elif o == '-g' or o == '--gen-explist':
+		gen_explist = True
+	elif o == '-e' or o == '--explist':
+		explist = np.fromfile(a, dtype=np.uint64, sep='\n')
+		good = np.where(explist > 0)
+		explist = explist[good]
+
+if gen_explist:
+	assert explist is None
+	assert not auto
+	make_catalog = False
+
+if explist is not None:
+	assert not gen_explist
+	assert not auto
+
+#
+# Actual work
+#
+
+if create:
+	if os.access(dbdir+'/.'+det_tabname+':_'+obj_tabname+'_to_'+det_tabname+'.join', os.F_OK):
+		os.remove(dbdir+'/.'+det_tabname+':_'+obj_tabname+'_to_'+det_tabname+'.join')
+	if os.access(dbdir+'/.'+obj_tabname+':_'+obj_tabname+'_to_'+det_tabname+'.join', os.F_OK):
+		os.remove(dbdir+'/.'+obj_tabname+':_'+obj_tabname+'_to_'+det_tabname+'.join')
+	if os.access(dbdir+'/.'+obj_tabname+':'+det_tabname+'.join', os.F_OK):
+		os.remove(dbdir+'/.'+obj_tabname+':'+det_tabname+'.join')
+	if os.access(dbdir+'/'+obj_tabname, os.F_OK):
+		subprocess.check_call(['chmod', '-R', '755', dbdir+'/'+obj_tabname])
+		shutil.rmtree(dbdir+'/'+obj_tabname)
+	if os.access(dbdir+'/_'+obj_tabname+'_to_'+det_tabname, os.F_OK):
+		subprocess.check_call(['chmod', '-R', '755', dbdir+'/_'+obj_tabname+'_to_'+det_tabname])
+		shutil.rmtree(dbdir+'/_'+obj_tabname+'_to_'+det_tabname)
+
+db = lsd.DB(dbdir)
+
+with db.transaction():
+	if create or auto:
+		smf.create_object_table(db, obj_tabname, det_tabname)
+
+	if gen_explist or auto:
+		print >> sys.stderr, "Scanning what is already in the database..."
+		newexp, oldexps = smf.get_new_exposures(db, obj_tabname, det_tabname, exp_tabname)
+		print >>sys.stderr, "%d new exposures (%d total)." % (len(newexp), db.table(exp_tabname).nrows())
+
+	if explist is not None:
+		print >>sys.stderr, "%d new exposures (%d total)." % (len(explist), db.table(exp_tabname).nrows())
+		newexp = explist
+
+	if gen_explist:
+		for exp in newexp:
+			print exp
+
+	if make_catalog:
+		smf.make_object_catalog(db, obj_tabname, det_tabname, exp_tabname, radius=radius/3600., explist=newexp, oldexps=oldexps, fovradius=fovradius)
+
+if make_catalog:
+	print "Rows in the object table: %d." % (db.table(obj_tabname).nrows())
+	print "Rows in the detection table: %d." % (db.table(det_tabname).nrows())

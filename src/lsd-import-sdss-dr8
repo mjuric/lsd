@@ -1,0 +1,53 @@
+#!/usr/bin/env python
+#
+# Example: ./lsd-import-sdss-dr8 -c -f sdss_list.0 sdss /home/ptfbs/projects/DB/sdss_orig/ >output_sdss1 2>errors_sdss1
+# Example: ./lsd-import-sdss-dr8 -f sdss_list.1 sdss /home/ptfbs/projects/DB/sdss_orig/ >output_sdss2 2>errors_sdss2
+#
+
+import sys
+import getopt
+from lsd import DB
+import lsd.sdss_dr8 as sdss
+from lsd.utils import *
+from lsd.tui import *
+import numpy as np
+import shutil
+import subprocess
+
+def usage():
+	print "Usage: %s [-c|--create] <sdss_table> <sweep_file_dir>" % sys.argv[0]
+
+optlist, (dbdir,), (tabname, sweep_dir) = tui_getopt('cf:', ['create', 'file=',], 2, usage)
+
+create = False
+filelist = 'None'
+for (o, a) in optlist:
+	if o == '-c' or o == '--create':
+		create = True
+	if o == '-f' or o == '--file':
+		filelist = str(a)
+
+if create:
+	if os.access(dbdir+'/'+tabname, os.F_OK):
+		subprocess.check_call(['chmod', '-R', '755', dbdir+'/'+tabname])
+		shutil.rmtree(dbdir+'/'+tabname)
+
+#
+# Actual work
+#
+db = DB(dbdir)
+
+if filelist != 'None':
+	files = np.genfromtxt(filelist, dtype='a')
+else:
+	files = shell('find "' + sweep_dir + '" -name "strip.*"').splitlines()
+
+db.begin_transaction(join=True)
+
+print "Importing SDSS catalog:"
+sdss.import_from_sweeps(db, tabname, files, create)
+print " done."
+
+#db.commit()
+
+#print "Total number of objects in catalog: ", db.table(tabname).nrows()
