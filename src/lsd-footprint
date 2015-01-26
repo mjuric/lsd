@@ -7,7 +7,10 @@ import getopt
 import lsd
 from lsd.bounds import rectangle, make_canonical
 from lsd.utils import make_printf_string, as_tuple
-import pyfits
+try:
+	import astropy.io.fits as pyfits
+except ImportError:
+	import pyfits
 from lsd.tui import *
 
 def usage():

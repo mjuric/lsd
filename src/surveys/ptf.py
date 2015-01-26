@@ -1,4 +1,7 @@
-import pyfits
+try:
+	import astropy.io.fits as pyfits
+except ImportError:
+	import pyfits
 import lsd.pool2 as pool2
 import numpy as np
 import time

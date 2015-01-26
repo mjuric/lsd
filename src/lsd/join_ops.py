@@ -9,7 +9,6 @@ well as the JOIN machinery.
 import os, json, glob, copy, sys
 import numpy as np
 import cPickle
-import pyfits
 import logging
 import time
 import locking

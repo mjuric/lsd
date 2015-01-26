@@ -1,6 +1,9 @@
 import os
 import pywcs
-import pyfits
+try:
+	import astropy.io.fits as pyfits
+except ImportError:
+	import pyfits
 import numpy
 from scipy.ndimage import map_coordinates
 

@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 
-import pyfits
+try:
+	import astropy.io.fits as pyfits
+except ImportError:
+	import pyfits
+
 import pool2
 import time
 import numpy as np

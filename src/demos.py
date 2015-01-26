@@ -10,7 +10,12 @@ import skysurvey.utils as ssutils
 import skysurvey.bhpix as bhpix
 import numpy as np
 from itertools import izip
-import pyfits
+
+try:
+	import astropy.io.fits as pyfits
+except ImportError:
+	import pyfits
+
 #########################################################
 
 if False:

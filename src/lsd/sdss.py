@@ -1,4 +1,7 @@
-import pyfits
+try:
+	import astropy.io.fits as pyfits
+except ImportError:
+	import pyfits
 import pool2
 import numpy as np
 from pyslalib.slalib import sla_eqgal

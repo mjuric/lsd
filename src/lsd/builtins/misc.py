@@ -275,7 +275,10 @@ class FileTable(object):
 
 		if ext == '.fits':
 			# Assume fits
-			import pyfits
+			try:
+				import astropy.io.fits as pyfits
+			except ImportError:
+				import pyfits
 			self.data = np.array(pyfits.getdata(fn, **kwargs))
 		elif ext == '.pkl':
 			# Assume pickled

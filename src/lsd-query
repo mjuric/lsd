@@ -3,7 +3,12 @@ import sys
 import os
 import os.path
 import numpy as np
-import pyfits
+
+try:
+	import astropy.io.fits as pyfits
+except ImportError:
+	import pyfits
+
 import lsd as lsd
 import lsd.pool2 as pool2
 import logging

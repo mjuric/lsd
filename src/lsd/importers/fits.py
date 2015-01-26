@@ -2,7 +2,10 @@
 
 import numpy as np
 from itertools import izip
-import pyfits
+try:
+	import astropy.io.fits as pyfits
+except ImportError:
+	import pyfits
 
 class FITSImporter:
 	def __init__(self, db, tabname, usecols, dtype, setcols={}, hdus=[1], import_primary_key=False):
