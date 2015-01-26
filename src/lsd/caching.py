@@ -9,6 +9,7 @@ import getpass
 import hashlib
 import os.path
 import errno
+import numpy as np
 from contextlib  import contextmanager
 from collections import OrderedDict
 
@@ -60,6 +61,11 @@ class CallResultCache(object):
 				for k, a in zip('\0'*len(args), args) + sorted(kwds.items()):
 					m.update(k)
 					try:
+						if type(a) is np.ndarray and not a.flags['C_CONTIGUOUS']:
+							# Version 1.7.1 and previous of NumPy allowed calling
+							# hash_from_code on an F-contiguous array, but more recent
+							# versions need a C-contiguous one.
+							a = np.ascontiguousarray(a)
 						m.update(a)
 					except TypeError:
 						m.update(cPickle.dumps(a, -1))
