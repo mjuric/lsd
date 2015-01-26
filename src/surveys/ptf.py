@@ -11,7 +11,10 @@ import sys, os
 import logging
 import datetime
 import lsd.locking as locking
-import pywcs
+try:
+	import astropy.wcs as pywcs
+except ImportError:
+	import pywcs
 
 conversion_to_int = 1
 

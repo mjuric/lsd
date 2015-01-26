@@ -1,5 +1,8 @@
 import os
-import pywcs
+try:
+	import astropy.wcs as pywcs
+except ImportError:
+	import pywcs
 try:
 	import astropy.io.fits as pyfits
 except ImportError:
