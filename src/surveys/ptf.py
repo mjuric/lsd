@@ -5,7 +5,9 @@ except ImportError:
 import lsd.pool2 as pool2
 import numpy as np
 import time
-from pyslalib.slalib import sla_eqgal, sla_caldj
+from pyslalib.slalib import sla_eqgal
+import astropy.time
+
 import itertools as it
 import sys, os
 import logging
@@ -314,7 +316,7 @@ def import_from_catalogs(db, det_tabname, exp_tabname, catalog_files, create=Fal
 
 	# MJD of import
 	now = datetime.datetime.now()
-	(djm, j) = sla_caldj(now.year, now.month, now.day)
+	djm = astropy.time.Time(datetime.datetime(now.year, now.month, now.day)).mjd
 	djm -= 55682
 
 	t0 = time.time()
