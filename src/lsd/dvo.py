@@ -4,7 +4,7 @@ import pyfits
 import pool2
 import time
 import numpy as np
-from pyslalib.slalib import sla_eqgal
+import astropy.coordinates
 from itertools import imap, izip
 import hashlib
 
@@ -106,13 +106,10 @@ def import_from_dvo_aux(file, cat):
 	#exit()
 
 	# Add computed columns
-	(ra, dec) = cols['ra'], cols['dec']
-	l = np.empty_like(ra)
-	b = np.empty_like(dec)
-	for i in xrange(len(ra)):
-		(l[i], b[i]) = np.degrees(sla_eqgal(*np.radians((ra[i], dec[i]))))
-	cols['l']      = l
-	cols['b']      = b
+        (ra, dec) = cols['ra'], cols['dec']
+        coords = astropy.coordinates.SkyCoord(ra, dec, unit="deg").galactic
+        cols['l'] = coords.l.value
+        cols['b'] = coords.b.value
 
 	# Add the ID of the file the object came from
 	fn = '/'.join(file.split('/')[-2:])

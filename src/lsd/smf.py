@@ -8,7 +8,7 @@ except ImportError:
 import pool2
 import time
 import numpy as np
-from pyslalib.slalib import sla_eqgal
+import astropy.coordinates
 import itertools as it
 import bhpix
 from utils import gnomonic, gc_dist
@@ -356,12 +356,9 @@ def import_from_smf(db, det_tabname, exp_tabname, smf_files, survey, create=Fals
 
 def add_lb(cols):
 	(ra, dec) = cols['ra'], cols['dec']
-	l = np.empty_like(ra)
-	b = np.empty_like(dec)
-	for i in xrange(len(ra)):
-		(l[i], b[i]) = np.degrees(sla_eqgal(*np.radians((ra[i], dec[i]))))
-	cols['l']      = l
-	cols['b']      = b
+	coords = astropy.coordinates.SkyCoord(ra, dec, unit="deg").galactic
+	cols['l'] = coords.l.value
+	cols['b'] = coords.b.value
 
 def load_columns_from_data(dat, c2f, c2t):
 	#cols = dict(( (name, dat.field(fitsname))   for (name, fitsname) in c2f.iteritems() if fitsname != ''))

@@ -3,7 +3,7 @@
 import Polygon
 import bhpix
 import numpy as np
-from pyslalib.slalib import sla_galeq
+import astropy.coordinates
 from numpy import sin, cos, radians, degrees, sqrt, arcsin, arctan2, pi
 from interval import intervalset
 from collections import defaultdict
@@ -94,7 +94,8 @@ def beam(lon0, lat0, radius=1., coordsys='equ', npts=360):
 	"""
 	# transform from the desired coordinate system to equatorial
 	if coordsys == 'gal':
-		lon0, lat0 = degrees(sla_galeq(radians(lon0), radians(lat0)))
+		_c = astropy.coordinates.SkyCoord(lon0, lat0, astropy.coordinates.Galactic, unit='deg').icrs
+                lon0, lat0 = _c.ra.value, _c.dec.value
 	elif coordsys == 'equ':
 		pass
 	else:
@@ -142,8 +143,8 @@ def rectangle(lon0, lat0, lon1, lat1, coordsys='equ'):
 
 	# transform it from the desired coordinate system
 	if coordsys == 'gal':
-		for i in xrange(len(lon)):
-			(lon[i], lat[i]) = np.degrees(sla_galeq(np.radians(lon[i]), np.radians(lat[i])))
+		_c = astropy.coordinates.SkyCoord(lon, lat, frame=astropy.coordinates.Galactic, unit='deg').icrs
+                lon, lat = _c.ra.value, _c.dec.value
 	elif coordsys == 'equ':
 		pass
 	else:

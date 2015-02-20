@@ -5,7 +5,7 @@ except ImportError:
 import lsd.pool2 as pool2
 import numpy as np
 import time
-from pyslalib.slalib import sla_eqgal
+import astropy.coordinates
 import astropy.time
 
 import itertools as it
@@ -393,9 +393,9 @@ def import_from_catalogs_aux(file, det_table, exp_table, djm, all=False):
 				sky = wcs.all_pix2sky(pixcrd, 1)
 				exp_cols['ra'] = np.array([sky[0][0]])
 				exp_cols['dec'] = np.array([sky[0][1]])
-				(l, b) = np.degrees(sla_eqgal(*np.radians((exp_cols['ra'].squeeze(), exp_cols['dec'].squeeze()))))
-				exp_cols['l'] = np.array([l])
-				exp_cols['b'] = np.array([b])
+				coords = astropy.coordinates.SkyCoord(exp_cols['ra'], exp_cols['dec'], unit="deg").galactic
+				exp_cols['l'] = l = coords.l.value
+				exp_cols['b'] = b = coords.b.value
 				exp_cols['mjd_import'] = np.array([djm]).astype('u4')
 				exp_cols['mumax_med'] = np.array([-99.99]).astype('f4')
 				exp_cols['mumax_rms'] = np.array([-99.99]).astype('f4')
@@ -437,9 +437,9 @@ def import_from_catalogs_aux(file, det_table, exp_table, djm, all=False):
 				sky = wcs.all_pix2sky(pixcrd, 1)
 				exp_cols['ra'] = np.array([sky[0][0]])
 				exp_cols['dec'] = np.array([sky[0][1]])
-				(l, b) = np.degrees(sla_eqgal(*np.radians((exp_cols['ra'].squeeze(), exp_cols['dec'].squeeze()))))
-				exp_cols['l'] = np.array([l])
-				exp_cols['b'] = np.array([b])
+				coords = astropy.coordinates.SkyCoord(exp_cols['ra'], exp_cols['dec'], unit="deg").galactic
+				exp_cols['l'] = l = coords.l.value
+				exp_cols['b'] = b = coords.b.value
 				exp_cols['mjd_import'] = np.array([djm]).astype('u4')
 				exp_cols['mumax_med'] = np.array([-99.99]).astype('f4')
 				exp_cols['mumax_rms'] = np.array([-99.99]).astype('f4')
