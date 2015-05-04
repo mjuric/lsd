@@ -408,8 +408,9 @@ class ColGroup(object):
 		(== implementation-dependend and may change in the future).
 		"""
 		for (pos, _) in enumerate(self.column_data):
-			col = self.column_data[pos]
-			self.column_data[pos] = np.resize(col, (size,) + col.shape[1:])
+			col = self.column_data[pos].copy()
+			col.resize((size,) + col.shape[1:])
+			self.column_data[pos] = col
 
 #	def append_rows(self, other):
 #		# Sanity checks:
