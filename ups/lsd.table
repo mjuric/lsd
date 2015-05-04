@@ -1,0 +1,9 @@
+setupRequired(scikits_ann)
+setupRequired(polygon)
+
+envPrepend(PATH, ${PRODUCT_DIR}/bin)
+
+envPrepend(DYLD_LIBRARY_PATH, ${PRODUCT_DIR}/lib)
+envPrepend(LD_LIBRARY_PATH, ${PRODUCT_DIR}/lib)
+
+envPrepend(PYTHONPATH, ${PRODUCT_DIR}/lib/python)
