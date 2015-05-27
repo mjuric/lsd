@@ -165,7 +165,7 @@ def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm, n_neighbors):
 	    	- load all objects in tabname_to (including neighbors), make an ANN tree, find matches
 	    	- store the output into an index table
 	"""
-	from scikits.ann import kdtree
+	from scipy.spatial import cKDTree as kdtree
 
 	db       = qresult.db
 	pix      = qresult.pix
@@ -191,8 +191,11 @@ def _xmatch_mapper(qresult, tabname_to, radius, tabname_xm, n_neighbors):
 			# Construct kD-tree to find an object in table_to that is nearest
 			# to an object in table_from, for every object in table_from
 			tree = kdtree(xy2)
-			match_idxs, match_d2 = tree.knn(xy1, min(n_neighbors, len(xy2)))
+			k=min(self.n, len(xy2))
+			match_d, match_idxs = tree.query(xy1, k=k)
 			del tree
+			if (k == 1):
+				match_idxs = match_idxs.reshape((match_idxs.shape[0],1))
 
 			# Create the index table array
 			join.resize(match_idxs.size)

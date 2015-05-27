@@ -8,8 +8,9 @@ class NamedList(list):
 		list.__init__(self, [ col for _, col in items ])
 
 class Namespace:
-	def __init__(self, name=''):
-		self.__name__ = name
+	def __init__(self, **kwargs):
+		for k, v in kwargs.iteritems():
+			setattr(self, k, v)
 
 class ModuleProxy(object):
 	""" A proxy class used to wrap modules imported as UDFs

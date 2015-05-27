@@ -2,7 +2,7 @@
 
 from multiprocessing import Process, Queue, cpu_count, current_process
 import threading
-from pyrpc import PyRPCProxy, RPCError
+from . import pyrpc
 from Queue import Empty
 from collections import defaultdict
 import socket
@@ -16,6 +16,7 @@ import traceback
 import platform
 import logging
 import signal
+import getpass
 from utils import unpack_callable
 
 logger = logging.getLogger('lsd.pool2')
@@ -326,21 +327,6 @@ class Pool:
 
 		self._ntarget = self.nworkers
 
-	_ntarget_time = 0	# Last time _ntarget was refreshed
-	_ntarget = None		# Target number of active workers
-	def get_active_workers_target(self, _mgr):
-		""" Return the target number of active workers """
-		if time.time() - self._ntarget_time > 30:
-			try:
-				self._ntarget = min(_mgr.nworkers(), self.nworkers)
-			except RPCError:
-				_mgr.close()
-				logger.warning("Error contacting lsd-manager. Cannot coordinate resource usage with others, using %d cores." % self._ntarget)
-				pass
-			self._ntarget_time = time.time()
-
-		return self._ntarget
-
 	def imap_unordered(self, input, mapper, mapper_args=(), progress_callback=None, progress_callback_stage='map'):
 		""" Execute in parallel a callable <mapper> on all values of
 		    iterable <input>, ensuring that no more than ~nworkers
@@ -362,14 +348,27 @@ class Pool:
 		# Dispatch/execute
 		if parallel:
 			try:
+				# Connection to lsd-manager, with fallback if it fails
+				class Defaults(object):
+					def __init__(self, user, nworkers):
+						self._user = user
+						self._nworkers = nworkers
+
+					def _startup(self, p):
+						p.login(self._user);
+						p.register_workers(self._nworkers)
+
+					def nworkers(self):
+						return self._nworkers
+				_mgr = pyrpc.CachingProxy("localhost", 9030, cache_for=10, defaults=Defaults(getpass.getuser(), self.nworkers))
+
 				# Create workers (if not created already)
-				_mgr = PyRPCProxy("localhost", 9029)
 				self._create_workers()
 
 				# Connect to worker manager and stop workers over the limit
 				stopped   = set()				# Idents of stopped workers
 				nrunning  = self.nworkers			# Number of running workers
-				ntarget   = self.get_active_workers_target(_mgr)# Desired number of running workers
+				ntarget   = min(_mgr.nworkers(), self.nworkers) # Desired number of running workers
 				nstopping = self.nworkers - ntarget		# Number of workers to which the stop command has been sent
 				for _ in xrange(nstopping):
 					self.qbroadcast.put( ('STOP', None) )
@@ -420,7 +419,7 @@ class Pool:
 					# Adjust the number of active workers
 					#
 					if k != n:
-						ntarget = self.get_active_workers_target(_mgr)
+						ntarget = min(_mgr.nworkers(), self.nworkers)
 					else:
 						# If all items have been exhausted, unstop all workers so they can
 						# finish cleanly
@@ -459,7 +458,7 @@ class Pool:
 			finally:
 				# Make sure the connection to manager is closed (e.g., if an
 				# exception is thrown)
-				_mgr.close()
+				_mgr._close()
 		else:
 			# Execute in-thread, without external workers
 			for (i, item) in enumerate(input):

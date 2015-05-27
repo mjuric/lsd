@@ -1,0 +1,44 @@
+workers, readers, wallclock, querytime
+
+time ./lsd-query --bounds='rectangle(100, -30, 110, 0)' --format=null 'select ra, dec, filterid, mjd_obs from ps1_det, sdss(matchedto=ps1_det, outer)'
+12	2	2:39	155
+12	3	3:34
+12	-	3:19
+12	1	2:43
+12	1	2:52
+
+time ./lsd-query --bounds=rectangle(100, -30, 110, 0) --format=null select ra, dec, filterid, mjd_obs from ps1_det, sdss(matchedto=ps1_det)
+12	2	1:47	103
+12	24	2:10	126
+12	24	2:15	130
+12	2	1:50	106
+12	1	1:53	108
+12	1	1:51	106
+24	1	1:41	96
+24	2	1:39	95
+
+time ./lsd-query --bounds='rectangle(100, -30, 110, 0)' --format=null 'select ra, dec, filterid, mjd_obs from ps1_obj, ps1_det, sdss(matchedto=ps1_obj)'
+24	2	4:26	259
+24	1	4:28	261
+24	12	4:23	256
+12	12	5:35	329
+12	2	5:37	331
+
+time ./lsd-query --bounds='rectangle(100, -30, 110, 0)' --format=null 'select ra, dec, filterid, mjd_obs from ps1_obj, ps1_det'
+12	2	4:14	243
+12	1	4:29	263
+12	12	4:57	292
+
+time ./lsd-query --bounds='rectangle(100, -30, 110, 0)' --format=null 'select ra, dec from averages'
+12	1	0:15	13
+12	12	0:28	26
+24	24	0:23	21
+24	24	0:26	24
+24	2	0:16	14
+
+time ./lsd-query --bounds='rectangle(100, -30, 130, 0)' --format=null 'select ra, dec from averages'
+24	2	0:33	30
+24	24	0:43	41
+24	24	0:49	47
+24	2	0:33	31
+24	1	0:27	25
