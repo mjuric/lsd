@@ -23,8 +23,25 @@ from pixelization import Pixelization
 from collections  import OrderedDict
 from contextlib   import contextmanager
 from colgroup     import ColGroup
+from . import pyrpc
 
 logger = logging.getLogger("lsd.table")
+
+class _Defaults(object):
+	def __init__(self):
+		import getpass
+		self._user = getpass.getuser()
+
+	def _startup(self, p):
+		p.login(self._user);
+
+        def obtain_file_lease(self, fn):
+                return False
+
+        def release_file_lease(self, fn):
+                pass
+
+_mgr = pyrpc.CachingProxy("localhost", 9030, cache_for=0, retry_interval=10, defaults=_Defaults())
 
 class BLOBAtom(tables.ObjectAtom):
 	"""
@@ -907,6 +924,23 @@ class Table:
 					if group in fp.root:
 						fp.removeNode('/', group, recursive=True);
 
+	class _TabletFile(object):
+		""" Wrap the tables.File object, adding lease requesting.
+		"""
+		def __init__(self, fn, mode):
+			object.__setattr__(self, '_x_fn', fn)
+			object.__setattr__(self, '_x_lease', _mgr.obtain_file_lease(fn))
+			object.__setattr__(self, '_x_fp', tables.openFile(fn, mode))
+
+		def __getattr__(self, k):    return getattr(self._x_fp, k)
+		def __delattr__(self, k):    return delattr(self._x_fp, k)
+		def __setattr__(self, k, v): return setattr(self._x_fp, k, v)
+
+		def close(self):
+			if self._x_lease:
+				_mgr.release_file_lease(self._x_fn)
+			return self._x_fp.close()
+
 	def _create_tablet(self, fn, cgroup):
 		"""
 		Create a new tablet.
@@ -925,7 +959,7 @@ class Table:
 
 		# Create the tablet
 		logger.debug("Creating tablet %s" % (fn))
-		fp  = tables.openFile(fn, mode='w')
+		fp  = self._TabletFile(fn, mode='w')
 
 		# Force creation of the main subgroup
 		self._get_row_group(fp, 'main', cgroup)
@@ -950,22 +984,30 @@ class Table:
 			fn_r = self._tablet_file(cell_id, cgroup)
 		        # --- hack: preload the entire file to have it appear in filesystem cache
 		        #     this will speed up subsequent random reads within the file
-			with open(fn_r) as f:
-				f.read()
+		        try:
+				_mgr.obtain_file_lease(fn_r)
+				with open(fn_r) as f:
+					f.read()
+			finally:
+				_mgr.release_file_lease(fn_r)
 			# ---
 			fp = tables.openFile(fn_r)
 		elif mode == 'r+':
 			self._check_transaction()
 			fn_w = self._tablet_file(cell_id, cgroup, mode='w')
 			if os.path.isfile(fn_w):
-				fp = tables.openFile(fn_w, mode='a')
+				fp = self._TabletFile(fn_w, mode='a')
 			elif self.tablet_exists(cell_id, cgroup): 	# Note: this will download the tablet from remote, if needed
 				# A file exists in an older snapshot. Copy it over here.
 				fn_r = self._tablet_file(cell_id, cgroup)
 				assert fn_r != fn_w, (fn_r, fn_w)
-				shutil.copy(fn_r, fn_w)
-				os.chmod(fn_w, 0664)	# Ensure it's writable
-				fp = tables.openFile(fn_w, mode='a')
+			        try:
+					_mgr.obtain_file_lease(fn_r)
+					shutil.copy(fn_r, fn_w)
+					os.chmod(fn_w, 0664)	# Ensure it's writable
+				finally:
+					_mgr.release_file_lease(fn_r)
+				fp = self._TabletFile(fn_w, mode='a')
 			else:
 				# No file exists
 				fp = self._create_tablet(fn_w, cgroup)
