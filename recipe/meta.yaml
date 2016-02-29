@@ -1,0 +1,40 @@
+package:
+  name: lsd
+  version: 0.6.1.1
+
+source:
+  fn: lsd-v0.6.1.1.tar.gz
+  url: https://github.com/mjuric/lsd/archive/v0.6.1.1.tar.gz
+  md5: 4f18fe2c7ee68131a9190d80e83cd69a
+
+requirements:
+  build:
+    - python 2.7.*
+    - numpy ==1.9
+    - astropy
+    - polygon
+    - scipy
+    - scikits-ann
+    - requests
+    - pytables
+  run:
+    - python 2.7.*
+    - numpy >=1.9
+    - astropy
+    - polygon
+    - scipy
+    - scikits-ann
+    - requests
+    - pytables
+
+#test:
+#  # Python imports
+#  imports:
+#    - scikits.ann
+#    - scikits.ann.ANN
+#    - scikits.ann.info
+#    - scikits.ann.setup
+#    - scikits.ann.version
+
+about:
+  home: https://github.com/mjuric/lsd
