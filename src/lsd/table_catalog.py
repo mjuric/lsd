@@ -422,7 +422,7 @@ class TableCatalog:
 			m0 = np.zeros((w, w), dtype=np.int32)
 			m1 = bmaps[lev+1]
 			for (i, j) in [(0, 0), (0, 1), (1, 0), (1, 1)]:
-				m0[:,:] |= m1[i::2, j::2]
+				m0[:,:] = m0[:,:] | m1[i::2, j::2]
 			m0 = m0 != 0
 
 			bmaps[lev] = m0
