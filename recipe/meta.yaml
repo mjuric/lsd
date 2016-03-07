@@ -19,6 +19,7 @@ requirements:
     - scikits-ann
     - requests
     - pytables
+    - pyyaml
   run:
     - python 2.7.*
     - numpy >=1.9
@@ -28,15 +29,16 @@ requirements:
     - scikits-ann
     - requests
     - pytables
+    - pyyaml
 
-#test:
-#  # Python imports
-#  imports:
-#    - scikits.ann
-#    - scikits.ann.ANN
-#    - scikits.ann.info
-#    - scikits.ann.setup
-#    - scikits.ann.version
+test:
+  # Python imports
+  imports:
+    - lsd
+    - lsd.bounds
+    - lsd.utils
+    - lsd.tui
+    - lsd.pool2
 
 about:
   home: https://github.com/mjuric/lsd
