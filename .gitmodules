@@ -1,3 +1,0 @@
-[submodule "src/data"]
-	path = src/data
-	url = http://faun.rc.fas.harvard.edu/mjuric/lsd-data.git
