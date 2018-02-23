@@ -1,4 +1,4 @@
-# lsd -- Large Survey Database
+# LSD -- Large Survey Database
 
 ## Building
 
