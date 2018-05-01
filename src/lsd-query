@@ -5,9 +5,11 @@ import os.path
 import numpy as np
 
 try:
-	import astropy.io.fits as pyfits
+    import astropy.io.fits as pyfits
 except ImportError:
-	import pyfits
+    import pyfits
+
+import tables
 
 import lsd as lsd
 import lsd.pool2 as pool2
@@ -20,134 +22,153 @@ from lsd.tui import *
 logger = logging.getLogger()
 
 def T(*args):
-	""" User friendly specification of time:
-		T([a,b], [b, c], [d, e]) --> intervalset([a,b], [b, c], [d, e])
-		T([a], [b]) --> intervalset([a], [b])
-		T(a) or T([a])--> intervalset([a])
+    """ User friendly specification of time:
+        T([a,b], [b, c], [d, e]) --> intervalset([a,b], [b, c], [d, e])
+        T([a], [b]) --> intervalset([a], [b])
+        T(a) or T([a])--> intervalset([a])
 
-		but, the often used case of:
+        but, the often used case of:
 
-		T(a, b) --> intervalset[a, b]
-	"""
-	hastuple = sum([ isinstance(a, tuple) or isinstance(a, list) for a in args ]) != 0
+        T(a, b) --> intervalset[a, b]
+    """
+    hastuple = sum([ isinstance(a, tuple) or isinstance(a, list) for a in args ]) != 0
 
-	if len(args) != 2 or hastuple:
-		return intervalset(*args)
-	else:
-		return intervalset(tuple(args))
+    if len(args) != 2 or hastuple:
+        return intervalset(*args)
+    else:
+        return intervalset(tuple(args))
 
 def usage():
-	print "Usage: %s --version --db=dbdir --define='funcname=pycode' --bounds=bounds --format=[fits|text|null] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
+    print "Usage: %s --version --db=dbdir --define='funcname=pycode' --bounds=bounds --format=[fits|text|hdf5|null] --output=[output,fits] --testbounds=True|False --quiet <query>" % sys.argv[0]
 
 if __name__ == "__main__":
-	np.seterr(over='raise')
+    np.seterr(over='raise')
 
-	if len(sys.argv) == 2 and sys.argv[1] in ['-v', '--version']:
-		print "Large Survey Database, version %s" % (lsd.__version__)
-		exit()
+    if len(sys.argv) == 2 and sys.argv[1] in ['-v', '--version']:
+        print "Large Survey Database, version %s" % (lsd.__version__)
+        exit()
 
-	optlist, (dbdir,), (query,) = tui_getopt('b:f:o:qD:', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds=', 'nc', 'define='], 1, usage)
+    optlist, (dbdir,), (query,) = tui_getopt('b:f:o:qD:', ['bounds=', 'format=', 'output=', 'quiet', 'testbounds=', 'nc', 'define='], 1, usage)
 
-	bounds = []
-	format = 'text'
-	output = None
-	progress_callback = None
-	testbounds = True
-	include_cached = False
-	udfs = {}
-	for o, a in optlist:
-		if o in ('-b', '--bounds'):
-			bounds.extend(eval('[' + a + ']'))
-		if o in ('--format', '-f'):
-			if a not in ['text', 'fits', 'null']: usage(); exit(-1);
-			format = a
-		if o in ('--output', '-o'):
-			output = a
-		if o in ('--quiet', '-q'):
-			progress_callback = pool2.progress_pass
-		if o in ('--testbounds'):
-			testbounds = a.lower() in ['true', '1', 't', 'y', 'yes']
-		if o in ('--nc'):
-			include_cached = True
-		if o in ('--define', '-D'):
-			name, code = a.split('=', 1)
-			udfs[name.strip()] = code.strip()
+    bounds = []
+    format = 'text'
+    output = None
+    progress_callback = None
+    testbounds = True
+    include_cached = False
+    udfs = {}
+    for o, a in optlist:
+        if o in ('-b', '--bounds'):
+            bounds.extend(eval('[' + a + ']'))
+        if o in ('--format', '-f'):
+            if a not in ['text', 'fits', 'hdf5', 'null']: usage(); exit(-1);
+            format = a
+        if o in ('--output', '-o'):
+            output = a
+        if o in ('--quiet', '-q'):
+            progress_callback = pool2.progress_pass
+        if o in ('--testbounds'):
+            testbounds = a.lower() in ['true', '1', 't', 'y', 'yes']
+        if o in ('--nc'):
+            include_cached = True
+        if o in ('--define', '-D'):
+            name, code = a.split('=', 1)
+            udfs[name.strip()] = code.strip()
 
-	######### Actual work
+    ######### Actual work
 
-	db = lsd.DB(dbdir)
+    db = lsd.DB(dbdir)
 
-	for name, code in udfs.iteritems():
-		g = db.get_globals()
-		db.register_udf(eval(code, g), name)
+    for name, code in udfs.iteritems():
+        g = db.get_globals()
+        db.register_udf(eval(code, g), name)
 
-	bounds = make_canonical(bounds)
+    bounds = make_canonical(bounds)
 
-	(select_clause, where_clause, from_clause, into_clause) = lsd.query_parser.parse(query)
-	if into_clause is not None:
-		db.begin_transaction()
+    (select_clause, where_clause, from_clause, into_clause) = lsd.query_parser.parse(query)
+    if into_clause is not None:
+        db.begin_transaction()
 
-	try:
-		q = db.query(query)
-		nrows = 0
-		if format == 'text':
-			# Text output
-			fmt = None
-			##rprev = None
-			out = sys.stdout if output is None else open(output, 'w')
-			for row in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds, include_cached=include_cached):
-				if fmt == None:
-					fmt = make_printf_string(row) + '\n'
-					out.write('# ' + ' '.join(row.dtype.names) + '\n')
-				out.write(fmt % as_tuple(row))
-				nrows += 1
-			out.flush()
-		elif format == 'null':
-			for rows in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds, return_blocks=True, include_cached=include_cached):
-				nrows += len(rows)
-		elif format == 'fits':
-			# FITS output
-			rows = q.fetch(bounds, progress_callback=progress_callback, testbounds=testbounds, include_cached=include_cached)
-			nrows += len(rows)
+    try:
+        q = db.query(query)
+        nrows = 0
+        if format == 'text':
+            # Text output
+            fmt = None
+            ##rprev = None
+            out = sys.stdout if output is None else open(output, 'w')
+            for row in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds, include_cached=include_cached):
+                if fmt == None:
+                    fmt = make_printf_string(row) + '\n'
+                    out.write('# ' + ' '.join(row.dtype.names) + '\n')
+                out.write(fmt % as_tuple(row))
+                nrows += 1
+            out.flush()
+        elif format == 'null':
+            for rows in q.iterate(bounds, progress_callback=progress_callback, testbounds=testbounds, return_blocks=True, include_cached=include_cached):
+                nrows += len(rows)
+        elif format == 'fits':
+            # FITS output
+            rows = q.fetch(bounds, progress_callback=progress_callback, testbounds=testbounds, include_cached=include_cached)
+            nrows += len(rows)
 
-			# workaround for pyfits bugs -- it doesn't know what to do with bool and uint?? columns
-			#                               so for now just convert these to signed, and emit a warning
-			#			     -- it also incorrectly stores i1 columns as False
-			dtype = []
-			copy = False
-			for col in rows.dtype.names:
-				t, o = rows.dtype.fields[col]
-				conv = False
-				if   t == np.bool:	t = 'i2'; conv = True; copy = True
-				elif t == np.uint64:	t = 'i8'; conv = True
-				elif t == np.uint32:	t = 'i4'; conv = True
-				elif t == np.uint16:	t = 'i2'; conv = True
-				dtype += [(col, t)]
-				if conv:
-					logger.warning('Stored "%s" as a signed integer, as pyfits can\'t handle unsigned and/or bools.' % (col))
-			rows = rows.as_ndarray()
+            # workaround for pyfits bugs -- it doesn't know what to do with bool and uint?? columns
+            #                               so for now just convert these to signed, and emit a warning
+            #                -- it also incorrectly stores i1 columns as False
+            dtype = []
+            copy = False
+            for col in rows.dtype.names:
+                t, o = rows.dtype.fields[col]
+                conv = False
+                if   t == np.bool:  t = 'i2'; conv = True; copy = True
+                elif t == np.uint64:    t = 'i8'; conv = True
+                elif t == np.uint32:    t = 'i4'; conv = True
+                elif t == np.uint16:    t = 'i2'; conv = True
+                dtype += [(col, t)]
+                if conv:
+                    logger.warning('Stored "%s" as a signed integer, as pyfits can\'t handle unsigned and/or bools.' % (col))
+            rows = rows.as_ndarray()
 
-			# pyfits bugs workarounds
-			if copy:
-				rows2 = np.empty(len(rows), dtype=dtype)
-				for col in rows.dtype.names: rows2[col] = rows[col]
-				rows = rows2
-			else:
-				rows = rows.view(dtype=dtype)
+            # pyfits bugs workarounds
+            if copy:
+                rows2 = np.empty(len(rows), dtype=dtype)
+                for col in rows.dtype.names: rows2[col] = rows[col]
+                rows = rows2
+            else:
+                rows = rows.view(dtype=dtype)
 
-			if output is None:
-				output = 'output.fits'
-			if os.path.exists(output):
-				os.unlink(output)
-			pyfits.writeto(output, rows)
+            if output is None:
+                output = 'output.fits'
+            if os.path.exists(output):
+                os.unlink(output)
+            pyfits.writeto(output, rows)
 
-			print >> sys.stderr, 'Output in %s' % (output)
+            print >> sys.stderr, 'Output in %s' % (output)
+        elif format == 'hdf5':
+            # HDF5 output
+            rows = q.fetch(bounds, progress_callback=progress_callback, testbounds=testbounds, include_cached=include_cached)
+            nrows += len(rows)
+            
+            if output is None:
+                output = 'output.hdf5'
+            
+            with tables.open_file(output, 'w') as f:
+                filters = tables.Filters(
+                    complevel=3,
+                    shuffle=False,
+                    fletcher32=False)
+                f.create_table(
+                    '/', 'query_result',
+                    obj=rows.as_ndarray(),
+                    filters=filters)
+            
+            print >> sys.stderr, 'Output in {:s}'.format(output)
 
-		if db.in_transaction():
-			db.commit()
-	except:
-		if db.in_transaction():
-			db.rollback()
-		raise
-	
-	print >> sys.stderr, '%d rows selected.' % (nrows)
+        if db.in_transaction():
+            db.commit()
+    except:
+        if db.in_transaction():
+            db.rollback()
+        raise
+    
+    print >> sys.stderr, '%d rows selected.' % (nrows)
